@@ -9,13 +9,23 @@ import {
 import {
   Column,
   ColumnDef,
+  columnVisibilityFeature,
+  createSortedRowModel,
   flexRender,
-  getCoreRowModel,
-  getSortedRowModel,
   Row,
+  RowData,
   RowSelectionState,
+  rowSelectionFeature,
+  rowSortingFeature,
   SortingState,
-  useReactTable,
+  sortFn_alphanumeric,
+  sortFn_alphanumericCaseSensitive,
+  sortFn_basic,
+  sortFn_datetime,
+  sortFn_text,
+  sortFn_textCaseSensitive,
+  tableFeatures,
+  useTable,
 } from "@tanstack/react-table";
 import {
   Box,
@@ -33,6 +43,27 @@ import {
 } from "@mantine/core";
 import { ArrowDown, ArrowUp, Info, Minus } from "lucide-react";
 
+// All built-in sort fns are registered so consumer columns can keep
+// using `sortFn: "auto"` (the default) or any built-in name.
+const features = tableFeatures({
+  rowSortingFeature,
+  rowSelectionFeature,
+  columnVisibilityFeature,
+  sortedRowModel: createSortedRowModel(),
+  sortFns: {
+    alphanumeric: sortFn_alphanumeric,
+    alphanumericCaseSensitive: sortFn_alphanumericCaseSensitive,
+    basic: sortFn_basic,
+    datetime: sortFn_datetime,
+    text: sortFn_text,
+    textCaseSensitive: sortFn_textCaseSensitive,
+  },
+});
+
+/** The table features `DataTable` is built with.
+ * Use as the `TFeatures` generic on `ColumnDef` / `Column` etc. */
+export type DataTableFeatures = typeof features;
+
 function loadStoredSorting(tableKey: string): SortingState | null {
   try {
     const stored = localStorage.getItem("data-table-" + tableKey);
@@ -42,10 +73,11 @@ function loadStoredSorting(tableKey: string): SortingState | null {
   }
 }
 
-export interface DataTableProps<TData, TValue = unknown> extends BoxProps {
+export interface DataTableProps<TData extends RowData, TValue = unknown>
+  extends BoxProps {
   /** Unique key given to table so sorting can be remembered on local storage */
   tableKey: string;
-  columns: (ColumnDef<TData, TValue> | false | undefined)[];
+  columns: (ColumnDef<DataTableFeatures, TData, TValue> | false | undefined)[];
   data: TData[];
   loading?: boolean;
   onRowClick?: (row: TData) => void;
@@ -64,7 +96,7 @@ export interface DataTableProps<TData, TValue = unknown> extends BoxProps {
     selectKey: (row: TData) => string;
     onSelect?: (selected: string[]) => void;
     state?: [RowSelectionState, Dispatch<SetStateAction<RowSelectionState>>];
-    disableRow?: boolean | ((row: Row<TData>) => boolean);
+    disableRow?: boolean | ((row: Row<DataTableFeatures, TData>) => boolean);
     color?: DefaultMantineColor;
   };
   caption?: string;
@@ -73,7 +105,7 @@ export interface DataTableProps<TData, TValue = unknown> extends BoxProps {
   noBorder?: boolean;
 }
 
-export function DataTable<TData, TValue>({
+export function DataTable<TData extends RowData, TValue>({
   tableKey,
   columns,
   data,
@@ -111,12 +143,11 @@ export function DataTable<TData, TValue>({
     ? selectOptions.state
     : _internalState;
 
-  const table = useReactTable({
+  const table = useTable({
+    features,
     data,
     columns: columns.filter((c) => c) as any,
-    getCoreRowModel: getCoreRowModel(),
     onSortingChange: setSorting,
-    getSortedRowModel: getSortedRowModel(),
     manualSorting,
     state: {
       sorting,
@@ -143,7 +174,7 @@ export function DataTable<TData, TValue>({
     selectOptions?.onSelect?.(Object.keys(rowSelection));
   }, [rowSelection]);
 
-  const rows = table.getPrePaginationRowModel().rows;
+  const rows = table.getRowModel().rows;
 
   const tableNode = (
     <Table
@@ -175,7 +206,10 @@ export function DataTable<TData, TValue>({
                   color={selectOptions.color ?? "Neutral"}
                   disabled={selectOptions.disableRow === true}
                   checked={table.getIsAllRowsSelected()}
-                  indeterminate={table.getIsSomeRowsSelected()}
+                  indeterminate={
+                    // v9: getIsSomeRowsSelected is true even when all are selected
+                    table.getIsSomeRowsSelected() && !table.getIsAllRowsSelected()
+                  }
                 />
               </Table.Th>
             )}
@@ -292,14 +326,14 @@ export function DataTable<TData, TValue>({
   }
 }
 
-export const SortableHeader = <T, V>({
+export const SortableHeader = <T extends RowData, V>({
   column,
   title,
   description,
   sortDescFirst,
   disabled,
 }: {
-  column: Column<T, V>;
+  column: Column<DataTableFeatures, T, V>;
   title: string;
   description?: ReactNode;
   sortDescFirst?: boolean;
