@@ -14,6 +14,9 @@ type LoginTokens = {
 const LOGIN_TOKENS_KEY = "mogh-auth-tokens-v1";
 
 export const LOGIN_TOKENS = (() => {
+  // Early return in environments which don't support 
+  if (!localStorage) return;
+
   const stored = localStorage.getItem(LOGIN_TOKENS_KEY);
 
   let tokens: LoginTokens = stored
