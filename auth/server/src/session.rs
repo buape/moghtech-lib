@@ -243,7 +243,7 @@ impl Session {
   /// Insert the totp which began totp enrollment
   pub async fn insert_totp_enrollment(
     &self,
-    totp: &totp_rs::TOTP,
+    totp: &totp_rs::Totp,
   ) -> mogh_error::Result<()> {
     self
       .0
@@ -256,7 +256,7 @@ impl Session {
   /// Returns the user id which began totp enrollment
   pub async fn retrieve_totp_enrollment(
     &self,
-  ) -> mogh_error::Result<totp_rs::TOTP> {
+  ) -> mogh_error::Result<totp_rs::Totp> {
     self
       .0
       .remove(Self::TOTP_ENROLLMENT)

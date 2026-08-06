@@ -1,8 +1,8 @@
-use anyhow::{Context as _, anyhow};
+use anyhow::Context as _;
 use axum::http::StatusCode;
 use data_encoding::BASE32_NOPAD;
 use mogh_auth_client::api::login::CompleteTotpLogin;
-use mogh_error::AddStatusCodeError as _;
+use mogh_error::AddStatusCode as _;
 use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
@@ -34,16 +34,12 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
 
       let totp = auth.make_totp(secret_bytes, None)?;
 
-      let valid = totp
+      // The step is the 30s window since epoch
+      // which the TOTP is valid for.
+      let _step = totp
         .check_current(&self.code)
-        .context("Failed to check TOTP code validity")?;
-
-      if !valid {
-        return Err(
-          anyhow!("Invalid TOTP code")
-            .status_code(StatusCode::UNAUTHORIZED),
-        );
-      }
+        .context("Invalid TOTP code")
+        .status_code(StatusCode::UNAUTHORIZED)?;
 
       let res = auth.jwt_provider().encode_sub(&user_id)?;
 

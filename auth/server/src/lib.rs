@@ -527,17 +527,17 @@ pub trait AuthImpl: Send + Sync + 'static {
     &self,
     secret_bytes: Vec<u8>,
     account_name: Option<String>,
-  ) -> anyhow::Result<totp_rs::TOTP> {
-    totp_rs::TOTP::new(
-      totp_rs::Algorithm::SHA1,
-      6,
-      1,
-      30,
-      secret_bytes,
-      Some(String::from(self.app_name())),
-      account_name.unwrap_or_default(),
-    )
-    .context("Failed to construct TOTP")
+  ) -> anyhow::Result<totp_rs::Totp> {
+    totp_rs::Builder::new()
+      .with_issuer(Some(String::from(self.app_name())))
+      .with_account_name(account_name.unwrap_or_default())
+      .with_algorithm(totp_rs::Algorithm::SHA1)
+      .with_digits(6)
+      .with_skew(1)
+      .with_step_duration(30)
+      .with_secret(secret_bytes)
+      .build()
+      .context("Failed to construct TOTP")
   }
 
   // ============

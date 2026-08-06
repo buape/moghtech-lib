@@ -1,4 +1,4 @@
-use anyhow::{Context as _, anyhow};
+use anyhow::Context as _;
 use axum::http::StatusCode;
 use data_encoding::BASE32_NOPAD;
 use mogh_auth_client::api::manage::{
@@ -6,7 +6,7 @@ use mogh_auth_client::api::manage::{
   ConfirmTotpEnrollment, ConfirmTotpEnrollmentResponse, UnenrollTotp,
   UnenrollTotpResponse,
 };
-use mogh_error::AddStatusCodeError as _;
+use mogh_error::AddStatusCode as _;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
@@ -46,10 +46,11 @@ impl Resolve<ManageArgs> for BeginTotpEnrollment {
     )?;
 
     let png = totp
-      .get_qr_base64()
+      .to_qr_base64()
       .map_err(anyhow::Error::msg)
       .context("Failed to generate QR code png")?;
-    let uri = totp.get_url();
+    let uri =
+      totp.to_url().context("Failed to generate QR code uri")?;
 
     session.insert_totp_enrollment(&totp).await?;
 
@@ -80,15 +81,12 @@ impl Resolve<ManageArgs> for ConfirmTotpEnrollment {
   ) -> Result<Self::Response, Self::Error> {
     let totp = session.retrieve_totp_enrollment().await?;
 
-    let valid = totp
+    // The step is the 30s window since epoch
+    // which the TOTP is valid for.
+    let _step = totp
       .check_current(&self.code)
-      .context("Failed to check code validity")?;
-
-    if !valid {
-      return Err(anyhow!(
-        "The provided code was not valid. Please try BeginTotpEnrollment flow again."
-      ).status_code(StatusCode::BAD_REQUEST));
-    }
+      .context("The provided code was not valid. Please try BeginTotpEnrollment flow again.")
+      .status_code(StatusCode::BAD_REQUEST)?;
 
     let recovery_codes =
       (0..10).map(|_| random_string(20)).collect::<Vec<_>>();
@@ -104,7 +102,7 @@ impl Resolve<ManageArgs> for ConfirmTotpEnrollment {
     auth
       .update_user_stored_totp(
         user.id().to_string(),
-        BASE32_NOPAD.encode(&totp.secret),
+        BASE32_NOPAD.encode(totp.secret()),
         hashed_recovery_codes,
       )
       .await?;
