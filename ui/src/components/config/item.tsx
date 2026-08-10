@@ -33,7 +33,13 @@ export const ConfigItem = createPolymorphicComponent<"div", ConfigItemProps>(
             <Text fz="h3">{fmtSnakeCaseToUpperSpaceCase(label)}</Text>
           )}
           {label && typeof label !== "string" && label}
-          {description && <Text c="dimmed">{description}</Text>}
+          {description && (
+            // component="div" so ReactNode descriptions (Groups, nested Text)
+            // don't produce invalid markup inside the default <p>.
+            <Text c="dimmed" component="div">
+              {description}
+            </Text>
+          )}
         </Stack>
       );
       return (
