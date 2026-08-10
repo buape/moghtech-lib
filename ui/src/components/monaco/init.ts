@@ -36,6 +36,33 @@ self.MonacoEnvironment = {
   },
 };
 
+// monaco-yaml as of 5.5.1 (via monaco-worker-manager) still calls createWebWorker with the
+// pre monaco 0.53 `{ moduleId, label, createData }` options. monaco-editor >= 0.53
+// only reads `opts.worker`, so worker creation fails and monaco silently falls
+// back to a local worker with no request handler — every yaml feature then
+// rejects with "Missing requestHandler or method: ...". Translate legacy-shaped
+// calls the same way monaco's own languages do (esm/vs/internal/common/workers.js):
+// resolve the worker through MonacoEnvironment.getWorker and post createData
+// to it before handing it to the new API.
+const nativeCreateWebWorker = monaco.editor.createWebWorker;
+monaco.editor.createWebWorker = <T extends object>(opts: any) => {
+  if (!("worker" in opts)) {
+    const { createData, host, keepIdleModels, label } = opts;
+    const worker = Promise.resolve(
+      self.MonacoEnvironment!.getWorker!(
+        "workerMain.js",
+        label ?? "monaco-editor-worker",
+      ),
+    ).then((w) => {
+      w.postMessage("ignore");
+      w.postMessage(createData);
+      return w;
+    });
+    opts = { worker, host, keepIdleModels };
+  }
+  return nativeCreateWebWorker<T>(opts);
+};
+
 import { loader } from "@monaco-editor/react";
 loader.config({ monaco });
 
