@@ -28,7 +28,7 @@ mogh_server = "1.5.0"
 mogh_validations = "1.0.1"
 
 # CICADA
-cicada_loader = "0.5.1"
+cicada_loader = "0.7.1"
 
 # ASYNC
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "form", "rustls"] }
@@ -98,7 +98,7 @@ syn = "3.0.3"
 
 # MISC
 clap = { version = "4.6.6", features = ["derive"] }
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.24.1", features = ["v4"] }
 typeshare = "1.0.5"
 wildcard = "0.3.0"
 colored = "3.1.1"
