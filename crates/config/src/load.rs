@@ -99,11 +99,48 @@ pub fn load_config_files(
   }
 }
 
+/// Splits a cicada path (`cicada://...`, `cicada:/...` or `cicada:...`)
+/// into the node path and the list of environments.
+/// Returns `None` if the path is not a cicada path.
+///
+/// Environments are given as a query suffix, using `+` as the
+/// list separator (comma is reserved for splitting multiple paths):
+///
+/// - `cicada://filesystem/config.yaml` -> no environments
+/// - `cicada://filesystem/config.yaml?env=prod` -> `["prod"]`
+/// - `cicada://filesystem/config.yaml?env=prod+us-east` -> `["prod", "us-east"]`
+/// - `cicada://filesystem/config.yaml?env=prod&env=us-east` -> `["prod", "us-east"]`
+#[cfg(feature = "cicada")]
+pub fn parse_cicada_path(
+  path: &Path,
+) -> Option<(PathBuf, Vec<String>)> {
+  let path_str = path.to_string_lossy();
+  let path =
+    path_str.strip_prefix("cicada:")?.trim_start_matches('/');
+  let Some((path, query)) = path.split_once('?') else {
+    return Some((PathBuf::from(path), Vec::new()));
+  };
+  let environments = query
+    .split('&')
+    .filter_map(|pair| {
+      let (key, value) = pair.split_once('=')?;
+      matches!(key.trim(), "env" | "envs" | "environment" | "environments")
+        .then_some(value)
+    })
+    .flat_map(|value| value.split('+'))
+    .map(str::trim)
+    .filter(|env| !env.is_empty())
+    .map(String::from)
+    .collect();
+  Some((PathBuf::from(path), environments))
+}
+
 /// loads multiple config files.
 ///
 /// If cicada feature is enabled, the files
-/// can be cicada paths (`cicada://filesystem/config.yaml`),
+/// can be cicada paths (`cicada://filesystem/config.yaml?env=prod+us-east`),
 /// provided user configures `CICADA_...` env vars.
+/// See [parse_cicada_path] for the environment syntax.
 pub fn load_parse_config_files<T: DeserializeOwned>(
   files: &[PathBuf],
   merge_nested: bool,
@@ -113,8 +150,10 @@ pub fn load_parse_config_files<T: DeserializeOwned>(
 
   for file in files {
     #[cfg(feature = "cicada")]
-    let source = if let Ok(file) = file.strip_prefix("cicada:") {
-      let contents = match cicada_loader::load(file) {
+    let source = if let Some((file, environments)) =
+      parse_cicada_path(file)
+    {
+      let contents = match cicada_loader::load(&file, environments) {
         Ok(contents) => contents,
         Err(e) => {
           println!(
@@ -125,7 +164,7 @@ pub fn load_parse_config_files<T: DeserializeOwned>(
           continue;
         }
       };
-      parse_config_contents(file, &contents)
+      parse_config_contents(&file, &contents)
     } else {
       load_parse_config_file(file)
     };
@@ -212,4 +251,35 @@ pub fn parse_config_contents<T: DeserializeOwned>(
     }
   };
   Ok(config)
+}
+
+#[cfg(all(test, feature = "cicada"))]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parses_cicada_paths() {
+    for prefix in ["cicada:", "cicada:/", "cicada://"] {
+      let full = PathBuf::from(format!(
+        "{prefix}filesystem/path/config.yaml?env=prod+us-east"
+      ));
+      let (path, envs) = parse_cicada_path(&full).unwrap();
+      assert_eq!(path, PathBuf::from("filesystem/path/config.yaml"));
+      assert_eq!(envs, vec!["prod", "us-east"]);
+    }
+    let (path, envs) = parse_cicada_path(Path::new(
+      "cicada://fs/config.yaml?env=a&env=b",
+    ))
+    .unwrap();
+    assert_eq!(path, PathBuf::from("fs/config.yaml"));
+    assert_eq!(envs, vec!["a", "b"]);
+    let (path, envs) =
+      parse_cicada_path(Path::new("cicada://fs/config.yaml"))
+        .unwrap();
+    assert_eq!(path, PathBuf::from("fs/config.yaml"));
+    assert!(envs.is_empty());
+    assert!(
+      parse_cicada_path(Path::new("/etc/config.yaml")).is_none()
+    );
+  }
 }

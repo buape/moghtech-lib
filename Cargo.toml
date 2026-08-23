@@ -28,7 +28,7 @@ mogh_server = "1.5.0"
 mogh_validations = "1.0.1"
 
 # CICADA
-cicada_loader = "0.9.0"
+cicada_loader = "0.10.0"
 
 # ASYNC
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "form", "rustls"] }
