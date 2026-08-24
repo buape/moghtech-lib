@@ -1,4 +1,5 @@
 import {
+  ComponentPropsWithoutRef,
   Dispatch,
   MouseEvent,
   ReactNode,
@@ -74,8 +75,10 @@ function loadStoredSorting(tableKey: string): SortingState | null {
   }
 }
 
-export interface DataTableProps<TData extends RowData, TValue = unknown>
-  extends BoxProps {
+export interface DataTableProps<
+  TData extends RowData,
+  TValue = unknown,
+> extends BoxProps {
   /** Unique key given to table so sorting can be remembered on local storage */
   tableKey: string;
   columns: (ColumnDef<DataTableFeatures, TData, TValue> | false | undefined)[];
@@ -85,6 +88,9 @@ export interface DataTableProps<TData extends RowData, TValue = unknown>
   /** Called when a row is right clicked. The consumer decides whether to
    * `preventDefault` the native context menu. */
   onRowContextMenu?: (row: TData, e: MouseEvent<HTMLTableRowElement>) => void;
+  /** Extra props (eg. drag and drop handlers) spread onto each data row's
+   * `<tr>`. A returned `style` is merged over the row's base style. */
+  rowProps?: (row: TData) => ComponentPropsWithoutRef<"tr">;
   noResults?: ReactNode;
   defaultSort?: SortingState;
   sortDescFirst?: boolean;
@@ -116,6 +122,7 @@ export function DataTable<TData extends RowData, TValue>({
   loading,
   onRowClick,
   onRowContextMenu,
+  rowProps,
   noResults = <Text c="dimmed">No results</Text>,
   sortDescFirst = false,
   defaultSort = [],
@@ -213,7 +220,8 @@ export function DataTable<TData extends RowData, TValue>({
                   checked={table.getIsAllRowsSelected()}
                   indeterminate={
                     // v9: getIsSomeRowsSelected is true even when all are selected
-                    table.getIsSomeRowsSelected() && !table.getIsAllRowsSelected()
+                    table.getIsSomeRowsSelected() &&
+                    !table.getIsAllRowsSelected()
                   }
                 />
               </Table.Th>
@@ -274,43 +282,48 @@ export function DataTable<TData extends RowData, TValue>({
             </Table.Td>
           </Table.Tr>
         ) : (
-          rows.map((row) => (
-            <Table.Tr
-              key={row.id}
-              onContextMenu={
-                onRowContextMenu
-                  ? (e) => onRowContextMenu(row.original, e)
-                  : undefined
-              }
-              style={{
-                cursor: onRowClick ? "pointer" : undefined,
-                contentVisibility: "auto",
-                containIntrinsicSize: "auto 2em",
-              }}
-            >
-              {selectOptions && (
-                <Table.Td onClick={() => row.toggleSelected()}>
-                  <Checkbox
-                    aria-label="Select row"
-                    color={selectOptions.color ?? "Neutral"}
-                    disabled={!row.getCanSelect()}
-                    checked={row.getIsSelected()}
-                  />
-                </Table.Td>
-              )}
-              {row.getVisibleCells().map((cell) => (
-                <Table.Td
-                  key={cell.id}
-                  onClick={
-                    onRowClick ? () => onRowClick(row.original) : undefined
-                  }
-                  style={{ flexWrap: "nowrap", textWrap: "nowrap" }}
-                >
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </Table.Td>
-              ))}
-            </Table.Tr>
-          ))
+          rows.map((row) => {
+            const extraRowProps = rowProps?.(row.original);
+            return (
+              <Table.Tr
+                key={row.id}
+                onContextMenu={
+                  onRowContextMenu
+                    ? (e) => onRowContextMenu(row.original, e)
+                    : undefined
+                }
+                {...extraRowProps}
+                style={{
+                  cursor: onRowClick ? "pointer" : undefined,
+                  contentVisibility: "auto",
+                  containIntrinsicSize: "auto 2em",
+                  ...extraRowProps?.style,
+                }}
+              >
+                {selectOptions && (
+                  <Table.Td onClick={() => row.toggleSelected()}>
+                    <Checkbox
+                      aria-label="Select row"
+                      color={selectOptions.color ?? "Neutral"}
+                      disabled={!row.getCanSelect()}
+                      checked={row.getIsSelected()}
+                    />
+                  </Table.Td>
+                )}
+                {row.getVisibleCells().map((cell) => (
+                  <Table.Td
+                    key={cell.id}
+                    onClick={
+                      onRowClick ? () => onRowClick(row.original) : undefined
+                    }
+                    style={{ flexWrap: "nowrap", textWrap: "nowrap" }}
+                  >
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </Table.Td>
+                ))}
+              </Table.Tr>
+            );
+          })
         )}
       </Table.Tbody>
     </Table>
