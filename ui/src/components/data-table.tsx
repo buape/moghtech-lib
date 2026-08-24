@@ -1,5 +1,6 @@
 import {
   Dispatch,
+  MouseEvent,
   ReactNode,
   SetStateAction,
   useEffect,
@@ -81,6 +82,9 @@ export interface DataTableProps<TData extends RowData, TValue = unknown>
   data: TData[];
   loading?: boolean;
   onRowClick?: (row: TData) => void;
+  /** Called when a row is right clicked. The consumer decides whether to
+   * `preventDefault` the native context menu. */
+  onRowContextMenu?: (row: TData, e: MouseEvent<HTMLTableRowElement>) => void;
   noResults?: ReactNode;
   defaultSort?: SortingState;
   sortDescFirst?: boolean;
@@ -111,6 +115,7 @@ export function DataTable<TData extends RowData, TValue>({
   data,
   loading,
   onRowClick,
+  onRowContextMenu,
   noResults = <Text c="dimmed">No results</Text>,
   sortDescFirst = false,
   defaultSort = [],
@@ -272,6 +277,11 @@ export function DataTable<TData extends RowData, TValue>({
           rows.map((row) => (
             <Table.Tr
               key={row.id}
+              onContextMenu={
+                onRowContextMenu
+                  ? (e) => onRowContextMenu(row.original, e)
+                  : undefined
+              }
               style={{
                 cursor: onRowClick ? "pointer" : undefined,
                 contentVisibility: "auto",
