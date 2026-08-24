@@ -16,6 +16,7 @@ import { Bookmark, History } from "lucide-react";
 import { ConfigGroup } from "./group";
 import { UnsavedChanges } from "./unsaved-changes";
 import { ConfigLayout } from "./layout";
+import { SectionProps } from "../section";
 
 export * from "./confirm";
 export * from "./group";
@@ -50,13 +51,12 @@ export interface ConfigGroupArgs<T> {
   };
 }
 
-export interface ConfigProps<T> {
+export interface ConfigProps<T> extends SectionProps {
   original: T;
   update: Partial<T>;
   setUpdate: React.Dispatch<SetStateAction<Partial<T>>>;
   disabled: boolean;
   onSave: () => Promise<unknown>;
-  titleOther?: ReactNode;
   disableSidebar?: boolean;
   fileContentsLanguage?: MonacoLanguage;
   enableFancyToml?: boolean;
@@ -72,11 +72,11 @@ export function Config<T>({
   setUpdate,
   disabled,
   onSave,
-  titleOther,
   disableSidebar,
   fileContentsLanguage,
   enableFancyToml,
   groups: _groups,
+  ...sectionProps
 }: ConfigProps<T>) {
   const changesMade = Object.keys(update).length ? true : false;
   const onConfirm = async () => {
@@ -202,7 +202,7 @@ export function Config<T>({
   );
 
   return (
-    <ConfigLayout titleOther={titleOther} SaveOrReset={SaveOrResetComponent}>
+    <ConfigLayout SaveOrReset={SaveOrResetComponent} {...sectionProps}>
       {disableSidebar && (
         <>
           {GroupsComponent}
