@@ -27,6 +27,7 @@ export * from "./components/labelled-switch";
 export * from "./components/labels-group";
 export * from "./components/loading-screen";
 export * from "./components/mobile-friendly-tabs";
+export * from "./components/page-breadcrumbs";
 export * from "./components/page-guard";
 export * from "./components/page";
 export * from "./components/search-input";
