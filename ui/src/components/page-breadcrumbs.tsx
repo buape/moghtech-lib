@@ -28,7 +28,7 @@ export function PageBreadcrumbs({
             key={i}
             className="hover-underline"
             c="dimmed"
-            fz="sm"
+            fz="md"
             maw={200}
             truncate
             renderRoot={(props) => <Link to={to} {...props} />}
@@ -40,7 +40,7 @@ export function PageBreadcrumbs({
         ) : (
           <Text
             key={i}
-            fz="sm"
+            fz="md"
             maw={200}
             truncate
             {...commonTextProps}
