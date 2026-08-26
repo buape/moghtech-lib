@@ -12,7 +12,7 @@ export interface PageBreadcrumbsProps extends Omit<
   "children"
 > {
   items: Crumb[];
-  commonTextProps: TextProps;
+  commonTextProps?: TextProps;
 }
 
 export function PageBreadcrumbs({
