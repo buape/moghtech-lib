@@ -7,7 +7,10 @@ export interface Crumb extends TextProps {
   to?: string;
 }
 
-export interface PageBreadcrumbsProps extends BreadcrumbsProps {
+export interface PageBreadcrumbsProps extends Omit<
+  BreadcrumbsProps,
+  "children"
+> {
   items: Crumb[];
 }
 
