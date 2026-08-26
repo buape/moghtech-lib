@@ -11,7 +11,7 @@ export interface PageBreadcrumbsProps extends BreadcrumbsProps {
   items: Crumb[];
 }
 
-export default function PageBreadcrumbs({
+export function PageBreadcrumbs({
   items,
   ...breadcrumbsProps
 }: PageBreadcrumbsProps) {
