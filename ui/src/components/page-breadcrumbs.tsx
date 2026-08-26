@@ -12,10 +12,12 @@ export interface PageBreadcrumbsProps extends Omit<
   "children"
 > {
   items: Crumb[];
+  commonTextProps: TextProps;
 }
 
 export function PageBreadcrumbs({
   items,
+  commonTextProps,
   ...breadcrumbsProps
 }: PageBreadcrumbsProps) {
   return (
@@ -30,12 +32,20 @@ export function PageBreadcrumbs({
             maw={200}
             truncate
             renderRoot={(props) => <Link to={to} {...props} />}
+            {...commonTextProps}
             {...textProps}
           >
             {label}
           </Text>
         ) : (
-          <Text key={i} fz="sm" maw={200} truncate {...textProps}>
+          <Text
+            key={i}
+            fz="sm"
+            maw={200}
+            truncate
+            {...commonTextProps}
+            {...textProps}
+          >
             {label}
           </Text>
         ),
