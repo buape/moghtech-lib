@@ -25,6 +25,7 @@ export * from "./components/info-card";
 export * from "./components/input-list";
 export * from "./components/labelled-switch";
 export * from "./components/labels-group";
+export * from "./components/list-pagination";
 export * from "./components/loading-screen";
 export * from "./components/mobile-friendly-tabs";
 export * from "./components/page-breadcrumbs";
