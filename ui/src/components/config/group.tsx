@@ -33,13 +33,15 @@ export function ConfigGroup<T>({
             return null;
           }
 
-          switch (typeof value) {
+          switch (
+            value !== undefined && value !== null ? typeof value : args?.type
+          ) {
             case "string":
               return (
                 <ConfigInput
                   key={key}
                   label={args?.label ?? key}
-                  value={value}
+                  value={value as string}
                   onValueChange={(value) =>
                     setUpdate({ [key]: value } as Partial<T>)
                   }
@@ -69,7 +71,7 @@ export function ConfigGroup<T>({
                 <ConfigSwitch
                   key={key}
                   label={args?.label ?? key}
-                  value={value}
+                  value={value as boolean}
                   onCheckedChange={(value) =>
                     setUpdate({ [key]: value } as Partial<T>)
                   }

@@ -27,6 +27,16 @@ export * from "./unsaved-changes";
 export interface ConfigFieldArgs {
   label?: string;
   description?: ReactNode;
+  /** Useful to set explicitly in cases where value is nullable from the API (so type cannot be inferred). */
+  type?:
+    | "string"
+    | "number"
+    | "bigint"
+    | "boolean"
+    | "symbol"
+    | "undefined"
+    | "object"
+    | "function";
   /** Use a selector instead of input */
   options?: { value: string; label?: string; icon?: ReactNode }[];
   placeholder?: string;
