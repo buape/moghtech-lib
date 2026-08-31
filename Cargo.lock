@@ -454,7 +454,7 @@ dependencies = [
  "rand 0.9.5",
  "serde_bytes",
  "simdutf8",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "uuid",
 ]
@@ -570,9 +570,9 @@ dependencies = [
 
 [[package]]
 name = "cicada_client"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ee6dbc46ffc916894cf9a45e18f0e62c1c2dc64cb3654d7be6c782dde2ddfd2"
+checksum = "db54592d9a863f25f1a5f2bb24875d6a4e39cda0cc085993d9e3c884634f7e47"
 dependencies = [
  "async_timing_util",
  "chrono",
@@ -591,9 +591,9 @@ dependencies = [
 
 [[package]]
 name = "cicada_loader"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42fc6d71aea2c8498ecd4a819449fb96a07609b7c78db5c2fc1eed95a8482510"
+checksum = "8568e32f7ca3084a9ef75d96ea57d0d00bd3d4214010f283e34bcc8a3e168f40"
 dependencies = [
  "anyhow",
  "cicada_client",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_config"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "cicada_loader",
  "colored",
@@ -2016,7 +2016,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "toml",
  "wildcard",
 ]
@@ -2118,7 +2118,7 @@ dependencies = [
 name = "mogh_secret_file"
 version = "1.0.1"
 dependencies = [
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -2131,7 +2131,7 @@ dependencies = [
  "axum-server",
  "data-encoding",
  "sha2 0.10.9",
- "tower-http 0.7.0",
+ "tower-http 0.7.1",
  "tower-sessions",
  "tracing",
  "url",
@@ -2370,7 +2370,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -2400,7 +2400,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "reqwest 0.13.4",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tonic",
 ]
 
@@ -2434,7 +2434,7 @@ dependencies = [
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.5",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
 ]
@@ -2751,7 +2751,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "web-time",
@@ -2773,7 +2773,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tinyvec",
  "tracing",
  "web-time",
@@ -3520,7 +3520,7 @@ checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -3677,11 +3677,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.19",
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
@@ -3697,9 +3697,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3973,9 +3973,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
 dependencies = [
  "bitflags",
  "bytes",
@@ -4041,7 +4041,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
@@ -4557,7 +4557,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9b0540e91e49de3817c314da0dd3bc518093ceacc6ea5327cb0e1eb073e5189"
 dependencies = [
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
