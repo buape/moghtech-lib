@@ -112,10 +112,19 @@ export function EntityHeader({
             </Group>
           )}
           <Group fz="md" tt="uppercase" mt="-8" gap="sm">
-            <Text c={color} fw="600">
+            <Text
+              component={typeof state === "string" ? undefined : "div"}
+              c={color}
+              fw="600"
+            >
               {state}
             </Text>
-            <Text c="dimmed">{status}</Text>
+            <Text
+              component={typeof status === "string" ? undefined : "div"}
+              c="dimmed"
+            >
+              {status}
+            </Text>
           </Group>
         </Stack>
       </Group>
