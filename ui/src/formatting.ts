@@ -60,6 +60,21 @@ export function fmtDuration(startTs: number, endTs: number) {
   }${remaining_seconds.toFixed(minutes > 0 ? 0 : 1)} seconds`;
 }
 
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/** Coarse "time until" of a future timestamp: days, falling back to
+ * hours / minutes once under a day. */
+export function fmtTimeUntil(ms: number) {
+  const plural = (count: number, unit: string) =>
+    `${count} ${unit}${count === 1 ? "" : "s"}`;
+  if (ms >= DAY_MS) return plural(Math.floor(ms / DAY_MS), "day");
+  if (ms >= HOUR_MS) return plural(Math.floor(ms / HOUR_MS), "hour");
+  if (ms >= MINUTE_MS) return plural(Math.floor(ms / MINUTE_MS), "minute");
+  return "< 1 minute";
+}
+
 export function fmtUpperCamelcase(input: string) {
   return input.match(/[A-Z][a-z]+|[0-9]+/g)?.join(" ") ?? input;
 }
