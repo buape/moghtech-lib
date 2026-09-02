@@ -577,7 +577,7 @@ dependencies = [
  "async_timing_util",
  "chrono",
  "http",
- "mogh_auth_client",
+ "mogh_auth_client 1.7.0",
  "mogh_error",
  "mogh_pki",
  "mogh_resolver",
@@ -1951,6 +1951,23 @@ dependencies = [
 [[package]]
 name = "mogh_auth_client"
 version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b22cf7d0f27783c7bb10c7f87fd7de3952bda65e2166d34c3285c698b00d89"
+dependencies = [
+ "anyhow",
+ "mogh_error",
+ "mogh_resolver",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "strum",
+ "typeshare",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "mogh_auth_client"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "mogh_error",
@@ -1966,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_auth_server"
-version = "1.8.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1974,7 +1991,7 @@ dependencies = [
  "bcrypt",
  "data-encoding",
  "jsonwebtoken",
- "mogh_auth_client",
+ "mogh_auth_client 2.0.0",
  "mogh_error",
  "mogh_pki",
  "mogh_rate_limit",
@@ -1987,6 +2004,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "tokio",
  "totp-rs",
  "tower-sessions",
  "tracing",
@@ -1999,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_cache"
-version = "1.1.2"
+version = "1.1.3"
 dependencies = [
  "anyhow",
  "tokio",
@@ -2007,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_config"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "cicada_loader",
  "colored",
@@ -2023,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_encryption"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -2033,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_error"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2044,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_logger"
-version = "1.3.4"
+version = "1.3.5"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -2052,6 +2070,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "serde",
+ "serde_json",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -2059,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_pki"
-version = "1.1.3"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2075,12 +2094,13 @@ dependencies = [
  "snow",
  "spki",
  "strum",
+ "subtle",
  "tracing",
 ]
 
 [[package]]
 name = "mogh_rate_limit"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2091,23 +2111,24 @@ dependencies = [
 
 [[package]]
 name = "mogh_request_ip"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "axum",
  "mogh_error",
+ "tokio",
 ]
 
 [[package]]
 name = "mogh_resolver"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "mogh_resolver_derive",
 ]
 
 [[package]]
 name = "mogh_resolver_derive"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2116,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_secret_file"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -2124,13 +2145,15 @@ dependencies = [
 
 [[package]]
 name = "mogh_server"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "axum",
  "axum-server",
  "data-encoding",
  "sha2 0.10.9",
+ "tokio",
+ "tower",
  "tower-http 0.7.1",
  "tower-sessions",
  "tracing",
@@ -2139,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_validations"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "bson",
