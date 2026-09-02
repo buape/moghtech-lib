@@ -63,3 +63,41 @@ pub async fn write_async(
 
   Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+  use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+  fn temp_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+      "mogh_secret_file_write_test_{}_{name}",
+      std::process::id()
+    ))
+  }
+
+  #[test]
+  fn write_creates_parents_and_sets_mode() {
+    let dir = temp_dir("sync");
+    let path = dir.join("nested").join("secret");
+    super::write(&path, "hunter2").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hunter2");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    // Overwriting truncates previous contents.
+    super::write(&path, "x").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[cfg(feature = "tokio")]
+  #[tokio::test]
+  async fn write_async_creates_parents_and_sets_mode() {
+    let dir = temp_dir("async");
+    let path = dir.join("nested").join("secret");
+    super::write_async(&path, "hunter2").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hunter2");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+}
