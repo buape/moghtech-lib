@@ -49,14 +49,12 @@ fn impl_derive_resolve(
     .attrs
     .iter()
     .filter(|attr| attr.path().is_ident("empty_traits"))
-    .map(|t| {
-      t.parse_args::<TokenStream>()
-        .expect("failed to parse Trait")
-    });
+    .map(|t| t.parse_args::<TokenStream>())
+    .collect::<Result<Vec<_>, _>>()?;
 
   let ident = &input.ident;
   let mut res = quote! {
-    impl mogh_resolver::HasResponse for #ident {
+    impl ::mogh_resolver::HasResponse for #ident {
       type Response = #response_type;
       type Error = #error_type;
 
@@ -98,12 +96,12 @@ fn impl_derive_resolve(
 
       let enum_res = quote! {
         impl ::mogh_resolver::Resolve<#args_type> for #ident {
-          async fn resolve(self, args: &#args_type) -> Result<Self::Response, Self::Error> {
+          async fn resolve(self, args: &#args_type) -> ::core::result::Result<Self::Response, Self::Error> {
             match self {
               #(#ident::#variants(request) => {
                 match ::mogh_resolver::Resolve::resolve(request, args).await {
-                  Ok(t) => Ok(::core::convert::From::from(t)),
-                  Err(e) => Err(::core::convert::From::from(e)),
+                  ::core::result::Result::Ok(t) => ::core::result::Result::Ok(::core::convert::From::from(t)),
+                  ::core::result::Result::Err(e) => ::core::result::Result::Err(::core::convert::From::from(e)),
                 }
               },)*
             }
