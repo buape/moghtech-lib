@@ -10,6 +10,9 @@ use der::AnyRef;
 mod private;
 mod public;
 
+#[cfg(test)]
+mod tests;
+
 pub use private::Pkcs8PrivateKey;
 pub use public::SpkiPublicKey;
 
@@ -23,6 +26,18 @@ fn algorithm() -> spki::AlgorithmIdentifier<AnyRef<'static>> {
     oid: OID_X25519,
     parameters: None,
   }
+}
+
+/// Wraps a base64 body in pem framing,
+/// with lines wrapped at 64 characters per RFC 7468.
+fn encode_pem(label: &str, base64_body: &str) -> String {
+  let mut pem = format!("-----BEGIN {label}-----\n");
+  for line in base64_body.as_bytes().chunks(64) {
+    pem.push_str(&String::from_utf8_lossy(line));
+    pem.push('\n');
+  }
+  pem.push_str(&format!("-----END {label}-----\n"));
+  pem
 }
 
 pub struct EncodedKeyPair {

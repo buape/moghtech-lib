@@ -7,11 +7,10 @@ use snow::{
   params::NoiseParams,
   resolvers::{CryptoResolver, DefaultResolver},
 };
-use spki::SubjectPublicKeyInfoRef;
 
 use crate::PkiKind;
 
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct SpkiPublicKey(String);
 
 impl From<String> for SpkiPublicKey {
@@ -40,13 +39,7 @@ impl SpkiPublicKey {
   }
 
   pub fn as_pem(&self) -> String {
-    let public_key = &self.0;
-    format!(
-      r#"-----BEGIN PUBLIC KEY-----
-{public_key}
------END PUBLIC KEY-----
-"#
-    )
+    super::encode_pem("PUBLIC KEY", &self.0)
   }
 
   pub fn write_pem_sync(
@@ -105,16 +98,18 @@ impl SpkiPublicKey {
 
   /// Accepts der (not base64)
   pub fn from_der(public_key_der: &[u8]) -> anyhow::Result<Self> {
-    let spki = SubjectPublicKeyInfoRef::from_der(public_key_der)
-      .map_err(anyhow::Error::msg)
-      .context("Invalid public key der")?;
-    if spki.algorithm.oid != super::OID_X25519 {
-      return Err(anyhow!("Public key is not X25519"));
-    }
-    Self::from_raw_bytes(spki.subject_public_key.raw_bytes())
+    let raw = Self::der_to_raw_bytes(public_key_der)?;
+    Self::from_raw_bytes(&raw)
   }
 
   pub fn from_raw_bytes(public_key: &[u8]) -> anyhow::Result<Self> {
+    if public_key.len() != 32 {
+      return Err(anyhow!(
+        "Raw public key length should be 32, got {}",
+        public_key.len()
+      ));
+    }
+
     let bs = BitStringRef::new(0, public_key)
       .map_err(anyhow::Error::msg)
       .context("Failed to parse public key bytes into bit string")?;
@@ -159,12 +154,12 @@ impl SpkiPublicKey {
   pub fn der_to_raw_bytes(
     spki_der: &[u8],
   ) -> anyhow::Result<[u8; 32]> {
-    let Ok(spki) = spki::SubjectPublicKeyInfo::<
+    let spki = spki::SubjectPublicKeyInfo::<
       der::AnyRef<'_>,
       BitStringRef<'_>,
-    >::try_from(spki_der) else {
-      return Err(anyhow!("Public key is not der"));
-    };
+    >::from_der(spki_der)
+    .map_err(anyhow::Error::msg)
+    .context("Invalid public key der")?;
 
     if spki.algorithm.oid != super::OID_X25519 {
       return Err(anyhow!("Public key is not X25519"));

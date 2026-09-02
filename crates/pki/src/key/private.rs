@@ -4,10 +4,22 @@ use anyhow::{Context, anyhow};
 use data_encoding::BASE64;
 use der::{Decode as _, Encode as _, asn1::OctetStringRef};
 
+use subtle::ConstantTimeEq as _;
+
 use crate::PkiKind;
 
-#[derive(PartialEq, Clone)]
+#[derive(Clone)]
 pub struct Pkcs8PrivateKey(String);
+
+/// Constant-time comparison to avoid leaking
+/// secret key material through timing side channels.
+impl PartialEq for Pkcs8PrivateKey {
+  fn eq(&self, other: &Self) -> bool {
+    self.as_bytes().ct_eq(other.as_bytes()).into()
+  }
+}
+
+impl Eq for Pkcs8PrivateKey {}
 
 impl From<String> for Pkcs8PrivateKey {
   fn from(value: String) -> Self {
@@ -35,13 +47,7 @@ impl Pkcs8PrivateKey {
   }
 
   pub fn as_pem(&self) -> String {
-    let private_key = &self.0;
-    format!(
-      r#"-----BEGIN PRIVATE KEY-----
-{private_key}
------END PRIVATE KEY-----
-"#
-    )
+    super::encode_pem("PRIVATE KEY", &self.0)
   }
 
   pub fn write_pem_sync(
@@ -91,11 +97,14 @@ impl Pkcs8PrivateKey {
         pem_rfc7468::decode_vec(maybe_pkcs8_private_key.as_bytes())
           .map_err(anyhow::Error::msg)
           .context("Failed to get der from pem")?;
+      // Validate the der holds a well formed X25519 pkcs8 key
+      Self::raw_bytes_after_decode(&private_key_der)?;
       return Ok(Self(BASE64.encode(&private_key_der)));
     }
     let len = maybe_pkcs8_private_key.len();
     if len == 64 {
-      // already base64 der
+      // already base64 der, validate before storing
+      Self::raw_bytes(maybe_pkcs8_private_key.as_bytes())?;
       Ok(Self(maybe_pkcs8_private_key.to_string()))
     } else if len <= 32 {
       Self::from_raw_bytes(maybe_pkcs8_private_key.as_bytes())
@@ -200,8 +209,15 @@ impl Pkcs8PrivateKey {
       .context("Failed to get octet string ref from private key")?
       .as_bytes();
 
+    if octet.len() != 32 {
+      return Err(anyhow!(
+        "Raw private key length should be 32, got {}",
+        octet.len()
+      ));
+    }
+
     let mut res = [0u8; 32];
-    res[..octet.len()].copy_from_slice(octet);
+    res.copy_from_slice(octet);
     Ok(res)
   }
 
