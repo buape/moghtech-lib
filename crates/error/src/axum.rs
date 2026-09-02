@@ -296,3 +296,163 @@ impl JsonString {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::Serror;
+
+  /// The response bodies here are fully buffered,
+  /// so they resolve without a runtime.
+  fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    loop {
+      match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(value) => return value,
+        std::task::Poll::Pending => std::thread::yield_now(),
+      }
+    }
+  }
+
+  fn body_string(response: axum::response::Response) -> String {
+    let bytes = block_on(axum::body::to_bytes(
+      response.into_body(),
+      usize::MAX,
+    ))
+    .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+  }
+
+  #[test]
+  fn error_defaults_to_internal_server_error() {
+    let error = Error::msg("boom");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(error.headers.is_none());
+  }
+
+  #[test]
+  fn question_mark_conversion_uses_internal_server_error() {
+    fn fails() -> Result<()> {
+      Err(std::io::Error::other("io failure"))?;
+      Ok(())
+    }
+    let error = fails().unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error.error.to_string(), "io failure");
+  }
+
+  #[test]
+  fn status_code_and_header_builders() {
+    let error = Error::msg("boom")
+      .status_code(StatusCode::BAD_REQUEST)
+      .header(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic"),
+      )
+      .header(header::RETRY_AFTER, HeaderValue::from_static("30"));
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    let headers = error.headers.as_ref().unwrap();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Basic");
+    assert_eq!(headers[header::RETRY_AFTER], "30");
+  }
+
+  #[test]
+  fn into_response_maps_status_headers_and_body() {
+    let response = Error::msg("root cause")
+      .status_code(StatusCode::UNAUTHORIZED)
+      .header(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic"),
+      )
+      .into_response();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+      response.headers()[header::CONTENT_TYPE],
+      "application/json"
+    );
+    assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Basic");
+    let serror: Serror =
+      serde_json::from_str(&body_string(response)).unwrap();
+    assert_eq!(serror.error, "root cause");
+    assert!(serror.trace.is_empty());
+  }
+
+  #[test]
+  fn into_response_serializes_context_chain() {
+    let error: Error = anyhow::Context::context(
+      std::result::Result::<(), _>::Err(anyhow::anyhow!(
+        "root cause"
+      )),
+      "top level",
+    )
+    .unwrap_err()
+    .into();
+    let serror: Serror =
+      serde_json::from_str(&body_string(error.into_response()))
+        .unwrap();
+    assert_eq!(serror.error, "top level");
+    assert_eq!(serror.trace, vec!["root cause"]);
+  }
+
+  #[test]
+  fn custom_headers_override_default_content_type() {
+    let response = Error::msg("boom")
+      .header(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain"),
+      )
+      .into_response();
+    assert_eq!(
+      response.headers()[header::CONTENT_TYPE],
+      "text/plain"
+    );
+  }
+
+  #[test]
+  fn add_status_code_on_results() {
+    let result: std::result::Result<(), std::io::Error> =
+      Err(std::io::Error::other("io failure"));
+    let error =
+      result.status_code(StatusCode::NOT_FOUND).unwrap_err();
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
+
+    let ok: std::result::Result<i64, std::io::Error> =
+      std::result::Result::Ok(42);
+    let ok = ok.status_code(StatusCode::NOT_FOUND).unwrap();
+    assert_eq!(ok, 42);
+  }
+
+  #[test]
+  fn add_headers_on_results() {
+    let mut headers = HeaderMap::new();
+    headers
+      .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+    let result: std::result::Result<(), std::io::Error> =
+      Err(std::io::Error::other("io failure"));
+    let error = result.headers(&headers).unwrap_err();
+    assert_eq!(error.headers.unwrap()[header::RETRY_AFTER], "30");
+  }
+
+  #[test]
+  fn response_from_serializable_value() {
+    let Response(response) =
+      Response::from(serde_json::json!({ "a": 1 }));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+      response.headers()[header::CONTENT_TYPE],
+      "application/json"
+    );
+    assert_eq!(body_string(response), r#"{"a":1}"#);
+  }
+
+  #[test]
+  fn json_string_from_serializable_value() {
+    let json = JsonString::from(serde_json::json!({ "a": 1 }));
+    let response = json.into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response), r#"{"a":1}"#);
+  }
+}
