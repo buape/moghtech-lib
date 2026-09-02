@@ -124,8 +124,11 @@ pub fn parse_cicada_path(
     .split('&')
     .filter_map(|pair| {
       let (key, value) = pair.split_once('=')?;
-      matches!(key.trim(), "env" | "envs" | "environment" | "environments")
-        .then_some(value)
+      matches!(
+        key.trim(),
+        "env" | "envs" | "environment" | "environments"
+      )
+      .then_some(value)
     })
     .flat_map(|value| value.split('+'))
     .map(str::trim)
@@ -188,7 +191,7 @@ pub fn load_parse_config_files<T: DeserializeOwned>(
     ) {
       Ok(target) => target,
       Err(e) => {
-        eprint!("{}: {e}", "WARN".yellow());
+        eprintln!("{}: {e}", "WARN".yellow());
         target
       }
     };
@@ -226,7 +229,11 @@ pub fn parse_config_contents<T: DeserializeOwned>(
   file: &Path,
   contents: &str,
 ) -> Result<T> {
-  let config = match file.extension().and_then(|e| e.to_str()) {
+  let extension = file
+    .extension()
+    .and_then(|e| e.to_str())
+    .map(str::to_ascii_lowercase);
+  let config = match extension.as_deref() {
     Some("toml") => {
       toml::from_str(contents).map_err(|e| Error::ParseToml {
         e,

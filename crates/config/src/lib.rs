@@ -84,14 +84,18 @@ impl ConfigLoader<'_, '_> {
     let mut all_files = IndexSet::new();
 
     for &path in paths {
-      // Cicada paths shortcut to all_files
+      // Cicada paths shortcut to all_files.
+      // Note. Must compare against the path as a string,
+      // Path::starts_with compares whole components and misses
+      // the `cicada:some/path` (no slash) form.
       #[cfg(feature = "cicada")]
-      if path.starts_with("cicada:") {
+      if path.to_string_lossy().starts_with("cicada:") {
         let path = path.to_path_buf();
         // If the same path comes up again later on, it should be removed and
         // reinserted so it maintains higher priority.
         all_files.shift_remove(&path);
         all_files.insert(path);
+        continue;
       }
 
       let metadata = match std::fs::metadata(path) {

@@ -91,3 +91,141 @@ pub fn merge_config<T: Serialize + DeserializeOwned>(
   serde_json::from_value(serde_json::Value::Object(object))
     .map_err(|e| Error::ParseFinalJson { e })
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn object(
+    json: serde_json::Value,
+  ) -> serde_json::Map<String, serde_json::Value> {
+    match json {
+      serde_json::Value::Object(object) => object,
+      _ => panic!("expected object"),
+    }
+  }
+
+  #[test]
+  fn source_overrides_target_scalars() {
+    let target =
+      object(serde_json::json!({ "a": 1, "b": "old", "c": true }));
+    let source = object(serde_json::json!({ "b": "new", "d": 2 }));
+    let merged = merge_objects(target, source, false, false).unwrap();
+    assert_eq!(
+      serde_json::Value::Object(merged),
+      serde_json::json!({ "a": 1, "b": "new", "c": true, "d": 2 })
+    );
+  }
+
+  #[test]
+  fn nested_objects_merge_when_enabled() {
+    let target = object(
+      serde_json::json!({ "nested": { "keep": 1, "replace": 1 } }),
+    );
+    let source = object(
+      serde_json::json!({ "nested": { "replace": 2, "add": 3 } }),
+    );
+    let merged = merge_objects(target, source, true, false).unwrap();
+    assert_eq!(
+      serde_json::Value::Object(merged),
+      serde_json::json!({
+        "nested": { "keep": 1, "replace": 2, "add": 3 }
+      })
+    );
+  }
+
+  #[test]
+  fn nested_objects_replace_when_disabled() {
+    let target = object(
+      serde_json::json!({ "nested": { "keep": 1, "replace": 1 } }),
+    );
+    let source =
+      object(serde_json::json!({ "nested": { "replace": 2 } }));
+    let merged = merge_objects(target, source, false, false).unwrap();
+    assert_eq!(
+      serde_json::Value::Object(merged),
+      serde_json::json!({ "nested": { "replace": 2 } })
+    );
+  }
+
+  #[test]
+  fn arrays_extend_when_enabled() {
+    let target = object(serde_json::json!({ "arr": [1, 2] }));
+    let source = object(serde_json::json!({ "arr": [3] }));
+    let merged = merge_objects(target, source, false, true).unwrap();
+    assert_eq!(
+      serde_json::Value::Object(merged),
+      serde_json::json!({ "arr": [1, 2, 3] })
+    );
+  }
+
+  #[test]
+  fn arrays_replace_when_disabled() {
+    let target = object(serde_json::json!({ "arr": [1, 2] }));
+    let source = object(serde_json::json!({ "arr": [3] }));
+    let merged = merge_objects(target, source, false, false).unwrap();
+    assert_eq!(
+      serde_json::Value::Object(merged),
+      serde_json::json!({ "arr": [3] })
+    );
+  }
+
+  #[test]
+  fn object_type_mismatch_errors_when_merging_nested() {
+    let target = object(serde_json::json!({ "field": { "a": 1 } }));
+    let source = object(serde_json::json!({ "field": 42 }));
+    let err = merge_objects(target, source, true, false).unwrap_err();
+    assert!(matches!(
+      err,
+      Error::ObjectFieldTypeMismatch { key, .. } if key == "field"
+    ));
+  }
+
+  #[test]
+  fn array_type_mismatch_errors_when_extending() {
+    let target = object(serde_json::json!({ "field": [1] }));
+    let source = object(serde_json::json!({ "field": 42 }));
+    let err = merge_objects(target, source, false, true).unwrap_err();
+    assert!(matches!(
+      err,
+      Error::ArrayFieldTypeMismatch { key, .. } if key == "field"
+    ));
+  }
+
+  #[test]
+  fn merge_config_merges_typed_values() {
+    #[derive(
+      serde::Serialize, serde::Deserialize, Debug, PartialEq,
+    )]
+    struct Config {
+      a: i64,
+      b: String,
+      arr: Vec<i64>,
+    }
+    let target = Config {
+      a: 1,
+      b: String::from("target"),
+      arr: vec![1],
+    };
+    let source = Config {
+      a: 2,
+      b: String::from("source"),
+      arr: vec![2],
+    };
+    let merged = merge_config(target, source, true, true).unwrap();
+    assert_eq!(
+      merged,
+      Config {
+        a: 2,
+        b: String::from("source"),
+        arr: vec![1, 2],
+      }
+    );
+  }
+
+  #[test]
+  fn merge_config_rejects_non_objects() {
+    let err = merge_config(1_i64, 2_i64, false, false).unwrap_err();
+    assert!(matches!(err, Error::ValueIsNotObject));
+  }
+}
