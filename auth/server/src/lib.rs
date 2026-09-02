@@ -41,9 +41,10 @@ pub type DynFuture<O> =
 pub enum RequestAuthentication {
   /// The user ID comes from JWT, which is already validated by the JwtProvider.
   UserId(String),
-  /// X-API-KEY and X-API-SECRET.
-  /// DANGER ⚠️ the key and secret must still be validated.
-  KeyAndSecret { key: String, secret: String },
+  /// The api key from X-API-KEY. The accompanying X-API-SECRET is
+  /// bcrypt-verified during extraction (against
+  /// [AuthImpl::get_api_key_hashed_secret]) and not needed afterwards.
+  ApiKey(String),
   /// X-API-SIGNATURE and X-API-TIMESTAMP. The handshake produces the public key.
   /// DANGER ⚠️ the public key must still be validated as belonging to a particular client.
   PublicKey(String),
@@ -158,6 +159,10 @@ pub trait AuthImpl: Send + Sync + 'static {
 
   /// Get user id from request authentication
   /// for use in auth management API middleware.
+  ///
+  /// DANGER ⚠️ This expects a [RequestAuthentication] produced by
+  /// [middleware::extract_authenticate_request], which has already
+  /// authenticated the credentials.
   fn get_user_id_from_request_authentication(
     &self,
     auth: RequestAuthentication,
@@ -166,7 +171,7 @@ pub trait AuthImpl: Send + Sync + 'static {
       RequestAuthentication::UserId(user_id) => {
         Box::pin(async { Ok(user_id) })
       }
-      RequestAuthentication::KeyAndSecret { key, .. } => {
+      RequestAuthentication::ApiKey(key) => {
         self.get_api_key_user_id(key)
       }
       RequestAuthentication::PublicKey(public_key) => {
@@ -191,7 +196,7 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// general authenticated requests.
   fn general_rate_limiter(&self) -> &RateLimiter {
     static DISABLED_RATE_LIMITER: LazyLock<Arc<RateLimiter>> =
-      LazyLock::new(|| RateLimiter::new(true, 0, 0));
+      LazyLock::new(|| RateLimiter::new(true, 0, Default::default()));
     &DISABLED_RATE_LIMITER
   }
 
@@ -523,6 +528,49 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
+  /// Returns whether the TOTP `step` is fresh for this user (not
+  /// previously accepted), marking it as consumed if so. Ensures each
+  /// TOTP code is only accepted once (RFC 6238 §5.2).
+  ///
+  /// The default implementation tracks accepted steps in process
+  /// memory, which is best-effort protection scoped to a single
+  /// instance. Implement with app-level storage to enforce this
+  /// across multiple instances and restarts.
+  fn consume_totp_step(
+    &self,
+    user_id: String,
+    step: u64,
+  ) -> DynFuture<mogh_error::Result<bool>> {
+    Box::pin(async move {
+      Ok(api::login::totp::consume_totp_step_in_process(
+        &user_id, step,
+      ))
+    })
+  }
+
+  /// Remove a used TOTP recovery code for the user, identified by its
+  /// bcrypt hash exactly as returned from
+  /// [AuthUserImpl][user::AuthUserImpl]::hashed_totp_recovery_codes,
+  /// so the code cannot be used again.
+  ///
+  /// Must be implemented for [CompleteTotpRecoveryLogin]
+  /// [mogh_auth_client::api::login::CompleteTotpRecoveryLogin]
+  /// to be usable.
+  fn remove_totp_recovery_code(
+    &self,
+    _user_id: String,
+    _hashed_code: String,
+  ) -> DynFuture<mogh_error::Result<()>> {
+    Box::pin(async {
+      Err(
+        anyhow!(
+          "Must implement 'AuthImpl::remove_totp_recovery_code'."
+        )
+        .into(),
+      )
+    })
+  }
+
   fn make_totp(
     &self,
     secret_bytes: Vec<u8>,
@@ -593,6 +641,17 @@ pub trait AuthImpl: Send + Sync + 'static {
       )
     })
   }
+
+  /// Get the bcrypt-hashed secret stored for a given API key,
+  /// or Ok(None) if the key does not exist.
+  ///
+  /// Used by [middleware::extract_authenticate_api_key] to validate
+  /// the X-API-SECRET during request authentication.
+  /// Unknown keys (Ok(None)) are rejected there.
+  fn get_api_key_hashed_secret(
+    &self,
+    key: String,
+  ) -> DynFuture<mogh_error::Result<Option<String>>>;
 
   /// Get the user id for a given API key
   fn get_api_key_user_id(

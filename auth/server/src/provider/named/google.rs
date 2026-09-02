@@ -26,6 +26,12 @@ pub async fn load_google_provider(
   path: &str,
   config: &NamedOauthConfig,
 ) -> Option<Arc<GoogleProvider>> {
+  // Google OpenID discovery only needs to happen once,
+  // reuse the cached provider on subsequent calls.
+  if let Some(client) = google_provider().load_full() {
+    return Some(client);
+  }
+
   let client: Arc<_> =
     GoogleProvider::new(app_user_agent, host, path, config)
       .await?
@@ -151,10 +157,11 @@ impl GoogleProvider {
     };
     let nonce = Nonce::new(random_string(32));
     let redirect_url = format!(
-      "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&state={state}&nonce={}&client_id={}&redirect_uri={}&scope={}",
+      "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&state={}&nonce={}&client_id={}&redirect_uri={}&scope={}",
+      urlencoding::encode(&state),
       urlencoding::encode(nonce.secret()),
       self.client_id,
-      self.redirect_uri,
+      urlencoding::encode(&self.redirect_uri),
       self.scopes
     );
     (state, nonce, redirect_url)

@@ -14,13 +14,12 @@ use crate::{
   AuthImpl,
   api::{
     RedirectQuery, StandardCallbackQuery, get_user_id_or_two_factor,
-    user_id_or_two_factor_redirect,
+    unique_username, user_id_or_two_factor_redirect,
   },
   provider::oidc::{
     OidcProvider, SessionOidcLink, SessionOidcLogin,
     load_oidc_provider,
   },
-  rand::random_string,
   session::Session,
 };
 
@@ -250,18 +249,11 @@ pub async fn oidc_callback<I: AuthImpl>(
           );
         }
 
-        let mut username =
+        let username =
           provider.get_username(&subject, &token, &nonce).await;
 
         // Modify username if it already exists
-        if auth
-          .find_user_with_username(username.clone())
-          .await?
-          .is_some()
-        {
-          username += "-";
-          username += &random_string(5);
-        }
+        let username = unique_username(&auth, username).await?;
 
         let user_id = auth
           .sign_up_oidc_user(
@@ -337,4 +329,62 @@ async fn link_oidc_callback<I: AuthImpl>(
   info!(user_id, "OIDC login linked");
 
   Ok(Redirect::to(auth.post_link_redirect()))
+}
+
+#[cfg(test)]
+mod tests {
+  use axum::response::IntoResponse;
+
+  use super::*;
+
+  fn location(redirect: Redirect) -> String {
+    redirect
+      .into_response()
+      .headers()
+      .get("location")
+      .unwrap()
+      .to_str()
+      .unwrap()
+      .to_string()
+  }
+
+  #[test]
+  fn test_auth_redirect_no_redirect_host() {
+    let redirect =
+      auth_redirect("https://idp.internal/authorize?a=1", "")
+        .unwrap();
+    assert_eq!(
+      location(redirect),
+      "https://idp.internal/authorize?a=1"
+    );
+  }
+
+  #[test]
+  fn test_auth_redirect_replaces_host() {
+    let redirect = auth_redirect(
+      "https://idp.internal/authorize?a=1",
+      "https://idp.external",
+    )
+    .unwrap();
+    assert_eq!(
+      location(redirect),
+      "https://idp.external/authorize?a=1"
+    );
+  }
+
+  #[test]
+  fn test_auth_redirect_host_without_path() {
+    let redirect =
+      auth_redirect("https://idp.internal", "https://idp.external")
+        .unwrap();
+    assert_eq!(location(redirect), "https://idp.external");
+  }
+
+  #[test]
+  fn test_auth_redirect_missing_protocol_errors() {
+    assert!(
+      auth_redirect("idp.internal/authorize", "https://external")
+        .is_err()
+    );
+  }
 }

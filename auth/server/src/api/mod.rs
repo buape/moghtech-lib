@@ -89,6 +89,22 @@ fn format_redirect(
   Redirect::to(&redirect_url)
 }
 
+/// Append a random suffix to the username if it is already taken.
+async fn unique_username<I: AuthImpl>(
+  auth: &I,
+  mut username: String,
+) -> mogh_error::Result<String> {
+  if auth
+    .find_user_with_username(username.clone())
+    .await?
+    .is_some()
+  {
+    username.push('-');
+    username.push_str(&crate::rand::random_string(5));
+  }
+  Ok(username)
+}
+
 async fn get_user_id_or_two_factor<I: AuthImpl>(
   auth: &I,
   session: &Session,
@@ -167,5 +183,128 @@ fn user_id_or_two_factor_redirect<I: AuthImpl>(
         &format!("passkey={passkey}"),
       ))
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use axum::response::IntoResponse;
+
+  use super::*;
+
+  fn location(redirect: Redirect) -> String {
+    redirect
+      .into_response()
+      .headers()
+      .get("location")
+      .unwrap()
+      .to_str()
+      .unwrap()
+      .to_string()
+  }
+
+  #[test]
+  fn test_format_redirect_with_redirect_no_query() {
+    let redirect = format_redirect(
+      "https://example.com",
+      Some("https://example.com/dest"),
+      "redeem_ready=true",
+    );
+    assert_eq!(
+      location(redirect),
+      "https://example.com/dest?redeem_ready=true"
+    );
+  }
+
+  #[test]
+  fn test_format_redirect_with_redirect_existing_query() {
+    let redirect = format_redirect(
+      "https://example.com",
+      Some("https://example.com/dest?a=1"),
+      "totp=true",
+    );
+    assert_eq!(
+      location(redirect),
+      "https://example.com/dest?a=1&totp=true"
+    );
+  }
+
+  #[test]
+  fn test_format_redirect_without_redirect_falls_back_to_host() {
+    let redirect = format_redirect(
+      "https://example.com",
+      None,
+      "redeem_ready=true",
+    );
+    assert_eq!(
+      location(redirect),
+      "https://example.com?redeem_ready=true"
+    );
+  }
+
+  #[test]
+  fn test_format_redirect_empty_redirect_falls_back_to_host() {
+    let redirect =
+      format_redirect("https://example.com", Some(""), "totp=true");
+    assert_eq!(location(redirect), "https://example.com?totp=true");
+  }
+
+  #[test]
+  fn test_format_redirect_empty_extra() {
+    let redirect = format_redirect(
+      "https://example.com",
+      Some("https://example.com/dest"),
+      "",
+    );
+    assert_eq!(location(redirect), "https://example.com/dest");
+    let redirect = format_redirect("https://example.com", None, "");
+    assert_eq!(location(redirect), "https://example.com");
+  }
+
+  #[test]
+  fn test_standard_callback_query_open() {
+    let (state, code) = StandardCallbackQuery {
+      state: Some("state".into()),
+      code: Some("code".into()),
+      error: None,
+    }
+    .open()
+    .unwrap();
+    assert_eq!(state, "state");
+    assert_eq!(code, "code");
+  }
+
+  #[test]
+  fn test_standard_callback_query_open_error_cases() {
+    // Provider error is surfaced
+    assert!(
+      StandardCallbackQuery {
+        state: Some("state".into()),
+        code: Some("code".into()),
+        error: Some("access_denied".into()),
+      }
+      .open()
+      .is_err()
+    );
+    // Missing state
+    assert!(
+      StandardCallbackQuery {
+        state: None,
+        code: Some("code".into()),
+        error: None,
+      }
+      .open()
+      .is_err()
+    );
+    // Missing code
+    assert!(
+      StandardCallbackQuery {
+        state: Some("state".into()),
+        code: None,
+        error: None,
+      }
+      .open()
+      .is_err()
+    );
   }
 }

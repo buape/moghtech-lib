@@ -13,13 +13,12 @@ use crate::{
   AuthImpl,
   api::{
     RedirectQuery, StandardCallbackQuery, get_user_id_or_two_factor,
-    user_id_or_two_factor_redirect,
+    unique_username, user_id_or_two_factor_redirect,
   },
   provider::named::{
     STATE_PREFIX_LENGTH,
     google::{GoogleProvider, load_google_provider},
   },
-  rand::random_string,
   session::Session,
 };
 
@@ -198,23 +197,15 @@ pub async fn google_callback<I: AuthImpl>(
           );
         }
 
-        let mut username = google_user
+        let username = google_user
           .email
           .split('@')
-          .collect::<Vec<&str>>()
-          .first()
-          .unwrap()
+          .next()
+          .unwrap_or_default()
           .to_string();
 
         // Modify username if it already exists
-        if auth
-          .find_user_with_username(username.clone())
-          .await?
-          .is_some()
-        {
-          username += "-";
-          username += &random_string(5);
-        }
+        let username = unique_username(&auth, username).await?;
 
         let user_id = auth
           .sign_up_google_user(

@@ -50,3 +50,59 @@ pub fn validate_api_key_name(name: &str) -> anyhow::Result<()> {
     .validate(name)
     .context("Failed to validate api key name")
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_validate_username_bounds() {
+    assert!(validate_username("").is_err());
+    assert!(validate_username("a").is_ok());
+    assert!(
+      validate_username(&"a".repeat(MAX_USERNAME_LENGTH)).is_ok()
+    );
+    assert!(
+      validate_username(&"a".repeat(MAX_USERNAME_LENGTH + 1))
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn test_validate_username_charset() {
+    assert!(validate_username("user.name_1@example-com").is_ok());
+    assert!(validate_username("user name").is_err());
+    assert!(validate_username("user<script>").is_err());
+  }
+
+  #[test]
+  fn test_validate_password_bounds() {
+    assert!(
+      validate_password(&"a".repeat(MIN_PASSWORD_LENGTH - 1))
+        .is_err()
+    );
+    assert!(
+      validate_password(&"a".repeat(MIN_PASSWORD_LENGTH)).is_ok()
+    );
+    assert!(
+      validate_password(&"a".repeat(MAX_PASSWORD_LENGTH)).is_ok()
+    );
+    assert!(
+      validate_password(&"a".repeat(MAX_PASSWORD_LENGTH + 1))
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn test_validate_api_key_name_bounds() {
+    assert!(validate_api_key_name("my key").is_ok());
+    assert!(
+      validate_api_key_name(&"a".repeat(MAX_API_KEY_NAME_LENGTH))
+        .is_ok()
+    );
+    assert!(
+      validate_api_key_name(&"a".repeat(MAX_API_KEY_NAME_LENGTH + 1))
+        .is_err()
+    );
+  }
+}

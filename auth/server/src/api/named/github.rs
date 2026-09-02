@@ -13,13 +13,12 @@ use crate::{
   AuthImpl,
   api::{
     RedirectQuery, StandardCallbackQuery, get_user_id_or_two_factor,
-    user_id_or_two_factor_redirect,
+    unique_username, user_id_or_two_factor_redirect,
   },
   provider::named::{
     STATE_PREFIX_LENGTH,
     github::{GithubProvider, github_provider},
   },
-  rand::random_string,
   session::Session,
 };
 
@@ -181,17 +180,10 @@ pub async fn github_callback<I: AuthImpl>(
           );
         }
 
-        let mut username = github_user.login;
+        let username = github_user.login;
 
         // Modify username if it already exists
-        if auth
-          .find_user_with_username(username.clone())
-          .await?
-          .is_some()
-        {
-          username += "-";
-          username += &random_string(5);
-        }
+        let username = unique_username(&auth, username).await?;
 
         let user_id = auth
           .sign_up_github_user(

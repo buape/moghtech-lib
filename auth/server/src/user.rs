@@ -18,6 +18,13 @@ pub trait AuthUserImpl: Send + Sync + 'static {
     None
   }
 
+  /// The bcrypt-hashed TOTP recovery codes which have not been used,
+  /// as stored by AuthImpl::update_user_stored_totp at enrollment.
+  /// Required for recovery code login to work.
+  fn hashed_totp_recovery_codes(&self) -> &[String] {
+    &[]
+  }
+
   fn external_skip_2fa(&self) -> bool {
     true
   }

@@ -42,6 +42,14 @@ impl Session {
     &self,
     user_id: &str,
   ) -> mogh_error::Result<()> {
+    // Cycle the session id on privilege elevation to
+    // prevent session fixation attacks. All session data
+    // is retained under the new id.
+    self
+      .0
+      .cycle_id()
+      .await
+      .context("Failed to cycle session id")?;
     self
       .0
       .insert(Self::AUTHENTICATED_USER_ID, user_id)

@@ -65,6 +65,19 @@ impl Resolve<LoginArgs> for SignUpLocalUser {
   }
 }
 
+/// When there is no user or stored password hash to verify against,
+/// still run bcrypt before failing so response timing does not
+/// reveal whether the username exists.
+fn invalid_credentials_after_dummy_hash<I: AuthImpl + ?Sized>(
+  auth: &I,
+  password: &str,
+) -> mogh_error::Error {
+  let _ =
+    bcrypt::hash(password.as_bytes(), auth.local_auth_bcrypt_cost());
+  anyhow!("Invalid login credentials")
+    .status_code(StatusCode::UNAUTHORIZED)
+}
+
 pub async fn login_local_user<I: AuthImpl + ?Sized>(
   auth: &I,
   session: &Session,
@@ -80,16 +93,14 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
 
   auth.validate_username(&username)?;
 
-  let user = auth
-    .find_user_with_username(username)
-    .await?
-    .context("Invalid login credentials")
-    .status_code(StatusCode::UNAUTHORIZED)?;
+  let Some(user) = auth.find_user_with_username(username).await?
+  else {
+    return Err(invalid_credentials_after_dummy_hash(auth, password));
+  };
 
-  let hashed_password = user
-    .hashed_password()
-    .context("Invalid login credentials")
-    .status_code(StatusCode::UNAUTHORIZED)?;
+  let Some(hashed_password) = user.hashed_password() else {
+    return Err(invalid_credentials_after_dummy_hash(auth, password));
+  };
 
   let verified = bcrypt::verify(password, hashed_password)
     .context("Invalid login credentials")
