@@ -31,8 +31,20 @@ pub fn cors_layer(config: impl CorsConfig) -> CorsLayer {
   if allowed_origins.is_empty() {
     info!("CORS using no additional allowed origins.");
   } else if allowed_origins.contains(&ANY_ORIGIN) {
-    warn!("CORS using allowed origin 'Any' (*).",);
-    cors = cors.allow_origin(tower_http::cors::Any)
+    if allow_credentials {
+      // tower-http panics at request time if the wildcard
+      // allowed origin is combined with credentials.
+      // Mirroring the request origin allows any origin
+      // while staying spec-valid alongside credentials.
+      warn!(
+        "CORS using allowed origin 'Any' (*) with credentials: mirroring the request origin.",
+      );
+      cors = cors
+        .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
+    } else {
+      warn!("CORS using allowed origin 'Any' (*).",);
+      cors = cors.allow_origin(tower_http::cors::Any)
+    }
   } else {
     let allowed_origins = allowed_origins
       .iter()

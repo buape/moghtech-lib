@@ -11,6 +11,12 @@ use tracing::info;
 
 pub use axum_server;
 
+// Dev dependencies used by the integration tests only.
+#[cfg(test)]
+use tokio as _;
+#[cfg(test)]
+use tower as _;
+
 pub mod cors;
 pub mod session;
 pub mod ui;
@@ -63,6 +69,21 @@ pub trait ServerConfig {
   }
 }
 
+/// Applies a security header layer to the app,
+/// unless the configured value is an empty string.
+fn apply_security_header(
+  app: Router,
+  name: header::HeaderName,
+  value: &str,
+  error_context: &'static str,
+) -> anyhow::Result<Router> {
+  if value.is_empty() {
+    return Ok(app);
+  }
+  let value = HeaderValue::from_str(value).context(error_context)?;
+  Ok(app.layer(SetResponseHeaderLayer::overriding(name, value)))
+}
+
 /// Serves the app with socket connect info
 /// and security headers applied.
 pub async fn serve_app(
@@ -70,70 +91,36 @@ pub async fn serve_app(
   config: impl ServerConfig,
   handle: impl Into<Option<Handle<SocketAddr>>>,
 ) -> anyhow::Result<()> {
-  // Set content type options
-  let content_type_options = config.x_content_type_options();
-  let content_type_options = (!content_type_options.is_empty())
-    .then(|| HeaderValue::from_str(content_type_options))
-    .transpose()
-    .context("Invalid x_content_type_options value")?;
-  if let Some(content_type_options) = content_type_options {
-    app = app.layer(SetResponseHeaderLayer::overriding(
-      header::X_CONTENT_TYPE_OPTIONS,
-      content_type_options,
-    ));
-  }
-
-  // Set iframe options
-  let frame_options = config.x_frame_options();
-  let frame_options = (!frame_options.is_empty())
-    .then(|| HeaderValue::from_str(frame_options))
-    .transpose()
-    .context("Invalid x_frame_options value")?;
-  if let Some(frame_options) = frame_options {
-    app = app.layer(SetResponseHeaderLayer::overriding(
-      header::X_FRAME_OPTIONS,
-      frame_options,
-    ));
-  }
-
-  // Set xss protection
-  let protection = config.x_xss_protection();
-  let protection = (!protection.is_empty())
-    .then(|| HeaderValue::from_str(protection))
-    .transpose()
-    .context("Invalid x_xss_protection value")?;
-  if let Some(protection) = protection {
-    app = app.layer(SetResponseHeaderLayer::overriding(
-      header::X_XSS_PROTECTION,
-      protection,
-    ));
-  }
-
-  // Set content security policy
-  let csp = config.content_security_policy();
-  let csp = (!csp.is_empty())
-    .then(|| HeaderValue::from_str(csp))
-    .transpose()
-    .context("Invalid content_security_policy value")?;
-  if let Some(csp) = csp {
-    app = app.layer(SetResponseHeaderLayer::overriding(
-      header::CONTENT_SECURITY_POLICY,
-      csp,
-    ));
-  }
-
-  // Set referrer policy
-  let referrer = config.referrer_policy();
-  let referrer = (!referrer.is_empty())
-    .then(|| HeaderValue::from_str(referrer))
-    .transpose()
-    .context("Invalid referrer_policy value")?;
-  if let Some(referrer) = referrer {
-    app = app.layer(SetResponseHeaderLayer::overriding(
-      header::REFERRER_POLICY,
-      referrer,
-    ));
-  }
+  app = apply_security_header(
+    app,
+    header::X_CONTENT_TYPE_OPTIONS,
+    config.x_content_type_options(),
+    "Invalid x_content_type_options value",
+  )?;
+  app = apply_security_header(
+    app,
+    header::X_FRAME_OPTIONS,
+    config.x_frame_options(),
+    "Invalid x_frame_options value",
+  )?;
+  app = apply_security_header(
+    app,
+    header::X_XSS_PROTECTION,
+    config.x_xss_protection(),
+    "Invalid x_xss_protection value",
+  )?;
+  app = apply_security_header(
+    app,
+    header::CONTENT_SECURITY_POLICY,
+    config.content_security_policy(),
+    "Invalid content_security_policy value",
+  )?;
+  app = apply_security_header(
+    app,
+    header::REFERRER_POLICY,
+    config.referrer_policy(),
+    "Invalid referrer_policy value",
+  )?;
 
   let app = app.into_make_service_with_connect_info::<SocketAddr>();
 

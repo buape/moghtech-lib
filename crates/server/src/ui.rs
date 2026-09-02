@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use axum::{
   Router,
-  http::{HeaderValue, header},
+  http::{HeaderValue, StatusCode, header},
 };
 use sha2::Digest as _;
 use tower_http::{
@@ -12,6 +12,19 @@ use tower_http::{
   set_status::SetStatus,
 };
 use tracing::warn;
+
+/// Serves the index fallback with 200 OK status.
+/// Note. `ServeDir::not_found_service` would force the
+/// fallback response status to 404, which breaks browser
+/// caching (the ETag / Cache-Control headers on the index)
+/// for client side routed paths.
+fn with_index_fallback(
+  directory: PathBuf,
+  index: Router,
+) -> ServeDir<SetStatus<Router>> {
+  ServeDir::new(directory)
+    .fallback(SetStatus::new(index, StatusCode::OK))
+}
 
 /// The static UI must have an `index.html` to use as the root.
 ///
@@ -31,8 +44,10 @@ pub fn serve_static_ui(
     Router::new().fallback_service(ServeFile::new(&index));
 
   if force_no_cache {
-    return ServeDir::new(directory)
-      .not_found_service(add_no_cache_layer(index_router));
+    return with_index_fallback(
+      directory,
+      add_no_cache_layer(index_router),
+    );
   }
 
   let index = match hash_encode_contents(&index) {
@@ -53,7 +68,7 @@ pub fn serve_static_ui(
     }
   };
 
-  ServeDir::new(directory).not_found_service(index)
+  with_index_fallback(directory, index)
 }
 
 fn hash_encode_contents(path: &Path) -> anyhow::Result<HeaderValue> {
@@ -64,7 +79,8 @@ fn hash_encode_contents(path: &Path) -> anyhow::Result<HeaderValue> {
   hasher.update(&contents);
   let digest = hasher.finalize();
   let value = data_encoding::BASE64URL.encode(&digest);
-  HeaderValue::from_bytes(value.as_bytes())
+  // ETag values must be wrapped in double quotes (RFC 9110).
+  HeaderValue::from_bytes(format!("\"{value}\"").as_bytes())
     .context("Invalid index hash for ETag header value")
 }
 
