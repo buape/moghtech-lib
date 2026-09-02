@@ -2,6 +2,7 @@ use crate::{JsonValue, U64};
 
 /// Emit authentication event logs,
 /// like password updates and external links.
+#[derive(Debug, Clone)]
 pub struct AuthEvent {
   /// The associated user id
   pub user: String,
@@ -14,6 +15,7 @@ pub struct AuthEvent {
 }
 
 /// The operation type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthOperation {
   /// User created.
   Creation,

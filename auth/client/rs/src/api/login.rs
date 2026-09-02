@@ -154,7 +154,7 @@ pub type ExchangeForJwtResponse = JwtResponse;
   post,
   path = "/login/SignUpLocalUser",
   description = "Sign up a new local user account.",
-  request_body(content = LoginLocalUser),
+  request_body(content = SignUpLocalUser),
   responses(
     (status = 200, description = "Authentication JWT", body = SignUpLocalUserResponse),
     (status = 401, description = "Unauthorized", body = mogh_error::Serror),
@@ -284,3 +284,180 @@ pub struct CompleteTotpLogin {
 /// Response for [CompleteTotpLogin].
 #[typeshare]
 pub type CompleteTotpLoginResponse = JwtResponse;
+
+//
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
+  path = "/login/CompleteTotpRecoveryLogin",
+  description = "Complete login using a TOTP recovery code as second factor.",
+  request_body(content = CompleteTotpRecoveryLogin),
+  responses(
+    (status = 200, description = "Authentication JWT", body = CompleteTotpRecoveryLoginResponse),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn complete_totp_recovery_login() {}
+
+/// Complete login using a TOTP recovery code as second factor.
+/// Each recovery code can only be used once.
+/// Response: [CompleteTotpRecoveryLoginResponse].
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthLoginRequest)]
+#[response(CompleteTotpRecoveryLoginResponse)]
+#[error(mogh_error::Error)]
+pub struct CompleteTotpRecoveryLogin {
+  /// One of the recovery codes issued at TOTP enrollment.
+  pub code: String,
+}
+
+/// Response for [CompleteTotpRecoveryLogin].
+#[typeshare]
+pub type CompleteTotpRecoveryLoginResponse = JwtResponse;
+
+#[cfg(test)]
+mod tests {
+  use std::str::FromStr;
+
+  use mogh_resolver::HasResponse;
+  use serde_json::json;
+
+  use super::*;
+
+  #[test]
+  fn test_req_types_stable() {
+    // These strings are sent as the `type` tag on the wire.
+    assert_eq!(GetLoginOptions::req_type(), "GetLoginOptions");
+    assert_eq!(ExchangeForJwt::req_type(), "ExchangeForJwt");
+    assert_eq!(SignUpLocalUser::req_type(), "SignUpLocalUser");
+    assert_eq!(LoginLocalUser::req_type(), "LoginLocalUser");
+    assert_eq!(
+      CompletePasskeyLogin::req_type(),
+      "CompletePasskeyLogin"
+    );
+    assert_eq!(CompleteTotpLogin::req_type(), "CompleteTotpLogin");
+    assert_eq!(
+      CompleteTotpRecoveryLogin::req_type(),
+      "CompleteTotpRecoveryLogin"
+    );
+  }
+
+  #[test]
+  fn test_jwt_response_wire_format() {
+    let value = serde_json::to_value(JwtResponse {
+      jwt: "token".into(),
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "jwt": "token" }));
+    let res: JwtResponse =
+      serde_json::from_value(json!({ "jwt": "token" })).unwrap();
+    assert_eq!(res.jwt, "token");
+  }
+
+  #[test]
+  fn test_jwt_or_two_factor_wire_format() {
+    // Tagged with `type` / `data`.
+    let value =
+      serde_json::to_value(JwtOrTwoFactor::Jwt(JwtResponse {
+        jwt: "abc".into(),
+      }))
+      .unwrap();
+    assert_eq!(
+      value,
+      json!({ "type": "Jwt", "data": { "jwt": "abc" } })
+    );
+    let res: JwtOrTwoFactor = serde_json::from_value(value).unwrap();
+    match res {
+      JwtOrTwoFactor::Jwt(res) => assert_eq!(res.jwt, "abc"),
+      _ => panic!("expected Jwt variant"),
+    }
+
+    let value =
+      serde_json::to_value(JwtOrTwoFactor::Totp {}).unwrap();
+    assert_eq!(value, json!({ "type": "Totp", "data": {} }));
+    let res: JwtOrTwoFactor = serde_json::from_value(value).unwrap();
+    assert!(matches!(res, JwtOrTwoFactor::Totp {}));
+  }
+
+  #[test]
+  fn test_user_id_or_two_factor_wire_format() {
+    let value = serde_json::to_value(UserIdOrTwoFactor::UserId(
+      "user-id".into(),
+    ))
+    .unwrap();
+    assert_eq!(value, json!({ "type": "UserId", "data": "user-id" }));
+    let res: UserIdOrTwoFactor =
+      serde_json::from_value(value).unwrap();
+    match res {
+      UserIdOrTwoFactor::UserId(id) => assert_eq!(id, "user-id"),
+      _ => panic!("expected UserId variant"),
+    }
+  }
+
+  #[test]
+  fn test_login_provider_representations() {
+    // serde representation
+    assert_eq!(
+      serde_json::to_value(LoginProvider::Local).unwrap(),
+      json!("Local")
+    );
+    let provider: LoginProvider =
+      serde_json::from_value(json!("Github")).unwrap();
+    assert!(matches!(provider, LoginProvider::Github));
+    // strum Display / FromStr representation
+    assert_eq!(LoginProvider::Oidc.to_string(), "Oidc");
+    assert!(matches!(
+      LoginProvider::from_str("Google").unwrap(),
+      LoginProvider::Google
+    ));
+    assert!(LoginProvider::from_str("Unknown").is_err());
+    // External providers
+    assert_eq!(ExternalLoginProvider::Oidc.to_string(), "Oidc");
+    assert!(matches!(
+      ExternalLoginProvider::from_str("Github").unwrap(),
+      ExternalLoginProvider::Github
+    ));
+  }
+
+  #[test]
+  fn test_get_login_options_response_wire_format() {
+    let value = serde_json::to_value(GetLoginOptionsResponse {
+      local: true,
+      oidc: false,
+      github: true,
+      google: false,
+      registration_disabled: true,
+      oidc_auto_redirect: false,
+    })
+    .unwrap();
+    assert_eq!(
+      value,
+      json!({
+        "local": true,
+        "oidc": false,
+        "github": true,
+        "google": false,
+        "registration_disabled": true,
+        "oidc_auto_redirect": false,
+      })
+    );
+  }
+
+  #[test]
+  fn test_login_local_user_wire_format() {
+    let value = serde_json::to_value(LoginLocalUser {
+      username: "user".into(),
+      password: "pass".into(),
+    })
+    .unwrap();
+    assert_eq!(
+      value,
+      json!({ "username": "user", "password": "pass" })
+    );
+  }
+}

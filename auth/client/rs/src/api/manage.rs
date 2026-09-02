@@ -107,7 +107,7 @@ fn update_password() {}
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthManageRequest)]
-#[response(UpdateUsernameResponse)]
+#[response(UpdatePasswordResponse)]
 #[error(mogh_error::Error)]
 pub struct UpdatePassword {
   pub password: String,
@@ -444,7 +444,7 @@ pub type UpdateExternalSkip2faResponse = NoData;
 fn create_api_key() {}
 
 /// Create an API key for the calling user.
-/// Response: [NoData].
+/// Response: [CreateApiKeyResponse].
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -528,7 +528,7 @@ pub type DeleteApiKeyResponse = NoData;
 fn create_api_key_v2() {}
 
 /// Create an API key (v2) for the calling user.
-/// Response: [NoData].
+/// Response: [CreateApiKeyV2Response].
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -573,10 +573,10 @@ pub struct CreateApiKeyV2Response {
 #[utoipa::path(
   post,
   path = "/manage/DeleteApiKeyV2",
-  description = "Create an api key (v2) for the calling user.",
+  description = "Delete an api key (v2) for the calling user.",
   request_body(content = DeleteApiKeyV2),
   responses(
-    (status = 200, description = "The private key, if one was generated.", body = DeleteApiKeyV2Response),
+    (status = 200, description = "Api key deleted.", body = DeleteApiKeyV2Response),
     (status = 400, description = "Invalid api key name", body = mogh_error::Serror),
     (status = 500, description = "Failed", body = mogh_error::Serror),
   ),
@@ -592,21 +592,172 @@ fn delete_api_key_v2() {}
 #[response(DeleteApiKeyV2Response)]
 #[error(mogh_error::Error)]
 pub struct DeleteApiKeyV2 {
-  /// The name for the api key.
-  pub name: String,
-
-  /// A unix timestamp in millseconds specifying api key expire time.
-  /// Default is 0, which means no expiry.
-  #[serde(default)]
-  pub expires: U64,
-
-  /// Optionally provide a pre-existing public key.
-  /// Otherwise, a private key will be generated and
-  /// returned in the response
-  #[serde(default)]
+  /// The public key of the api key to delete.
   pub public_key: String,
 }
 
 /// Response for [DeleteApiKeyV2].
 #[typeshare]
 pub type DeleteApiKeyV2Response = NoData;
+
+#[cfg(test)]
+mod tests {
+  use mogh_resolver::HasResponse;
+  use serde_json::json;
+
+  use super::*;
+
+  #[test]
+  fn test_req_types_stable() {
+    // These strings are sent as the `type` tag on the wire.
+    assert_eq!(GetUserId::req_type(), "GetUserId");
+    assert_eq!(UpdateUsername::req_type(), "UpdateUsername");
+    assert_eq!(UpdatePassword::req_type(), "UpdatePassword");
+    assert_eq!(
+      BeginPasskeyEnrollment::req_type(),
+      "BeginPasskeyEnrollment"
+    );
+    assert_eq!(
+      ConfirmPasskeyEnrollment::req_type(),
+      "ConfirmPasskeyEnrollment"
+    );
+    assert_eq!(UnenrollPasskey::req_type(), "UnenrollPasskey");
+    assert_eq!(
+      BeginTotpEnrollment::req_type(),
+      "BeginTotpEnrollment"
+    );
+    assert_eq!(
+      ConfirmTotpEnrollment::req_type(),
+      "ConfirmTotpEnrollment"
+    );
+    assert_eq!(UnenrollTotp::req_type(), "UnenrollTotp");
+    assert_eq!(
+      BeginExternalLoginLink::req_type(),
+      "BeginExternalLoginLink"
+    );
+    assert_eq!(UnlinkLogin::req_type(), "UnlinkLogin");
+    assert_eq!(
+      UpdateExternalSkip2fa::req_type(),
+      "UpdateExternalSkip2fa"
+    );
+    assert_eq!(CreateApiKey::req_type(), "CreateApiKey");
+    assert_eq!(DeleteApiKey::req_type(), "DeleteApiKey");
+    assert_eq!(CreateApiKeyV2::req_type(), "CreateApiKeyV2");
+    assert_eq!(DeleteApiKeyV2::req_type(), "DeleteApiKeyV2");
+  }
+
+  #[test]
+  fn test_update_password_response_type() {
+    // Regression: UpdatePassword was declared with
+    // `#[response(UpdateUsernameResponse)]`. Both aliases
+    // resolve to NoData, but the declared response should
+    // be UpdatePasswordResponse.
+    fn assert_response<T: HasResponse<Response = NoData>>() {}
+    assert_response::<UpdatePassword>();
+    assert_eq!(UpdatePassword::res_type(), "UpdatePasswordResponse");
+  }
+
+  #[test]
+  fn test_no_data_wire_format() {
+    let value = serde_json::to_value(NoData {}).unwrap();
+    assert_eq!(value, json!({}));
+    let _: NoData = serde_json::from_value(json!({})).unwrap();
+  }
+
+  #[test]
+  fn test_get_user_id_response_wire_format() {
+    let value = serde_json::to_value(GetUserIdResponse {
+      id: "user-id".into(),
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "id": "user-id" }));
+  }
+
+  #[test]
+  fn test_create_api_key_expires_defaults_to_zero() {
+    // Backwards compatibility: `expires` may be omitted.
+    let req: CreateApiKey =
+      serde_json::from_value(json!({ "name": "key-name" })).unwrap();
+    assert_eq!(req.name, "key-name");
+    assert_eq!(req.expires, 0);
+    let value = serde_json::to_value(CreateApiKey {
+      name: "key-name".into(),
+      expires: 100,
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "name": "key-name", "expires": 100 }));
+  }
+
+  #[test]
+  fn test_create_api_key_v2_defaults() {
+    // `expires` and `public_key` may both be omitted.
+    let req: CreateApiKeyV2 =
+      serde_json::from_value(json!({ "name": "key-name" })).unwrap();
+    assert_eq!(req.name, "key-name");
+    assert_eq!(req.expires, 0);
+    assert!(req.public_key.is_empty());
+  }
+
+  #[test]
+  fn test_create_api_key_response_wire_format() {
+    let value = serde_json::to_value(CreateApiKeyResponse {
+      key: "K".into(),
+      secret: "S".into(),
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "key": "K", "secret": "S" }));
+  }
+
+  #[test]
+  fn test_create_api_key_v2_response_wire_format() {
+    let value = serde_json::to_value(CreateApiKeyV2Response {
+      private_key: None,
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "private_key": null }));
+    let res: CreateApiKeyV2Response =
+      serde_json::from_value(json!({ "private_key": "pk-contents" }))
+        .unwrap();
+    assert_eq!(res.private_key.as_deref(), Some("pk-contents"));
+  }
+
+  #[test]
+  fn test_confirm_totp_enrollment_response_wire_format() {
+    let value = serde_json::to_value(ConfirmTotpEnrollmentResponse {
+      recovery_codes: vec!["a".into(), "b".into()],
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "recovery_codes": ["a", "b"] }));
+  }
+
+  #[test]
+  fn test_unlink_login_wire_format() {
+    let value = serde_json::to_value(UnlinkLogin {
+      provider: LoginProvider::Oidc,
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "provider": "Oidc" }));
+  }
+
+  #[test]
+  fn test_update_external_skip_2fa_wire_format() {
+    let value = serde_json::to_value(UpdateExternalSkip2fa {
+      external_skip_2fa: true,
+    })
+    .unwrap();
+    assert_eq!(value, json!({ "external_skip_2fa": true }));
+  }
+
+  #[test]
+  fn test_begin_totp_enrollment_response_wire_format() {
+    let value = serde_json::to_value(BeginTotpEnrollmentResponse {
+      uri: "otpauth://totp/x".into(),
+      png: "base64png".into(),
+    })
+    .unwrap();
+    assert_eq!(
+      value,
+      json!({ "uri": "otpauth://totp/x", "png": "base64png" })
+    );
+  }
+}
