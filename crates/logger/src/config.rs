@@ -104,16 +104,100 @@ pub trait LogConfig {
   /// Specify which module targets (eg the current binary) are included.
   ///
   /// ```rust
-  /// fn targets(&self) -> &[String] {
-  ///   use std::sync::LazyLock;
-  ///   static TARGETS: LazyLock<Vec<String>> =
-  ///     LazyLock::new(|| {
-  ///       ["binary_name"].into_iter().map(str::to_string).collect()
-  ///     });
-  ///   &TARGETS
+  /// struct MyConfig;
+  ///
+  /// impl mogh_logger::LogConfig for MyConfig {
+  ///   fn targets(&self) -> &[String] {
+  ///     use std::sync::LazyLock;
+  ///     static TARGETS: LazyLock<Vec<String>> =
+  ///       LazyLock::new(|| {
+  ///         ["binary_name"].into_iter().map(str::to_string).collect()
+  ///       });
+  ///     &TARGETS
+  ///   }
   /// }
   /// ```
   fn targets(&self) -> &[String] {
     &[]
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn log_level_parses_lowercase() {
+    for (json, expected) in [
+      ("\"trace\"", LogLevel::Trace),
+      ("\"debug\"", LogLevel::Debug),
+      ("\"info\"", LogLevel::Info),
+      ("\"warn\"", LogLevel::Warn),
+      ("\"error\"", LogLevel::Error),
+    ] {
+      let parsed: LogLevel = serde_json::from_str(json).unwrap();
+      assert_eq!(parsed, expected);
+      assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+    // Non lowercase variants are rejected
+    assert!(serde_json::from_str::<LogLevel>("\"Info\"").is_err());
+  }
+
+  #[test]
+  fn log_level_default_is_info() {
+    assert_eq!(LogLevel::default(), LogLevel::Info);
+  }
+
+  #[test]
+  fn log_level_into_tracing_level() {
+    assert_eq!(
+      tracing::Level::from(LogLevel::Trace),
+      tracing::Level::TRACE
+    );
+    assert_eq!(
+      tracing::Level::from(LogLevel::Debug),
+      tracing::Level::DEBUG
+    );
+    assert_eq!(
+      tracing::Level::from(LogLevel::Info),
+      tracing::Level::INFO
+    );
+    assert_eq!(
+      tracing::Level::from(LogLevel::Warn),
+      tracing::Level::WARN
+    );
+    assert_eq!(
+      tracing::Level::from(LogLevel::Error),
+      tracing::Level::ERROR
+    );
+  }
+
+  #[test]
+  fn stdio_log_mode_parses() {
+    for (json, expected) in [
+      ("\"Standard\"", StdioLogMode::Standard),
+      ("\"Json\"", StdioLogMode::Json),
+      ("\"None\"", StdioLogMode::None),
+    ] {
+      let parsed: StdioLogMode = serde_json::from_str(json).unwrap();
+      assert_eq!(parsed, expected);
+      assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+    assert_eq!(StdioLogMode::default(), StdioLogMode::Standard);
+  }
+
+  #[test]
+  fn log_config_defaults() {
+    struct Default_;
+    impl LogConfig for Default_ {}
+    let config = Default_;
+    assert_eq!(config.level(), tracing::Level::INFO);
+    assert_eq!(config.stdio(), StdioLogMode::Standard);
+    assert!(!config.pretty());
+    assert!(!config.location());
+    assert!(config.ansi());
+    assert!(config.timestamps());
+    assert!(config.otlp_endpoint().is_empty());
+    assert!(config.targets().is_empty());
   }
 }
