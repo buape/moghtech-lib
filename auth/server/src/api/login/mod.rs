@@ -229,13 +229,6 @@ mod tests {
     fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
       panic!("not needed for these tests")
     }
-
-    fn get_api_key_hashed_secret(
-      &self,
-      _key: String,
-    ) -> crate::DynFuture<mogh_error::Result<Option<String>>> {
-      Box::pin(async { Ok(None) })
-    }
   }
 
   #[test]

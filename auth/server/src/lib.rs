@@ -39,12 +39,13 @@ pub type DynFuture<O> =
 
 #[derive(Clone)]
 pub enum RequestAuthentication {
-  /// The user ID comes from JWT, which is already validated by the JwtProvider.
-  UserId(String),
-  /// The api key from X-API-KEY. The accompanying X-API-SECRET is
-  /// bcrypt-verified during extraction (against
-  /// [AuthImpl::get_api_key_hashed_secret]) and not needed afterwards.
-  ApiKey(String),
+  /// Jwt's coming through the AUTHORIZATION header.
+  /// DANGER ⚠️ the jwt must still be validated as belonging to a particular client.
+  Jwt(String),
+  /// The api key and secret from X-API-KEY and X-API-SECRET.
+  /// DANGER ⚠️ the secret needs bcrypt compare with matching
+  /// api key's hashed secret to be validated as belonging to a particular client.
+  ApiKey { key: String, secret: String },
   /// X-API-SIGNATURE and X-API-TIMESTAMP. The handshake produces the public key.
   /// DANGER ⚠️ the public key must still be validated as belonging to a particular client.
   PublicKey(String),
@@ -157,22 +158,26 @@ pub trait AuthImpl: Send + Sync + 'static {
     req: Request,
   ) -> DynFuture<mogh_error::Result<Request>>;
 
-  /// Get user id from request authentication
+  /// Authenticates the request credentials and returns the user id,
   /// for use in auth management API middleware.
   ///
-  /// DANGER ⚠️ This expects a [RequestAuthentication] produced by
-  /// [middleware::extract_authenticate_request], which has already
-  /// authenticated the credentials.
+  /// - [RequestAuthentication::Jwt]: validated with
+  ///   [middleware::get_jwt_user_id].
+  /// - [RequestAuthentication::ApiKey]: secret verified and mapped
+  ///   with [Self::get_api_key_user_id].
+  /// - [RequestAuthentication::PublicKey]: mapped with
+  ///   [Self::get_api_key_v2_user_id].
   fn get_user_id_from_request_authentication(
     &self,
     auth: RequestAuthentication,
   ) -> DynFuture<mogh_error::Result<String>> {
     match auth {
-      RequestAuthentication::UserId(user_id) => {
-        Box::pin(async { Ok(user_id) })
+      RequestAuthentication::Jwt(jwt) => {
+        let user_id = middleware::get_jwt_user_id(self, &jwt);
+        Box::pin(async move { user_id })
       }
-      RequestAuthentication::ApiKey(key) => {
-        self.get_api_key_user_id(key)
+      RequestAuthentication::ApiKey { key, secret } => {
+        self.get_api_key_user_id(key, secret)
       }
       RequestAuthentication::PublicKey(public_key) => {
         self.get_api_key_v2_user_id(public_key)
@@ -642,21 +647,15 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
-  /// Get the bcrypt-hashed secret stored for a given API key,
-  /// or Ok(None) if the key does not exist.
-  ///
-  /// Used by [middleware::extract_authenticate_api_key] to validate
-  /// the X-API-SECRET during request authentication.
-  /// Unknown keys (Ok(None)) are rejected there.
-  fn get_api_key_hashed_secret(
-    &self,
-    key: String,
-  ) -> DynFuture<mogh_error::Result<Option<String>>>;
-
-  /// Get the user id for a given API key
+  /// Get the user id for a given API key.
+  /// DANGER ⚠️ the incoming secret must still be validated as matching the
+  /// known hashed secret for the api key. Use
+  /// [middleware::verify_api_key_secret] with the stored hash
+  /// (or `None` if the key does not exist) to do so.
   fn get_api_key_user_id(
     &self,
     _key: String,
+    _secret: String,
   ) -> DynFuture<mogh_error::Result<String>> {
     Box::pin(async {
       Err(
@@ -666,8 +665,12 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
+  /// Delete the api key, only if it belongs to `user_id`.
+  /// Must error (eg FORBIDDEN / NOT_FOUND) if the key does not
+  /// belong to the user.
   fn delete_api_key(
     &self,
+    _user_id: String,
     _key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async {
@@ -709,8 +712,12 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
+  /// Delete the api key (v2), only if it belongs to `user_id`.
+  /// Must error (eg FORBIDDEN / NOT_FOUND) if the key does not
+  /// belong to the user.
   fn delete_api_key_v2(
     &self,
+    _user_id: String,
     _public_key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async {
@@ -719,5 +726,126 @@ pub trait AuthImpl: Send + Sync + 'static {
           .into(),
       )
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  struct TestAuth {
+    jwt_provider: JwtProvider,
+    /// Simulates the stored bcrypt hash for any api key.
+    /// None simulates an unknown api key.
+    hashed_secret: Option<String>,
+  }
+
+  impl TestAuth {
+    fn with_hashed_secret(hashed_secret: Option<String>) -> Self {
+      Self {
+        jwt_provider: JwtProvider::new(b"secret", 60_000),
+        hashed_secret,
+      }
+    }
+  }
+
+  impl AuthImpl for TestAuth {
+    fn new() -> Self {
+      Self::with_hashed_secret(None)
+    }
+    fn get_user(
+      &self,
+      _user_id: String,
+    ) -> DynFuture<mogh_error::Result<BoxAuthUser>> {
+      Box::pin(async { Err(anyhow!("unimplemented").into()) })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: RequestAuthentication,
+      _require_user_enabled: bool,
+      req: Request,
+    ) -> DynFuture<mogh_error::Result<Request>> {
+      Box::pin(async { Ok(req) })
+    }
+    fn jwt_provider(&self) -> &JwtProvider {
+      &self.jwt_provider
+    }
+    // Low cost to keep the unknown-key dummy hash fast.
+    fn api_secret_bcrypt_cost(&self) -> u32 {
+      4
+    }
+    /// The intended implementation shape: one lookup for the key,
+    /// then verify the secret with the helper.
+    fn get_api_key_user_id(
+      &self,
+      key: String,
+      secret: String,
+    ) -> DynFuture<mogh_error::Result<String>> {
+      let verified = middleware::verify_api_key_secret(
+        self,
+        &secret,
+        self.hashed_secret.as_deref(),
+      );
+      Box::pin(async move {
+        verified?;
+        Ok(format!("user-of-{key}"))
+      })
+    }
+  }
+
+  #[tokio::test]
+  async fn test_get_user_id_from_jwt() {
+    let auth = TestAuth::new();
+    let jwt = auth.jwt_provider().encode_sub("user-1").unwrap().jwt;
+    let user_id = auth
+      .get_user_id_from_request_authentication(
+        RequestAuthentication::Jwt(jwt),
+      )
+      .await
+      .unwrap();
+    assert_eq!(user_id, "user-1");
+  }
+
+  #[tokio::test]
+  async fn test_get_user_id_from_jwt_rejects_forged() {
+    let auth = TestAuth::new();
+    let forged = JwtProvider::new(b"other", 60_000)
+      .encode_sub("user-1")
+      .unwrap()
+      .jwt;
+    let err = auth
+      .get_user_id_from_request_authentication(
+        RequestAuthentication::Jwt(forged),
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn test_get_user_id_from_api_key_verifies_secret() {
+    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
+    let auth = TestAuth::with_hashed_secret(Some(hashed));
+    let user_id = auth
+      .get_user_id_from_request_authentication(
+        RequestAuthentication::ApiKey {
+          key: "K_abc_K".into(),
+          secret: "S_def_S".into(),
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(user_id, "user-of-K_abc_K");
+
+    let err = auth
+      .get_user_id_from_request_authentication(
+        RequestAuthentication::ApiKey {
+          key: "K_abc_K".into(),
+          secret: "S_wrong_S".into(),
+        },
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 }

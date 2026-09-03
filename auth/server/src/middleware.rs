@@ -13,9 +13,7 @@ use mogh_rate_limit::WithFailureRateLimit;
 use mogh_request_ip::RequestIp;
 use reqwest::StatusCode;
 
-use crate::{
-  AuthImpl, RequestAuthentication, provider::jwt::JwtProvider,
-};
+use crate::{AuthImpl, RequestAuthentication};
 
 pub async fn authenticate_request<
   I: AuthImpl,
@@ -28,59 +26,56 @@ pub async fn authenticate_request<
 ) -> mogh_error::Result<Response> {
   let auth = I::new();
 
-  let req = {
-    let auth = &auth;
-    async move {
-      let req_auth = extract_authenticate_request(
-        auth,
-        req.method(),
-        &uri,
-        req.headers(),
-      )
-      .await?
-      .context("Invalid client credentials")
-      .status_code(StatusCode::UNAUTHORIZED)?;
+  let req_auth = extract_request_authentication(
+    &auth,
+    req.method(),
+    &uri,
+    req.headers(),
+  )?
+  .context("Invalid client credentials")
+  .status_code(StatusCode::UNAUTHORIZED)?;
 
-      auth
-        .handle_request_authentication(
-          req_auth,
-          REQUIRE_USER_ENABLED,
-          req,
-        )
-        .await
-    }
-  }
-  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
-  .await?;
+  let req = auth
+    .handle_request_authentication(
+      req_auth,
+      REQUIRE_USER_ENABLED,
+      req,
+    )
+    .with_failure_rate_limit_using_ip(
+      auth.general_rate_limiter(),
+      &ip,
+    )
+    .await?;
 
   Ok(next.run(req).await)
 }
 
-/// Extracts and authenticates the request credentials, trying
-/// [extract_authenticate_user_id], [extract_authenticate_api_key],
-/// and [extract_authenticate_public_key] in order.
+/// Maps the request credential headers to [RequestAuthentication],
+/// trying [extract_request_jwt], [extract_request_api_key],
+/// and [extract_request_public_key] in order.
+///
+/// DANGER ⚠️ This does not authenticate the credentials
+/// (see [RequestAuthentication]). Authentication happens downstream
+/// in [AuthImpl::handle_request_authentication] /
+/// [AuthImpl::get_user_id_from_request_authentication].
 ///
 /// Returns `Ok(None)` when the request carries no credentials.
-pub async fn extract_authenticate_request<I: AuthImpl>(
+pub fn extract_request_authentication<I: AuthImpl>(
   auth: &I,
   method: &Method,
   uri: &Uri,
   headers: &HeaderMap,
 ) -> mogh_error::Result<Option<RequestAuthentication>> {
-  if let Some(user_id) =
-    extract_authenticate_user_id(auth.jwt_provider(), headers)?
-  {
-    return Ok(Some(RequestAuthentication::UserId(user_id)));
+  if let Some(jwt) = extract_request_jwt(headers)? {
+    return Ok(Some(RequestAuthentication::Jwt(jwt)));
   }
 
-  if let Some(key) =
-    extract_authenticate_api_key(auth, headers).await?
-  {
-    return Ok(Some(RequestAuthentication::ApiKey(key)));
+  if let Some((key, secret)) = extract_request_api_key(headers)? {
+    return Ok(Some(RequestAuthentication::ApiKey { key, secret }));
   }
 
   if let Some(public_key) =
-    extract_authenticate_public_key(auth, method, uri, headers)?
+    extract_request_public_key(auth, method, uri, headers)?
   {
     return Ok(Some(RequestAuthentication::PublicKey(public_key)));
   }
@@ -88,12 +83,12 @@ pub async fn extract_authenticate_request<I: AuthImpl>(
   Ok(None)
 }
 
-/// Extracts the user id from the AUTHORIZATION header.
+/// Extracts the jwt from the AUTHORIZATION header,
+/// stripping any `Bearer ` prefix.
 ///
-/// This performs authentication: the JWT signature and expiry
-/// are validated by the [JwtProvider].
-pub fn extract_authenticate_user_id(
-  jwt_provider: &JwtProvider,
+/// DANGER ⚠️ The jwt is not validated here, see
+/// [get_jwt_user_id].
+pub fn extract_request_jwt(
   headers: &HeaderMap,
 ) -> mogh_error::Result<Option<String>> {
   let Some(authorization) = headers.get("authorization") else {
@@ -105,19 +100,17 @@ pub fn extract_authenticate_user_id(
     .trim();
   let jwt =
     maybe_bearer.strip_prefix("Bearer ").unwrap_or(maybe_bearer);
-  let user_id = jwt_provider.decode_sub(jwt)?;
-  Ok(Some(user_id))
+  Ok(Some(jwt.to_string()))
 }
 
-/// Extracts the api key from the X-API-KEY / X-API-SECRET headers.
+/// Extracts the (key, secret) from the
+/// X-API-KEY / X-API-SECRET headers.
 ///
-/// This performs authentication: the secret is bcrypt-verified
-/// against the stored hash from [AuthImpl::get_api_key_hashed_secret],
-/// and is not needed after this returns. Unknown keys are rejected.
-pub async fn extract_authenticate_api_key<I: AuthImpl>(
-  auth: &I,
+/// DANGER ⚠️ The secret is not validated here, see
+/// [verify_api_key_secret].
+pub fn extract_request_api_key(
   headers: &HeaderMap,
-) -> mogh_error::Result<Option<String>> {
+) -> mogh_error::Result<Option<(String, String)>> {
   let Some(key) = headers.get("x-api-key") else {
     return Ok(None);
   };
@@ -135,40 +128,19 @@ pub async fn extract_authenticate_api_key<I: AuthImpl>(
     .context("X-API-SECRET is not valid UTF-8")?
     .trim()
     .to_string();
-
-  let Some(hashed_secret) =
-    auth.get_api_key_hashed_secret(key.clone()).await?
-  else {
-    // Unknown key: still run bcrypt before failing so response
-    // timing does not reveal whether the api key exists.
-    let _ = bcrypt::hash(&secret, auth.api_secret_bcrypt_cost());
-    return Err(
-      anyhow!("Invalid client credentials")
-        .status_code(StatusCode::UNAUTHORIZED),
-    );
-  };
-
-  let verified = bcrypt::verify(&secret, &hashed_secret)
-    .context("Invalid client credentials")
-    .status_code(StatusCode::UNAUTHORIZED)?;
-  if !verified {
-    return Err(
-      anyhow!("Invalid client credentials")
-        .status_code(StatusCode::UNAUTHORIZED),
-    );
-  }
-
-  Ok(Some(key))
+  Ok(Some((key, secret)))
 }
 
 /// Extracts the client public key from the
 /// X-API-SIGNATURE / X-API-TIMESTAMP headers.
 ///
-/// This performs authentication: the timestamp must be ~now, and the
-/// signature must complete a noise handshake against the server
-/// private key over a prologue binding method, uri, and timestamp.
-/// The resulting public key still must be matched to a known client.
-pub fn extract_authenticate_public_key<I: AuthImpl>(
+/// The timestamp must be ~now, and the signature must complete a
+/// noise handshake against the server private key over a prologue
+/// binding method, uri, and timestamp. This proves the client holds
+/// the private key for the returned public key, nothing more.
+///
+/// DANGER ⚠️ The public key must still be matched to a known client.
+pub fn extract_request_public_key<I: AuthImpl>(
   auth: &I,
   method: &Method,
   uri: &Uri,
@@ -214,6 +186,51 @@ pub fn extract_authenticate_public_key<I: AuthImpl>(
   Ok(Some(public_key))
 }
 
+/// Helper for authenticating [RequestAuthentication::Jwt]:
+/// validates the jwt (signature, expiry, iss / aud) with
+/// [AuthImpl::jwt_provider] and returns the user id (`sub`),
+/// returning UNAUTHORIZED if invalid.
+pub fn get_jwt_user_id<I: AuthImpl + ?Sized>(
+  auth: &I,
+  jwt: &str,
+) -> mogh_error::Result<String> {
+  auth
+    .jwt_provider()
+    .decode_sub(jwt)
+    .status_code(StatusCode::UNAUTHORIZED)
+}
+
+/// Helper for implementing [AuthImpl::get_api_key_user_id]:
+/// bcrypt verifies the incoming secret against the stored hash,
+/// returning UNAUTHORIZED for an unknown key or non-matching secret.
+///
+/// Pass `None` when the key does not exist: a dummy hash is still
+/// run so response timing does not reveal whether the key exists.
+pub fn verify_api_key_secret<I: AuthImpl>(
+  auth: &I,
+  secret: &str,
+  hashed_secret: Option<&str>,
+) -> mogh_error::Result<()> {
+  let Some(hashed_secret) = hashed_secret else {
+    let _ = bcrypt::hash(secret, auth.api_secret_bcrypt_cost());
+    return Err(
+      anyhow!("Invalid client credentials")
+        .status_code(StatusCode::UNAUTHORIZED),
+    );
+  };
+  let verified = bcrypt::verify(secret, hashed_secret)
+    .context("Invalid client credentials")
+    .status_code(StatusCode::UNAUTHORIZED)?;
+  if verified {
+    Ok(())
+  } else {
+    Err(
+      anyhow!("Invalid client credentials")
+        .status_code(StatusCode::UNAUTHORIZED),
+    )
+  }
+}
+
 pub fn pki_auth_prologue(
   method: &Method,
   uri: &Uri,
@@ -229,25 +246,11 @@ mod tests {
   use super::*;
   use crate::{DynFuture, provider::jwt::JwtProvider};
 
-  struct TestAuth {
-    jwt_provider: JwtProvider,
-    /// Simulates the stored bcrypt hash for any api key.
-    /// None simulates an unknown api key.
-    hashed_secret: Option<String>,
-  }
-
-  impl TestAuth {
-    fn new(hashed_secret: Option<String>) -> Self {
-      Self {
-        jwt_provider: JwtProvider::new(b"secret", 60_000),
-        hashed_secret,
-      }
-    }
-  }
+  struct TestAuth;
 
   impl AuthImpl for TestAuth {
     fn new() -> Self {
-      Self::new(None)
+      TestAuth
     }
     fn get_user(
       &self,
@@ -264,14 +267,15 @@ mod tests {
       Box::pin(async { Ok(req) })
     }
     fn jwt_provider(&self) -> &JwtProvider {
-      &self.jwt_provider
+      static PROVIDER: std::sync::LazyLock<JwtProvider> =
+        std::sync::LazyLock::new(|| {
+          JwtProvider::new(b"secret", 60_000)
+        });
+      &PROVIDER
     }
-    fn get_api_key_hashed_secret(
-      &self,
-      _key: String,
-    ) -> DynFuture<mogh_error::Result<Option<String>>> {
-      let hashed_secret = self.hashed_secret.clone();
-      Box::pin(async move { Ok(hashed_secret) })
+    // Low cost to keep the unknown-key dummy hash fast.
+    fn api_secret_bcrypt_cost(&self) -> u32 {
+      4
     }
   }
 
@@ -290,150 +294,121 @@ mod tests {
       ))
   }
 
-  #[tokio::test]
-  async fn test_extract_key_and_secret_missing_key() {
-    let auth = TestAuth::new(None);
+  #[test]
+  fn test_extract_api_key_missing_key() {
     let headers = HeaderMap::new();
-    assert!(
-      extract_authenticate_api_key(&auth, &headers)
-        .await
-        .unwrap()
-        .is_none()
-    );
+    assert!(extract_request_api_key(&headers).unwrap().is_none());
   }
 
-  #[tokio::test]
-  async fn test_extract_key_and_secret_missing_secret_errors() {
-    let auth = TestAuth::new(None);
+  #[test]
+  fn test_extract_api_key_missing_secret_errors() {
     let mut headers = HeaderMap::new();
     headers.insert("x-api-key", HeaderValue::from_static("K_abc_K"));
-    assert!(
-      extract_authenticate_api_key(&auth, &headers).await.is_err()
-    );
+    assert!(extract_request_api_key(&headers).is_err());
   }
 
-  #[tokio::test]
-  async fn test_extract_key_and_secret_trims_values() {
-    // Verification runs against the trimmed secret,
-    // and the trimmed key is returned.
-    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
-    let auth = TestAuth::new(Some(hashed));
+  #[test]
+  fn test_extract_api_key_trims_values() {
     let mut headers = HeaderMap::new();
     headers
       .insert("x-api-key", HeaderValue::from_static(" K_abc_K "));
     headers
       .insert("x-api-secret", HeaderValue::from_static(" S_def_S "));
-    let key = extract_authenticate_api_key(&auth, &headers)
-      .await
-      .unwrap()
-      .unwrap();
+    let (key, secret) =
+      extract_request_api_key(&headers).unwrap().unwrap();
     assert_eq!(key, "K_abc_K");
-  }
-
-  #[tokio::test]
-  async fn test_extract_key_and_secret_verifies_secret() {
-    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
-    let auth = TestAuth::new(Some(hashed));
-    let mut headers = HeaderMap::new();
-    headers.insert("x-api-key", HeaderValue::from_static("K_abc_K"));
-    headers
-      .insert("x-api-secret", HeaderValue::from_static("S_def_S"));
-    let key = extract_authenticate_api_key(&auth, &headers)
-      .await
-      .unwrap()
-      .unwrap();
-    assert_eq!(key, "K_abc_K");
-  }
-
-  #[tokio::test]
-  async fn test_extract_key_and_secret_rejects_unknown_key() {
-    // get_api_key_hashed_secret returning None means the key
-    // does not exist: must reject, not pass through.
-    let auth = TestAuth::new(None);
-    let mut headers = HeaderMap::new();
-    headers.insert("x-api-key", HeaderValue::from_static("K_abc_K"));
-    headers
-      .insert("x-api-secret", HeaderValue::from_static("S_def_S"));
-    let err = extract_authenticate_api_key(&auth, &headers)
-      .await
-      .unwrap_err();
-    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-  }
-
-  #[tokio::test]
-  async fn test_extract_key_and_secret_rejects_wrong_secret() {
-    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
-    let auth = TestAuth::new(Some(hashed));
-    let mut headers = HeaderMap::new();
-    headers.insert("x-api-key", HeaderValue::from_static("K_abc_K"));
-    headers
-      .insert("x-api-secret", HeaderValue::from_static("S_wrong_S"));
-    let err = extract_authenticate_api_key(&auth, &headers)
-      .await
-      .unwrap_err();
-    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(secret, "S_def_S");
   }
 
   #[test]
-  fn test_extract_user_id_no_authorization_header() {
-    let provider = JwtProvider::new(b"secret", 60_000);
+  fn test_extract_jwt_no_authorization_header() {
     let headers = HeaderMap::new();
-    assert!(
-      extract_authenticate_user_id(&provider, &headers)
-        .unwrap()
-        .is_none()
-    );
+    assert!(extract_request_jwt(&headers).unwrap().is_none());
   }
 
   #[test]
-  fn test_extract_user_id_with_bearer_prefix() {
-    let provider = JwtProvider::new(b"secret", 60_000);
-    let jwt = provider.encode_sub("user-1").unwrap().jwt;
+  fn test_extract_jwt_strips_bearer_prefix() {
     let mut headers = HeaderMap::new();
     headers.insert(
       "authorization",
-      HeaderValue::from_str(&format!("Bearer {jwt}")).unwrap(),
+      HeaderValue::from_static(" Bearer some.jwt.token "),
     );
     assert_eq!(
-      extract_authenticate_user_id(&provider, &headers)
-        .unwrap()
-        .unwrap(),
-      "user-1"
+      extract_request_jwt(&headers).unwrap().unwrap(),
+      "some.jwt.token"
     );
   }
 
   #[test]
-  fn test_extract_user_id_without_bearer_prefix() {
-    let provider = JwtProvider::new(b"secret", 60_000);
-    let jwt = provider.encode_sub("user-1").unwrap().jwt;
+  fn test_extract_jwt_without_bearer_prefix() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      "authorization",
+      HeaderValue::from_static("some.jwt.token"),
+    );
+    assert_eq!(
+      extract_request_jwt(&headers).unwrap().unwrap(),
+      "some.jwt.token"
+    );
+  }
+
+  #[test]
+  fn test_extract_jwt_does_not_validate() {
+    // Extraction is a pure header mapping; validation is downstream.
     let mut headers = HeaderMap::new();
     headers
-      .insert("authorization", HeaderValue::from_str(&jwt).unwrap());
+      .insert("authorization", HeaderValue::from_static("not-a-jwt"));
     assert_eq!(
-      extract_authenticate_user_id(&provider, &headers)
-        .unwrap()
-        .unwrap(),
-      "user-1"
+      extract_request_jwt(&headers).unwrap().unwrap(),
+      "not-a-jwt"
     );
   }
 
   #[test]
-  fn test_extract_user_id_invalid_jwt_errors() {
-    let provider = JwtProvider::new(b"secret", 60_000);
-    let forged =
-      JwtProvider::new(b"other", 60_000).encode_sub("user-1");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-      "authorization",
-      HeaderValue::from_str(&format!(
-        "Bearer {}",
-        forged.unwrap().jwt
-      ))
-      .unwrap(),
-    );
-    assert!(
-      extract_authenticate_user_id(&provider, &headers).is_err()
-    );
+  fn test_get_jwt_user_id_round_trip() {
+    let jwt =
+      TestAuth.jwt_provider().encode_sub("user-1").unwrap().jwt;
+    assert_eq!(get_jwt_user_id(&TestAuth, &jwt).unwrap(), "user-1");
+  }
+
+  #[test]
+  fn test_get_jwt_user_id_rejects_forged() {
+    let forged = JwtProvider::new(b"other", 60_000)
+      .encode_sub("user-1")
+      .unwrap()
+      .jwt;
+    let err = get_jwt_user_id(&TestAuth, &forged).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[test]
+  fn test_get_jwt_user_id_rejects_garbage() {
+    let err = get_jwt_user_id(&TestAuth, "not-a-jwt").unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[test]
+  fn test_verify_api_key_secret_accepts_matching_secret() {
+    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
+    verify_api_key_secret(&TestAuth, "S_def_S", Some(&hashed))
+      .unwrap();
+  }
+
+  #[test]
+  fn test_verify_api_key_secret_rejects_wrong_secret() {
+    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
+    let err =
+      verify_api_key_secret(&TestAuth, "S_wrong_S", Some(&hashed))
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[test]
+  fn test_verify_api_key_secret_rejects_unknown_key() {
+    // None means the key does not exist: must reject.
+    let err =
+      verify_api_key_secret(&TestAuth, "S_def_S", None).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 
   #[test]
