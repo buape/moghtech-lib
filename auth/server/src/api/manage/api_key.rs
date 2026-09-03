@@ -1,10 +1,12 @@
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use mogh_auth_client::api::manage::{
   CreateApiKey, CreateApiKeyResponse, CreateApiKeyV2,
   CreateApiKeyV2Response, DeleteApiKey, DeleteApiKeyResponse,
   DeleteApiKeyV2, DeleteApiKeyV2Response,
 };
+use mogh_error::AddStatusCodeError as _;
 use mogh_resolver::Resolve;
+use reqwest::StatusCode;
 use tracing::{info, instrument};
 
 use crate::{AuthImpl, api::manage::ManageArgs, rand::random_string};
@@ -65,14 +67,24 @@ impl Resolve<ManageArgs> for CreateApiKey {
 
 //
 
-/// The [AuthImpl::delete_api_key] implementation
-/// is responsible for scoping the delete to `user_id`.
 pub async fn delete_api_key<I: AuthImpl + ?Sized>(
   auth: &I,
   user_id: &str,
   key: String,
 ) -> mogh_error::Result<()> {
-  auth.delete_api_key(user_id.to_string(), key).await
+  let expected_user_id =
+    auth.get_api_key_owner_id(key.clone()).await?;
+
+  if user_id != expected_user_id {
+    return Err(
+      anyhow!("Api key does not belong to user")
+        .status_code(StatusCode::FORBIDDEN),
+    );
+  }
+
+  auth.delete_api_key(key).await?;
+
+  Ok(())
 }
 
 impl Resolve<ManageArgs> for DeleteApiKey {
@@ -153,16 +165,24 @@ impl Resolve<ManageArgs> for CreateApiKeyV2 {
 //
 
 #[instrument("DeleteApiKeyV2", skip_all, fields(user_id, public_key))]
-/// The [AuthImpl::delete_api_key_v2] implementation
-/// is responsible for scoping the delete to `user_id`.
 pub async fn delete_api_key_v2<I: AuthImpl + ?Sized>(
   auth: &I,
   user_id: &str,
   public_key: String,
 ) -> mogh_error::Result<()> {
-  auth
-    .delete_api_key_v2(user_id.to_string(), public_key)
-    .await
+  let expected_user_id =
+    auth.get_api_key_v2_user_id(public_key.clone()).await?;
+
+  if user_id != expected_user_id {
+    return Err(
+      anyhow!("Api key does not belong to user")
+        .status_code(StatusCode::FORBIDDEN),
+    );
+  }
+
+  auth.delete_api_key_v2(public_key).await?;
+
+  Ok(())
 }
 
 impl Resolve<ManageArgs> for DeleteApiKeyV2 {

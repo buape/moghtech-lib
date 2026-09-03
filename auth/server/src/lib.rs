@@ -665,12 +665,22 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
-  /// Delete the api key, only if it belongs to `user_id`.
-  /// Must error (eg FORBIDDEN / NOT_FOUND) if the key does not
-  /// belong to the user.
+  /// Get the user id which owns the api key, without secret
+  /// verification. Used to check ownership before deletion.
+  fn get_api_key_owner_id(
+    &self,
+    _key: String,
+  ) -> DynFuture<mogh_error::Result<String>> {
+    Box::pin(async {
+      Err(
+        anyhow!("Must implement 'AuthImpl::get_api_key_owner_id'.")
+          .into(),
+      )
+    })
+  }
+
   fn delete_api_key(
     &self,
-    _user_id: String,
     _key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async {
@@ -712,12 +722,8 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
-  /// Delete the api key (v2), only if it belongs to `user_id`.
-  /// Must error (eg FORBIDDEN / NOT_FOUND) if the key does not
-  /// belong to the user.
   fn delete_api_key_v2(
     &self,
-    _user_id: String,
     _public_key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async {
