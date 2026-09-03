@@ -25,6 +25,9 @@ export type CompletePasskeyLoginResponse = JwtResponse;
 /** Response for [CompleteTotpLogin]. */
 export type CompleteTotpLoginResponse = JwtResponse;
 
+/** Response for [CompleteTotpRecoveryLogin]. */
+export type CompleteTotpRecoveryLoginResponse = JwtResponse;
+
 /** Response for [ConfirmPasskeyEnrollment]. */
 export type ConfirmPasskeyEnrollmentResponse = NoData;
 
@@ -131,6 +134,16 @@ export interface CompleteTotpLogin {
 }
 
 /**
+ * Complete login using a TOTP recovery code as second factor.
+ * Each recovery code can only be used once.
+ * Response: [CompleteTotpRecoveryLoginResponse].
+ */
+export interface CompleteTotpRecoveryLogin {
+	/** One of the recovery codes issued at TOTP enrollment. */
+	code: string;
+}
+
+/**
  * Confirm enrollment flow for Passkey 2FA.
  * Response: [NoData]
  */
@@ -153,7 +166,7 @@ export interface ConfirmTotpEnrollmentResponse {
 
 /**
  * Create an API key for the calling user.
- * Response: [NoData].
+ * Response: [CreateApiKeyResponse].
  */
 export interface CreateApiKey {
 	/** The name for the api key. */
@@ -180,7 +193,7 @@ export interface CreateApiKeyResponse {
 
 /**
  * Create an API key (v2) for the calling user.
- * Response: [NoData].
+ * Response: [CreateApiKeyV2Response].
  */
 export interface CreateApiKeyV2 {
 	/** The name for the api key. */
@@ -226,19 +239,8 @@ export interface DeleteApiKey {
  * Response: [NoData].
  */
 export interface DeleteApiKeyV2 {
-	/** The name for the api key. */
-	name: string;
-	/**
-	 * A unix timestamp in millseconds specifying api key expire time.
-	 * Default is 0, which means no expiry.
-	 */
-	expires?: U64;
-	/**
-	 * Optionally provide a pre-existing public key.
-	 * Otherwise, a private key will be generated and
-	 * returned in the response
-	 */
-	public_key?: string;
+	/** The public key of the api key to delete. */
+	public_key: string;
 }
 
 /**
@@ -374,7 +376,8 @@ export type LoginRequest =
 	| { type: "SignUpLocalUser", params: SignUpLocalUser }
 	| { type: "LoginLocalUser", params: LoginLocalUser }
 	| { type: "CompletePasskeyLogin", params: CompletePasskeyLogin }
-	| { type: "CompleteTotpLogin", params: CompleteTotpLogin };
+	| { type: "CompleteTotpLogin", params: CompleteTotpLogin }
+	| { type: "CompleteTotpRecoveryLogin", params: CompleteTotpRecoveryLogin };
 
 export type ManageRequest = 
 	| { type: "GetUserId", params: GetUserId }

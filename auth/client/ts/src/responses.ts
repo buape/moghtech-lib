@@ -7,6 +7,7 @@ export type LoginResponses = {
   ExchangeForJwt: Types.ExchangeForJwtResponse;
   CompleteTotpLogin: Types.CompleteTotpLoginResponse;
   CompletePasskeyLogin: Types.CompletePasskeyLoginResponse;
+  CompleteTotpRecoveryLogin: Types.CompleteTotpRecoveryLoginResponse;
 };
 
 export type ManageResponses = {
