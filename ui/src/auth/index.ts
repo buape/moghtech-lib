@@ -23,7 +23,7 @@ export function setAuthUrl(url: string) {
 }
 
 export function authClient() {
-  return MoghAuth.MoghAuthClient(AUTH_URL, MoghAuth.LOGIN_TOKENS.jwt());
+  return MoghAuth.MoghAuthClient(AUTH_URL, MoghAuth.LOGIN_TOKENS!.jwt());
 }
 
 export function useLoginOptions() {
@@ -70,7 +70,7 @@ export function useUserId() {
   return useQuery({
     queryKey: [""],
     queryFn: () => authClient().manage("GetUserId", {}),
-    enabled: !!MoghAuth.LOGIN_TOKENS.jwt(),
+    enabled: !!MoghAuth.LOGIN_TOKENS!.jwt(),
   });
 }
 
@@ -113,7 +113,7 @@ let passkey_sent = false;
 /// returns whether to show login / loading screen depending on state of exchange token loop
 export function useAuthState() {
   const onSuccess = ({ jwt }: MoghAuth.Types.JwtResponse) => {
-    MoghAuth.LOGIN_TOKENS.add_and_change(jwt);
+    MoghAuth.LOGIN_TOKENS!.add_and_change(jwt);
     sanitizeQueryInner(search);
   };
   const { mutate: redeemJwt } = useLogin("ExchangeForJwt", {

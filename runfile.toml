@@ -1,7 +1,12 @@
+[install-auth-client]
+alias = "iac"
+description = "Installs the auth ts client dependencies"
+cmd = "cd ./auth/client/ts && npm install"
+
 [gen-auth-client]
 alias = "gac"
 description = "Generates auth typescript types and build the auth ts client"
-after = "yarn-install"
+after = "install-auth-client"
 cmd = """
 node ./auth/client/ts/generate_types.mjs && \
-cd ./auth/client/ts && yarn build"""
+cd ./auth/client/ts && npm run build"""

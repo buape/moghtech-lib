@@ -1,3 +1,9 @@
+[install-auth-ts-client]
+cmd = "npm install"
+
+[build-auth-ts-client]
+cmd = "npm run build"
+
 [publish-auth-ts-client]
 description = "Publish the typescript client to npm"
 cmd = "npm publish"

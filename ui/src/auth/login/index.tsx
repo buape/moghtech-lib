@@ -69,7 +69,7 @@ export function LoginPage({
     : undefined;
 
   const onSuccess = ({ jwt }: MoghAuth.Types.JwtResponse) => {
-    MoghAuth.LOGIN_TOKENS.add_and_change(jwt);
+    MoghAuth.LOGIN_TOKENS!.add_and_change(jwt);
     onLogin?.();
     maybeNavigate?.();
   };

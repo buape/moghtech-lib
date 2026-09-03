@@ -1,13 +1,13 @@
 [install-ui]
 alias = "iu"
 cmd = """
-yarn
+npm install
 """
 
 [build-ui]
 alias = "bu"
 cmd = """
-yarn build
+npm run build
 """
 
 [publish-ui]
