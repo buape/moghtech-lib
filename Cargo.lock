@@ -2024,12 +2024,15 @@ dependencies = [
 
 [[package]]
 name = "mogh_encryption"
-version = "0.1.2"
+version = "1.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "chacha20poly1305",
  "data-encoding",
  "rand 0.10.2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
