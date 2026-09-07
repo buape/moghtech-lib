@@ -28,6 +28,20 @@ pub trait AuthUserImpl: Send + Sync + 'static {
   fn external_skip_2fa(&self) -> bool {
     true
   }
+
+  /// Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
+  /// from which user logins / api calls are accepted.
+  /// Empty means all ips allowed.
+  ///
+  /// Enforced by the auth server on all login flows
+  /// (local, 2FA completion, OIDC / social callbacks)
+  /// and on authenticated auth management API calls.
+  /// Apps must enforce this on their own APIs in
+  /// [AuthImpl::handle_request_authentication][crate::AuthImpl::handle_request_authentication],
+  /// see [middleware::check_user_cidr_whitelist][crate::middleware::check_user_cidr_whitelist].
+  fn cidr_whitelist(&self) -> &[String] {
+    &[]
+  }
 }
 
 pub type BoxAuthUser = Box<dyn AuthUserImpl>;

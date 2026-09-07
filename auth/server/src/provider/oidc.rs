@@ -222,7 +222,8 @@ impl OidcProvider {
     nonce: &Nonce,
   ) -> anyhow::Result<(SubjectIdentifier, TokenResponse)> {
     // Validate CSRF tokens match
-    if client.secret() != &server {
+    if !crate::validations::constant_time_eq(client.secret(), &server)
+    {
       return Err(anyhow!("CSRF token invalid"));
     }
 

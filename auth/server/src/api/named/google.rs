@@ -15,11 +15,13 @@ use crate::{
     RedirectQuery, StandardCallbackQuery, get_user_id_or_two_factor,
     unique_username, user_id_or_two_factor_redirect,
   },
+  middleware::check_user_cidr_whitelist,
   provider::named::{
     STATE_PREFIX_LENGTH,
     google::{GoogleProvider, load_google_provider},
   },
   session::Session,
+  validations::constant_time_eq,
 };
 
 pub fn router<I: AuthImpl>() -> Router {
@@ -91,6 +93,7 @@ pub async fn google_link<I: AuthImpl>(
 
     let user = auth.get_user(user_id.clone()).await?;
     auth.check_username_locked(user.username())?;
+    check_user_cidr_whitelist(user.as_ref(), ip)?;
 
     let provider = load_google_provider(
       auth.app_name(),
@@ -167,7 +170,7 @@ pub async fn google_callback<I: AuthImpl>(
 
     let (state, nonce) = session.retrieve_google_login().await?;
 
-    if client_state != state {
+    if !constant_time_eq(&client_state, &state) {
       return Err(
         anyhow!("State mismatch")
           .status_code(StatusCode::UNAUTHORIZED),
@@ -184,7 +187,7 @@ pub async fn google_callback<I: AuthImpl>(
     let user_id_or_two_factor = match user {
       // Log in existing user
       Some(user) => {
-        get_user_id_or_two_factor(&auth, &session, &user).await?
+        get_user_id_or_two_factor(&auth, &session, &user, ip).await?
       }
       // Sign up user
       None => {
@@ -243,7 +246,7 @@ async fn link_google_callback<I: AuthImpl>(
   client_state: String,
   code: String,
 ) -> mogh_error::Result<Redirect> {
-  if client_state != state {
+  if !constant_time_eq(&client_state, &state) {
     return Err(
       anyhow!("State mismatch").status_code(StatusCode::UNAUTHORIZED),
     );

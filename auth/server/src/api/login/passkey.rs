@@ -6,7 +6,9 @@ use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
-use crate::api::login::LoginArgs;
+use crate::{
+  api::login::LoginArgs, middleware::check_user_cidr_whitelist,
+};
 
 impl Resolve<LoginArgs> for CompletePasskeyLogin {
   #[instrument(
@@ -40,6 +42,8 @@ impl Resolve<LoginArgs> for CompletePasskeyLogin {
       let user = auth
         .get_user(user_id.clone())
         .await?;
+
+      check_user_cidr_whitelist(user.as_ref(), *ip)?;
 
       let mut passkey = user
         .passkey()

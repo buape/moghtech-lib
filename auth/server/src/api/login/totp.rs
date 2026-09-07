@@ -14,7 +14,9 @@ use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
-use crate::api::login::LoginArgs;
+use crate::{
+  api::login::LoginArgs, middleware::check_user_cidr_whitelist,
+};
 
 /// Tracks the latest accepted TOTP step per user, to reject reuse
 /// of an already accepted code within its valid window ([RFC 6238 §5.2]).
@@ -65,6 +67,9 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
       let totp_secret = user
         .totp_secret()
         .context("User is not enrolled in TOTP 2FA")?;
+
+      check_user_cidr_whitelist(user.as_ref(), *ip)?;
+
       let secret_bytes = BASE32_NOPAD
         .decode(totp_secret.as_bytes())
         .context("Failed to decode TOTP secret to bytes")?;
@@ -123,6 +128,8 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
             .status_code(StatusCode::UNAUTHORIZED),
         );
       }
+
+      check_user_cidr_whitelist(user.as_ref(), *ip)?;
 
       // Recovery codes are bcrypt hashed, so each unused code
       // must be verified against the provided one.

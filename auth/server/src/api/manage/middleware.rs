@@ -12,7 +12,11 @@ use mogh_rate_limit::WithFailureRateLimit as _;
 use mogh_request_ip::RequestIp;
 
 use crate::{
-  AuthImpl, middleware::extract_request_authentication,
+  AuthImpl,
+  middleware::{
+    extract_request_authentication,
+    get_user_from_request_authentication,
+  },
   user::BoxAuthUser,
 };
 
@@ -52,14 +56,14 @@ pub async fn attach_user<I: AuthImpl>(
   .context("Invalid client credentials")
   .status_code(StatusCode::UNAUTHORIZED)?;
 
-  let user = async {
-    let user_id = auth
-      .get_user_id_from_request_authentication(req_auth)
+  // Enforces the api key and user cidr whitelists.
+  let user =
+    get_user_from_request_authentication(&auth, req_auth, ip)
+      .with_failure_rate_limit_using_ip(
+        auth.general_rate_limiter(),
+        &ip,
+      )
       .await?;
-    auth.get_user(user_id).await
-  }
-  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
-  .await?;
 
   req.extensions_mut().insert(UserExtractor(Arc::new(user)));
 

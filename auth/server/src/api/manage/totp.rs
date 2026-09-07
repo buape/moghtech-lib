@@ -83,7 +83,7 @@ impl Resolve<ManageArgs> for ConfirmTotpEnrollment {
 
     // The step is the 30s window since epoch
     // which the TOTP is valid for.
-    let _step = totp
+    let step = totp
       .check_current(&self.code)
       .context("The provided code was not valid. Please try BeginTotpEnrollment flow again.")
       .status_code(StatusCode::BAD_REQUEST)?;
@@ -106,6 +106,13 @@ impl Resolve<ManageArgs> for ConfirmTotpEnrollment {
         hashed_recovery_codes,
       )
       .await?;
+
+    // Consume the step so the enrollment code cannot be replayed
+    // as a login code in the same window. Done after persisting
+    // so a storage failure leaves the code usable for a retry,
+    // and an already consumed step (re-enrollment within the
+    // window) does not fail the enrollment.
+    let _ = auth.consume_totp_step(user.id().to_string(), step).await;
 
     info!("TOTP 2FA enrollment complete");
 
@@ -185,6 +192,7 @@ mod tests {
     fn handle_request_authentication(
       &self,
       _auth: RequestAuthentication,
+      _ip: std::net::IpAddr,
       _require_user_enabled: bool,
       _req: Request,
     ) -> DynFuture<mogh_error::Result<Request>> {

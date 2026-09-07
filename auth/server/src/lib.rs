@@ -1,4 +1,7 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+  net::IpAddr,
+  sync::{Arc, LazyLock},
+};
 
 use anyhow::{Context as _, anyhow};
 use axum::{extract::Request, http::StatusCode};
@@ -13,6 +16,7 @@ use mogh_rate_limit::RateLimiter;
 use openidconnect::SubjectIdentifier;
 
 pub mod api;
+pub mod api_key;
 pub mod middleware;
 pub mod provider;
 pub mod rand;
@@ -22,13 +26,21 @@ pub mod validations;
 mod session;
 
 use crate::{
+  api_key::BoxAuthApiKey,
   provider::{jwt::JwtProvider, passkey::PasskeyProvider},
   user::BoxAuthUser,
   validations::{
-    validate_api_key_name, validate_password, validate_username,
+    validate_api_key_name, validate_cidr_whitelist,
+    validate_password, validate_username,
   },
 };
 
+/// Client ip extraction. The `RequestIp` extractor believes
+/// forwarding headers only from the [TrustedProxies][request_ip::TrustedProxies]
+/// attached to the request by `mogh_server::serve_app`
+/// (`ServerConfig::trusted_proxies`), else private ranges.
+/// Apps not using `mogh_server` should add
+/// `TrustedProxies::layer()` to their router.
 pub mod request_ip {
   pub use mogh_request_ip::*;
 }
@@ -151,38 +163,62 @@ pub trait AuthImpl: Send + Sync + 'static {
 
   /// Handle incoming request authentication in middleware.
   /// Can attach a client struct as request extension here.
+  ///
+  /// `ip` is the client request ip, which must be checked against
+  /// the api key's [AuthApiKeyImpl::cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist]
+  /// and the user's [AuthUserImpl::cidr_whitelist][user::AuthUserImpl::cidr_whitelist].
+  /// [Self::get_user_id_from_request_authentication] handles the api key
+  /// whitelist, and [middleware::get_user_from_request_authentication]
+  /// additionally handles the user whitelist. See also
+  /// [middleware::check_api_key_cidr_whitelist] and
+  /// [middleware::check_user_cidr_whitelist] for custom implementations.
   fn handle_request_authentication(
     &self,
     auth: RequestAuthentication,
+    ip: IpAddr,
     require_user_enabled: bool,
     req: Request,
   ) -> DynFuture<mogh_error::Result<Request>>;
 
-  /// Authenticates the request credentials and returns the user id,
-  /// for use in auth management API middleware.
+  /// Authenticates the request credentials and returns the user id.
   ///
   /// - [RequestAuthentication::Jwt]: validated with
   ///   [middleware::get_jwt_user_id].
   /// - [RequestAuthentication::ApiKey]: secret verified and mapped
-  ///   with [Self::get_api_key_user_id].
+  ///   with [Self::get_api_key].
   /// - [RequestAuthentication::PublicKey]: mapped with
-  ///   [Self::get_api_key_v2_user_id].
+  ///   [Self::get_api_key_v2].
+  ///
+  /// For api keys, the request `ip` is checked against the key's
+  /// [AuthApiKeyImpl::cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist].
+  ///
+  /// DANGER ⚠️ The user's own
+  /// [AuthUserImpl::cidr_whitelist][user::AuthUserImpl::cidr_whitelist]
+  /// is not checked here, as the user is not loaded.
+  /// Use [middleware::get_user_from_request_authentication] or
+  /// [middleware::check_user_cidr_whitelist] after loading the user.
   fn get_user_id_from_request_authentication(
     &self,
     auth: RequestAuthentication,
+    ip: IpAddr,
   ) -> DynFuture<mogh_error::Result<String>> {
-    match auth {
+    let api_key = match auth {
       RequestAuthentication::Jwt(jwt) => {
         let user_id = middleware::get_jwt_user_id(self, &jwt);
-        Box::pin(async move { user_id })
+        return Box::pin(async move { user_id });
       }
       RequestAuthentication::ApiKey { key, secret } => {
-        self.get_api_key_user_id(key, secret)
+        self.get_api_key(key, secret)
       }
       RequestAuthentication::PublicKey(public_key) => {
-        self.get_api_key_v2_user_id(public_key)
+        self.get_api_key_v2(public_key)
       }
-    }
+    };
+    Box::pin(async move {
+      let api_key = api_key.await?;
+      middleware::check_api_key_cidr_whitelist(api_key.as_ref(), ip)?;
+      Ok(api_key.user_id().to_string())
+    })
   }
 
   // =========
@@ -558,8 +594,8 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// [AuthUserImpl][user::AuthUserImpl]::hashed_totp_recovery_codes,
   /// so the code cannot be used again.
   ///
-  /// Must be implemented for [CompleteTotpRecoveryLogin]
-  /// [mogh_auth_client::api::login::CompleteTotpRecoveryLogin]
+  /// Must be implemented for
+  /// [CompleteTotpRecoveryLogin][mogh_auth_client::api::login::CompleteTotpRecoveryLogin]
   /// to be usable.
   fn remove_totp_recovery_code(
     &self,
@@ -623,6 +659,15 @@ pub trait AuthImpl: Send + Sync + 'static {
       .status_code(StatusCode::BAD_REQUEST)
   }
 
+  /// Validate api key CIDR whitelist entries.
+  fn validate_cidr_whitelist(
+    &self,
+    cidr_whitelist: &[String],
+  ) -> mogh_error::Result<()> {
+    validate_cidr_whitelist(cidr_whitelist)
+      .status_code(StatusCode::BAD_REQUEST)
+  }
+
   /// Set custom API key length. Default is 40.
   fn api_key_secret_length(&self) -> usize {
     40
@@ -647,21 +692,23 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
-  /// Get the user id for a given API key.
+  /// Get the api key ([AuthApiKeyImpl][api_key::AuthApiKeyImpl])
+  /// for a given API key, returning UNAUTHORIZED if none exists.
+  ///
   /// DANGER ⚠️ the incoming secret must still be validated as matching the
   /// known hashed secret for the api key. Use
   /// [middleware::verify_api_key_secret] with the stored hash
   /// (or `None` if the key does not exist) to do so.
-  fn get_api_key_user_id(
+  ///
+  /// The returned [cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist]
+  /// is enforced by [Self::get_user_id_from_request_authentication].
+  fn get_api_key(
     &self,
     _key: String,
     _secret: String,
-  ) -> DynFuture<mogh_error::Result<String>> {
+  ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
     Box::pin(async {
-      Err(
-        anyhow!("Must implement 'AuthImpl::get_api_key_user_id'.")
-          .into(),
-      )
+      Err(anyhow!("Must implement 'AuthImpl::get_api_key'.").into())
     })
   }
 
@@ -709,15 +756,18 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
-  /// Get the user id for a given public key
-  fn get_api_key_v2_user_id(
+  /// Get the api key ([AuthApiKeyImpl][api_key::AuthApiKeyImpl])
+  /// for a given public key, returning UNAUTHORIZED if none exists.
+  ///
+  /// The returned [cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist]
+  /// is enforced by [Self::get_user_id_from_request_authentication].
+  fn get_api_key_v2(
     &self,
     _public_key: String,
-  ) -> DynFuture<mogh_error::Result<String>> {
+  ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
     Box::pin(async {
       Err(
-        anyhow!("Must implement 'AuthImpl::get_api_key_v2_user_id'.")
-          .into(),
+        anyhow!("Must implement 'AuthImpl::get_api_key_v2'.").into(),
       )
     })
   }
@@ -739,11 +789,17 @@ pub trait AuthImpl: Send + Sync + 'static {
 mod tests {
   use super::*;
 
+  use crate::api_key::AuthApiKey;
+
+  const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
+
   struct TestAuth {
     jwt_provider: JwtProvider,
     /// Simulates the stored bcrypt hash for any api key.
     /// None simulates an unknown api key.
     hashed_secret: Option<String>,
+    /// Simulates the stored cidr whitelist for any api key.
+    cidr_whitelist: Vec<String>,
   }
 
   impl TestAuth {
@@ -751,6 +807,7 @@ mod tests {
       Self {
         jwt_provider: JwtProvider::new(b"secret", 60_000),
         hashed_secret,
+        cidr_whitelist: Vec::new(),
       }
     }
   }
@@ -768,6 +825,7 @@ mod tests {
     fn handle_request_authentication(
       &self,
       _auth: RequestAuthentication,
+      _ip: IpAddr,
       _require_user_enabled: bool,
       req: Request,
     ) -> DynFuture<mogh_error::Result<Request>> {
@@ -782,19 +840,41 @@ mod tests {
     }
     /// The intended implementation shape: one lookup for the key,
     /// then verify the secret with the helper.
-    fn get_api_key_user_id(
+    fn get_api_key(
       &self,
       key: String,
       secret: String,
-    ) -> DynFuture<mogh_error::Result<String>> {
+    ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
       let verified = middleware::verify_api_key_secret(
         self,
         &secret,
         self.hashed_secret.as_deref(),
       );
+      let cidr_whitelist = self.cidr_whitelist.clone();
       Box::pin(async move {
         verified?;
-        Ok(format!("user-of-{key}"))
+        Ok(
+          AuthApiKey {
+            user_id: format!("user-of-{key}"),
+            cidr_whitelist,
+          }
+          .into(),
+        )
+      })
+    }
+    fn get_api_key_v2(
+      &self,
+      public_key: String,
+    ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
+      let cidr_whitelist = self.cidr_whitelist.clone();
+      Box::pin(async move {
+        Ok(
+          AuthApiKey {
+            user_id: format!("user-of-{public_key}"),
+            cidr_whitelist,
+          }
+          .into(),
+        )
       })
     }
   }
@@ -806,6 +886,7 @@ mod tests {
     let user_id = auth
       .get_user_id_from_request_authentication(
         RequestAuthentication::Jwt(jwt),
+        IP,
       )
       .await
       .unwrap();
@@ -822,6 +903,7 @@ mod tests {
     let err = auth
       .get_user_id_from_request_authentication(
         RequestAuthentication::Jwt(forged),
+        IP,
       )
       .await
       .unwrap_err();
@@ -838,6 +920,7 @@ mod tests {
           key: "K_abc_K".into(),
           secret: "S_def_S".into(),
         },
+        IP,
       )
       .await
       .unwrap();
@@ -849,9 +932,89 @@ mod tests {
           key: "K_abc_K".into(),
           secret: "S_wrong_S".into(),
         },
+        IP,
       )
       .await
       .unwrap_err();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn test_get_user_id_from_api_key_enforces_cidr_whitelist() {
+    let hashed = bcrypt::hash("S_def_S", 4).unwrap();
+    let mut auth = TestAuth::with_hashed_secret(Some(hashed));
+    auth.cidr_whitelist = vec!["10.0.0.0/8".into()];
+    let api_key = || RequestAuthentication::ApiKey {
+      key: "K_abc_K".into(),
+      secret: "S_def_S".into(),
+    };
+
+    // In whitelist
+    let user_id = auth
+      .get_user_id_from_request_authentication(api_key(), IP)
+      .await
+      .unwrap();
+    assert_eq!(user_id, "user-of-K_abc_K");
+
+    // Not in whitelist
+    let err = auth
+      .get_user_id_from_request_authentication(
+        api_key(),
+        "8.8.8.8".parse().unwrap(),
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+    // Wrong secret is still UNAUTHORIZED, checked before whitelist
+    let err = auth
+      .get_user_id_from_request_authentication(
+        RequestAuthentication::ApiKey {
+          key: "K_abc_K".into(),
+          secret: "S_wrong_S".into(),
+        },
+        "8.8.8.8".parse().unwrap(),
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn test_get_user_id_from_api_key_v2_enforces_cidr_whitelist()
+  {
+    let mut auth = TestAuth::new();
+    auth.cidr_whitelist = vec!["10.1.2.3".into()];
+    let public_key =
+      || RequestAuthentication::PublicKey("PUBKEY".into());
+
+    let user_id = auth
+      .get_user_id_from_request_authentication(public_key(), IP)
+      .await
+      .unwrap();
+    assert_eq!(user_id, "user-of-PUBKEY");
+
+    let err = auth
+      .get_user_id_from_request_authentication(
+        public_key(),
+        "10.1.2.4".parse().unwrap(),
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+  }
+
+  #[tokio::test]
+  async fn test_get_user_id_from_api_key_empty_whitelist_allows_all()
+  {
+    let auth = TestAuth::new();
+    let user_id = auth
+      .get_user_id_from_request_authentication(
+        RequestAuthentication::PublicKey("PUBKEY".into()),
+        "8.8.8.8".parse().unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(user_id, "user-of-PUBKEY");
   }
 }

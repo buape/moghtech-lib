@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use anyhow::{Context, anyhow};
 use axum::http::StatusCode;
 use mogh_auth_client::api::login::{
@@ -8,7 +10,10 @@ use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
-use crate::{AuthImpl, api::login::LoginArgs, session::Session};
+use crate::{
+  AuthImpl, api::login::LoginArgs,
+  middleware::check_user_cidr_whitelist, session::Session,
+};
 
 pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
   auth: &I,
@@ -81,6 +86,7 @@ fn invalid_credentials_after_dummy_hash<I: AuthImpl + ?Sized>(
 pub async fn login_local_user<I: AuthImpl + ?Sized>(
   auth: &I,
   session: &Session,
+  ip: IpAddr,
   username: String,
   password: &str,
 ) -> mogh_error::Result<JwtOrTwoFactor> {
@@ -112,6 +118,10 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
         .status_code(StatusCode::UNAUTHORIZED),
     );
   }
+
+  // Checked after credential verification so the
+  // whitelist does not reveal whether the username exists.
+  check_user_cidr_whitelist(user.as_ref(), ip)?;
 
   let res = match (user.passkey(), user.totp_secret()) {
     // Passkey 2FA
@@ -173,6 +183,7 @@ impl Resolve<LoginArgs> for LoginLocalUser {
     login_local_user(
       auth.as_ref(),
       session,
+      *ip,
       self.username,
       &self.password,
     )

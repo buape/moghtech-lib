@@ -1,8 +1,11 @@
-//! Default username / password validations.
+//! Default username / password / api key validations.
 //! These can be overridden on AuthImpl.
 
 use anyhow::Context as _;
 use mogh_validations::{StringValidator, StringValidatorMatches};
+use subtle::ConstantTimeEq as _;
+
+pub use mogh_request_ip::cidr::validate_cidr_whitelist;
 
 /// Minimum length for usernames
 pub const MIN_USERNAME_LENGTH: usize = 1;
@@ -51,9 +54,23 @@ pub fn validate_api_key_name(name: &str) -> anyhow::Result<()> {
     .context("Failed to validate api key name")
 }
 
+/// Compare two secrets (eg oauth `state` / csrf tokens)
+/// in constant time with respect to their contents.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+  a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn test_constant_time_eq() {
+    assert!(constant_time_eq("abc", "abc"));
+    assert!(!constant_time_eq("abc", "abd"));
+    assert!(!constant_time_eq("abc", "abcd"));
+    assert!(constant_time_eq("", ""));
+  }
 
   #[test]
   fn test_validate_username_bounds() {

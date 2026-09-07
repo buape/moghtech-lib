@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+  net::IpAddr,
+  time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context as _, anyhow};
 use axum::{
@@ -13,7 +16,13 @@ use mogh_rate_limit::WithFailureRateLimit;
 use mogh_request_ip::RequestIp;
 use reqwest::StatusCode;
 
-use crate::{AuthImpl, RequestAuthentication};
+use crate::{
+  AuthImpl, RequestAuthentication,
+  api_key::AuthApiKeyImpl,
+  user::{AuthUserImpl, BoxAuthUser},
+};
+
+pub use mogh_request_ip::cidr::check_cidr_whitelist;
 
 pub async fn authenticate_request<
   I: AuthImpl,
@@ -38,6 +47,7 @@ pub async fn authenticate_request<
   let req = auth
     .handle_request_authentication(
       req_auth,
+      ip,
       REQUIRE_USER_ENABLED,
       req,
     )
@@ -186,6 +196,49 @@ pub fn extract_request_public_key<I: AuthImpl>(
   Ok(Some(public_key))
 }
 
+/// Authenticates the request credentials with
+/// [AuthImpl::get_user_id_from_request_authentication] (which enforces
+/// the api key cidr whitelist), loads the user with [AuthImpl::get_user],
+/// and checks the request `ip` against the user's
+/// [AuthUserImpl::cidr_whitelist] with [check_user_cidr_whitelist].
+///
+/// Used by the auth management API middleware, and can be used
+/// to implement [AuthImpl::handle_request_authentication].
+pub async fn get_user_from_request_authentication<
+  I: AuthImpl + ?Sized,
+>(
+  auth: &I,
+  req_auth: RequestAuthentication,
+  ip: IpAddr,
+) -> mogh_error::Result<BoxAuthUser> {
+  let user_id = auth
+    .get_user_id_from_request_authentication(req_auth, ip)
+    .await?;
+  let user = auth.get_user(user_id).await?;
+  check_user_cidr_whitelist(user.as_ref(), ip)?;
+  Ok(user)
+}
+
+/// Ensure the request `ip` is allowed by the user's
+/// [AuthUserImpl::cidr_whitelist], returning FORBIDDEN if not.
+/// An empty whitelist allows all ips.
+pub fn check_user_cidr_whitelist(
+  user: &dyn AuthUserImpl,
+  ip: IpAddr,
+) -> mogh_error::Result<()> {
+  check_cidr_whitelist(ip, user.cidr_whitelist())
+}
+
+/// Ensure the request `ip` is allowed by the api key's
+/// [AuthApiKeyImpl::cidr_whitelist], returning FORBIDDEN if not.
+/// An empty whitelist allows all ips.
+pub fn check_api_key_cidr_whitelist(
+  api_key: &dyn AuthApiKeyImpl,
+  ip: IpAddr,
+) -> mogh_error::Result<()> {
+  check_cidr_whitelist(ip, api_key.cidr_whitelist())
+}
+
 /// Helper for authenticating [RequestAuthentication::Jwt]:
 /// validates the jwt (signature, expiry, iss / aud) with
 /// [AuthImpl::jwt_provider] and returns the user id (`sub`),
@@ -200,7 +253,7 @@ pub fn get_jwt_user_id<I: AuthImpl + ?Sized>(
     .status_code(StatusCode::UNAUTHORIZED)
 }
 
-/// Helper for implementing [AuthImpl::get_api_key_user_id]:
+/// Helper for implementing [AuthImpl::get_api_key]:
 /// bcrypt verifies the incoming secret against the stored hash,
 /// returning UNAUTHORIZED for an unknown key or non-matching secret.
 ///
@@ -261,6 +314,7 @@ mod tests {
     fn handle_request_authentication(
       &self,
       _auth: RequestAuthentication,
+      _ip: IpAddr,
       _require_user_enabled: bool,
       req: Request,
     ) -> DynFuture<mogh_error::Result<Request>> {

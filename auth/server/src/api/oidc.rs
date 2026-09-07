@@ -16,6 +16,7 @@ use crate::{
     RedirectQuery, StandardCallbackQuery, get_user_id_or_two_factor,
     unique_username, user_id_or_two_factor_redirect,
   },
+  middleware::check_user_cidr_whitelist,
   provider::oidc::{
     OidcProvider, SessionOidcLink, SessionOidcLogin,
     load_oidc_provider,
@@ -103,6 +104,7 @@ pub async fn oidc_link<I: AuthImpl>(
 
     let user = auth.get_user(user_id.clone()).await?;
     auth.check_username_locked(user.username())?;
+    check_user_cidr_whitelist(user.as_ref(), ip)?;
 
     let provider = load_oidc_provider(
       auth.app_name(),
@@ -236,7 +238,7 @@ pub async fn oidc_callback<I: AuthImpl>(
     let user_id_or_two_factor = match user {
       // Log in existing user
       Some(user) => {
-        get_user_id_or_two_factor(&auth, &session, &user).await?
+        get_user_id_or_two_factor(&auth, &session, &user, ip).await?
       }
       // Sign up user
       None => {

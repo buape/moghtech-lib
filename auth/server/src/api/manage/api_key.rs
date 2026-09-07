@@ -25,12 +25,29 @@ fn generate_api_key_parts(
   Ok((key, secret, hashed_secret))
 }
 
+/// Trim whitelist entries, drop empty ones,
+/// and validate the remaining entries.
+fn normalize_cidr_whitelist<I: AuthImpl + ?Sized>(
+  auth: &I,
+  cidr_whitelist: Vec<String>,
+) -> mogh_error::Result<Vec<String>> {
+  let cidr_whitelist = cidr_whitelist
+    .into_iter()
+    .map(|entry| entry.trim().to_string())
+    .filter(|entry| !entry.is_empty())
+    .collect::<Vec<_>>();
+  auth.validate_cidr_whitelist(&cidr_whitelist)?;
+  Ok(cidr_whitelist)
+}
+
 pub async fn create_api_key<I: AuthImpl + ?Sized>(
   auth: &I,
   user_id: String,
-  body: CreateApiKey,
+  mut body: CreateApiKey,
 ) -> mogh_error::Result<CreateApiKeyResponse> {
   auth.validate_api_key_name(&body.name)?;
+  body.cidr_whitelist =
+    normalize_cidr_whitelist(auth, body.cidr_whitelist)?;
 
   let (key, secret, hashed_secret) = generate_api_key_parts(
     auth.api_key_secret_length(),
@@ -54,7 +71,8 @@ impl Resolve<ManageArgs> for CreateApiKey {
       user_id = user.id(),
       username = user.username(),
       name = &self.name,
-      expires = &self.expires
+      expires = &self.expires,
+      cidr_whitelist = ?self.cidr_whitelist,
     )
   )]
   async fn resolve(
@@ -114,6 +132,8 @@ pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
   body: CreateApiKeyV2,
 ) -> mogh_error::Result<CreateApiKeyV2Response> {
   auth.validate_api_key_name(&body.name)?;
+  let cidr_whitelist =
+    normalize_cidr_whitelist(auth, body.cidr_whitelist)?;
 
   let public_key = body.public_key.trim();
 
@@ -134,6 +154,7 @@ pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
       CreateApiKey {
         name: body.name,
         expires: body.expires,
+        cidr_whitelist,
       },
       public_key,
     )
@@ -150,7 +171,8 @@ impl Resolve<ManageArgs> for CreateApiKeyV2 {
       user_id = user.id(),
       username = user.username(),
       name = &self.name,
-      expires = &self.expires
+      expires = &self.expires,
+      cidr_whitelist = ?self.cidr_whitelist,
     )
   )]
   async fn resolve(
@@ -170,8 +192,11 @@ pub async fn delete_api_key_v2<I: AuthImpl + ?Sized>(
   user_id: &str,
   public_key: String,
 ) -> mogh_error::Result<()> {
-  let expected_user_id =
-    auth.get_api_key_v2_user_id(public_key.clone()).await?;
+  let expected_user_id = auth
+    .get_api_key_v2(public_key.clone())
+    .await?
+    .user_id()
+    .to_string();
 
   if user_id != expected_user_id {
     return Err(

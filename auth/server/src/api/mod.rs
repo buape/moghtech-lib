@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use anyhow::{Context as _, anyhow};
 use axum::{Router, response::Redirect, routing::get};
 use data_encoding::BASE64URL;
@@ -8,7 +10,10 @@ use serde::Deserialize;
 use tracing::info;
 use utoipa::ToSchema;
 
-use crate::{AuthImpl, session::Session, user::BoxAuthUser};
+use crate::{
+  AuthImpl, middleware::check_user_cidr_whitelist, session::Session,
+  user::BoxAuthUser,
+};
 
 pub mod login;
 pub mod manage;
@@ -64,13 +69,36 @@ impl StandardCallbackQuery {
   }
 }
 
+/// Only allow post-login redirects back to the app itself,
+/// preventing open redirects through the `redirect` query param.
+/// The redirect is resolved against `host` (so absolute urls, paths
+/// and relative paths all work) and must be http(s) on the same
+/// hostname, any scheme or port. Anything else (other origins,
+/// protocol-relative `//evil`, scheme tricks) is dropped.
+fn sanitize_redirect(host: &str, redirect: &str) -> Option<String> {
+  let redirect = redirect.trim();
+  if redirect.is_empty() {
+    return None;
+  }
+  let host = reqwest::Url::parse(host).ok()?;
+  let host_name = host.host_str()?;
+  let target = host.join(redirect).ok()?;
+  if !matches!(target.scheme(), "http" | "https") {
+    return None;
+  }
+  if !target.host_str()?.eq_ignore_ascii_case(host_name) {
+    return None;
+  }
+  Some(target.to_string())
+}
+
 fn format_redirect(
   host: &str,
   redirect: Option<&str>,
   extra: &str,
 ) -> Redirect {
-  let redirect_url = if let Some(redirect) = redirect
-    && !redirect.is_empty()
+  let redirect_url = if let Some(redirect) =
+    redirect.and_then(|redirect| sanitize_redirect(host, redirect))
   {
     let splitter = if extra.is_empty() {
       ""
@@ -105,11 +133,16 @@ async fn unique_username<I: AuthImpl>(
   Ok(username)
 }
 
+/// Logs in an existing user found by an external provider,
+/// initiating 2FA if required. Enforces the user cidr whitelist.
 async fn get_user_id_or_two_factor<I: AuthImpl>(
   auth: &I,
   session: &Session,
   user: &BoxAuthUser,
+  ip: IpAddr,
 ) -> mogh_error::Result<UserIdOrTwoFactor> {
+  check_user_cidr_whitelist(user.as_ref(), ip)?;
+
   let res = match (
     user.external_skip_2fa(),
     user.passkey(),
@@ -247,6 +280,79 @@ mod tests {
     let redirect =
       format_redirect("https://example.com", Some(""), "totp=true");
     assert_eq!(location(redirect), "https://example.com?totp=true");
+  }
+
+  #[test]
+  fn test_format_redirect_rejects_other_origins() {
+    // Open redirect attempts fall back to the host.
+    for evil in [
+      "https://evil.com",
+      "https://evil.com/?next=https://example.com",
+      "https://example.com.evil.com/dest",
+      "https://example.com@evil.com",
+      "//evil.com/dest",
+      "/\\evil.com",
+      "\\\\evil.com",
+      "javascript:alert(1)",
+      "data:text/html,hi",
+    ] {
+      let redirect = format_redirect(
+        "https://example.com",
+        Some(evil),
+        "redeem_ready=true",
+      );
+      assert_eq!(
+        location(redirect),
+        "https://example.com?redeem_ready=true",
+        "{evil}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_format_redirect_allows_same_host() {
+    let cases = [
+      ("https://example.com", "https://example.com/?totp=true"),
+      (
+        "/servers/abc?tab=1",
+        "https://example.com/servers/abc?tab=1&totp=true",
+      ),
+      ("servers/abc", "https://example.com/servers/abc?totp=true"),
+      ("?tab=1", "https://example.com/?tab=1&totp=true"),
+      // Same host, other scheme / port (eg TLS at the proxy).
+      (
+        "http://example.com/dest",
+        "http://example.com/dest?totp=true",
+      ),
+      (
+        "https://example.com:8443/dest",
+        "https://example.com:8443/dest?totp=true",
+      ),
+      (
+        "https://EXAMPLE.com/dest",
+        "https://example.com/dest?totp=true",
+      ),
+      // Same scheme without `//` is a relative path on the host.
+      ("https:evil.com", "https://example.com/evil.com?totp=true"),
+    ];
+    for (redirect, expected) in cases {
+      let redirect = format_redirect(
+        "https://example.com",
+        Some(redirect),
+        "totp=true",
+      );
+      assert_eq!(location(redirect), expected);
+    }
+    // Trailing slash on host is tolerated.
+    let redirect = format_redirect(
+      "https://example.com/",
+      Some("/dest"),
+      "totp=true",
+    );
+    assert_eq!(
+      location(redirect),
+      "https://example.com/dest?totp=true"
+    );
   }
 
   #[test]

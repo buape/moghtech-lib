@@ -13,7 +13,10 @@ use tracing::{debug, instrument};
 use typeshare::typeshare;
 use uuid::Uuid;
 
-use crate::{AuthImpl, BoxAuthImpl, api::Variant, session::Session};
+use crate::{
+  AuthImpl, BoxAuthImpl, api::Variant,
+  middleware::check_user_cidr_whitelist, session::Session,
+};
 
 pub mod local;
 pub mod passkey;
@@ -141,7 +144,12 @@ impl Resolve<LoginArgs> for ExchangeForJwt {
   ) -> Result<Self::Response, Self::Error> {
     async {
       let user_id = session.retrieve_authenticated_user_id().await?;
-      auth.jwt_provider().encode_sub(&user_id).map_err(Into::into)
+      let user = auth.get_user(user_id).await?;
+      check_user_cidr_whitelist(user.as_ref(), *ip)?;
+      auth
+        .jwt_provider()
+        .encode_sub(user.id())
+        .map_err(Into::into)
     }
     .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), ip)
     .await
@@ -217,6 +225,7 @@ mod tests {
     fn handle_request_authentication(
       &self,
       _auth: crate::RequestAuthentication,
+      _ip: std::net::IpAddr,
       _require_user_enabled: bool,
       _req: axum::extract::Request,
     ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
