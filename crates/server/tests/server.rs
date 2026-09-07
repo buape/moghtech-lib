@@ -9,7 +9,7 @@ use axum::{
   routing::get,
 };
 use mogh_server::{
-  ServerConfig,
+  ServerConfig, TrustedProxies,
   cors::{CorsConfig, cors_layer},
   session::{SessionConfig, memory_session_layer},
   ui::serve_static_ui,
@@ -300,5 +300,79 @@ async fn serve_app_rejects_invalid_header_values() {
   .unwrap_err();
   assert!(
     error.to_string().contains("Invalid x_frame_options value")
+  );
+}
+
+struct ProxyServer(TrustedProxies);
+
+impl ServerConfig for ProxyServer {
+  fn port(&self) -> u16 {
+    0
+  }
+  fn trusted_proxies(&self) -> TrustedProxies {
+    self.0.clone()
+  }
+}
+
+/// Echoes the client ip resolved by the RequestIp extractor.
+fn ip_app(trusted: TrustedProxies) -> Router {
+  mogh_server::configure_app(
+    Router::new().route(
+      "/",
+      get(async |mogh_request_ip::RequestIp(ip)| ip.to_string()),
+    ),
+    &ProxyServer(trusted),
+  )
+  .unwrap()
+}
+
+fn forwarded_request(peer: &str) -> Request<Body> {
+  Request::builder()
+    .uri("/")
+    .header("x-forwarded-for", "203.0.113.7")
+    .extension(axum::extract::ConnectInfo(
+      format!("{peer}:1234")
+        .parse::<std::net::SocketAddr>()
+        .unwrap(),
+    ))
+    .body(Body::empty())
+    .unwrap()
+}
+
+#[tokio::test]
+async fn configure_app_attaches_trusted_proxies() {
+  // Default: private peer is trusted, headers believed.
+  let response = ip_app(TrustedProxies::default())
+    .oneshot(forwarded_request("10.0.0.1"))
+    .await
+    .unwrap();
+  assert_eq!(body_string(response.into_body()).await, "203.0.113.7");
+  // Default: public peer is not trusted, headers ignored.
+  let response = ip_app(TrustedProxies::default())
+    .oneshot(forwarded_request("198.51.100.1"))
+    .await
+    .unwrap();
+  assert_eq!(body_string(response.into_body()).await, "198.51.100.1");
+  // Configured: the public proxy range is trusted.
+  let response =
+    ip_app(TrustedProxies::from_config(["198.51.100.0/24"]).unwrap())
+      .oneshot(forwarded_request("198.51.100.1"))
+      .await
+      .unwrap();
+  assert_eq!(body_string(response.into_body()).await, "203.0.113.7");
+  // Configured none: even private peers are not trusted.
+  let response = ip_app(TrustedProxies::None)
+    .oneshot(forwarded_request("10.0.0.1"))
+    .await
+    .unwrap();
+  assert_eq!(body_string(response.into_body()).await, "10.0.0.1");
+  // Security headers still applied.
+  let response = ip_app(TrustedProxies::default())
+    .oneshot(forwarded_request("10.0.0.1"))
+    .await
+    .unwrap();
+  assert_eq!(
+    response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+    "DENY"
   );
 }

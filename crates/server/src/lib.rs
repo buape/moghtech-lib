@@ -10,6 +10,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
 pub use axum_server;
+pub use mogh_request_ip::TrustedProxies;
 
 // Dev dependencies used by the integration tests only.
 #[cfg(test)]
@@ -67,6 +68,19 @@ pub trait ServerConfig {
   fn content_security_policy(&self) -> &str {
     ""
   }
+  /// Which socket peers are trusted to set the client ip through
+  /// `X-Forwarded-For` / `X-Real-IP` headers, eg the app's internal
+  /// CIDR ranges. Attached to every request by [serve_app], where
+  /// the `mogh_request_ip::RequestIp` extractor (and the Mogh Auth
+  /// server) pick it up.
+  ///
+  /// Pipe a config list through with [TrustedProxies::from_config]:
+  /// empty means private ranges, `all` / `none` / `private`
+  /// keywords are supported, else the CIDR ranges given.
+  /// Default: [TrustedProxies::private].
+  fn trusted_proxies(&self) -> TrustedProxies {
+    TrustedProxies::default()
+  }
 }
 
 /// Applies a security header layer to the app,
@@ -84,13 +98,13 @@ fn apply_security_header(
   Ok(app.layer(SetResponseHeaderLayer::overriding(name, value)))
 }
 
-/// Serves the app with socket connect info
-/// and security headers applied.
-pub async fn serve_app(
+/// Applies the security headers and
+/// [trusted proxies][ServerConfig::trusted_proxies] layers
+/// to the app. Used by [serve_app].
+pub fn configure_app(
   mut app: Router,
-  config: impl ServerConfig,
-  handle: impl Into<Option<Handle<SocketAddr>>>,
-) -> anyhow::Result<()> {
+  config: &impl ServerConfig,
+) -> anyhow::Result<Router> {
   app = apply_security_header(
     app,
     header::X_CONTENT_TYPE_OPTIONS,
@@ -121,8 +135,18 @@ pub async fn serve_app(
     config.referrer_policy(),
     "Invalid referrer_policy value",
   )?;
+  Ok(app.layer(config.trusted_proxies().layer()))
+}
 
-  let app = app.into_make_service_with_connect_info::<SocketAddr>();
+/// Serves the app with socket connect info,
+/// security headers, and trusted proxies applied.
+pub async fn serve_app(
+  app: Router,
+  config: impl ServerConfig,
+  handle: impl Into<Option<Handle<SocketAddr>>>,
+) -> anyhow::Result<()> {
+  let app = configure_app(app, &config)?
+    .into_make_service_with_connect_info::<SocketAddr>();
 
   // Construct the bind socket addr
   let addr = format!("{}:{}", config.bind_ip(), config.port());
