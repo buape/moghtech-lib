@@ -23,7 +23,7 @@ pub fn Ok<T>(value: T) -> Result<T> {
 /// Intermediate error type which can be converted to from any error using `?`.
 /// The standard `impl From<E> for Error` will attach StatusCode::INTERNAL_SERVER_ERROR,
 /// so if an alternative StatusCode is desired, you should use `.status_code` ([AddStatusCode] or [AddStatusCodeError])
-/// to add the status and `.header` ([AddHeader] or [AddHeaderError]) before using `?`.
+/// to add the status and `.header` ([AddHeaders] or [AddHeadersError]) before using `?`.
 #[derive(Debug)]
 pub struct Error {
   pub status: StatusCode,
