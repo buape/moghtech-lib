@@ -459,6 +459,12 @@ pub struct CreateApiKey {
   /// Default is 0, which means no expiry.
   #[serde(default)]
   pub expires: U64,
+
+  /// Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
+  /// from which requests using this api key are accepted.
+  /// Empty (the default) means all ips are allowed.
+  #[serde(default)]
+  pub cidr_whitelist: Vec<String>,
 }
 
 /// Response for [CreateApiKey].
@@ -543,6 +549,12 @@ pub struct CreateApiKeyV2 {
   /// Default is 0, which means no expiry.
   #[serde(default)]
   pub expires: U64,
+
+  /// Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
+  /// from which requests using this api key are accepted.
+  /// Empty (the default) means all ips are allowed.
+  #[serde(default)]
+  pub cidr_whitelist: Vec<String>,
 
   /// Optionally provide a pre-existing public key.
   /// Otherwise, a private key will be generated and
@@ -680,12 +692,21 @@ mod tests {
       serde_json::from_value(json!({ "name": "key-name" })).unwrap();
     assert_eq!(req.name, "key-name");
     assert_eq!(req.expires, 0);
+    assert!(req.cidr_whitelist.is_empty());
     let value = serde_json::to_value(CreateApiKey {
       name: "key-name".into(),
       expires: 100,
+      cidr_whitelist: vec!["10.0.0.0/8".into()],
     })
     .unwrap();
-    assert_eq!(value, json!({ "name": "key-name", "expires": 100 }));
+    assert_eq!(
+      value,
+      json!({
+        "name": "key-name",
+        "expires": 100,
+        "cidr_whitelist": ["10.0.0.0/8"]
+      })
+    );
   }
 
   #[test]
@@ -695,7 +716,14 @@ mod tests {
       serde_json::from_value(json!({ "name": "key-name" })).unwrap();
     assert_eq!(req.name, "key-name");
     assert_eq!(req.expires, 0);
+    assert!(req.cidr_whitelist.is_empty());
     assert!(req.public_key.is_empty());
+    let req: CreateApiKeyV2 = serde_json::from_value(json!({
+      "name": "key-name",
+      "cidr_whitelist": ["10.0.0.0/8", "::1"]
+    }))
+    .unwrap();
+    assert_eq!(req.cidr_whitelist, ["10.0.0.0/8", "::1"]);
   }
 
   #[test]

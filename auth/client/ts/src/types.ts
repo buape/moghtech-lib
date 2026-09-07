@@ -176,6 +176,12 @@ export interface CreateApiKey {
 	 * Default is 0, which means no expiry.
 	 */
 	expires?: U64;
+	/**
+	 * Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
+	 * from which requests using this api key are accepted.
+	 * Empty (the default) means all ips are allowed.
+	 */
+	cidr_whitelist?: string[];
 }
 
 /** Response for [CreateApiKey]. */
@@ -203,6 +209,12 @@ export interface CreateApiKeyV2 {
 	 * Default is 0, which means no expiry.
 	 */
 	expires?: U64;
+	/**
+	 * Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
+	 * from which requests using this api key are accepted.
+	 * Empty (the default) means all ips are allowed.
+	 */
+	cidr_whitelist?: string[];
 	/**
 	 * Optionally provide a pre-existing public key.
 	 * Otherwise, a private key will be generated and
