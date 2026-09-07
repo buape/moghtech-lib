@@ -7,8 +7,10 @@ use std::{
 use anyhow::anyhow;
 use axum::http::{HeaderMap, StatusCode};
 use mogh_cache::CloneCache;
-use mogh_error::{AddStatusCode, AddStatusCodeError};
+use mogh_error::AddStatusCodeError;
 use tokio::sync::RwLock;
+
+pub use mogh_request_ip::{TrustedProxies, get_client_ip};
 
 /// Trait to extend fallible futures with stateful
 /// rate limiting.
@@ -111,18 +113,23 @@ where
     }
   }
 
+  /// [Self::with_failure_rate_limit_using_ip], with the ip
+  /// determined from the request headers and socket `peer`
+  /// using [get_client_ip], so forwarding headers are only
+  /// believed from `trusted_proxies`.
   fn with_failure_rate_limit_using_headers(
     self,
     limiter: &RateLimiter,
     headers: &HeaderMap,
-    fallback: Option<IpAddr>,
+    peer: Option<IpAddr>,
+    trusted_proxies: &TrustedProxies,
   ) -> impl Future<Output = mogh_error::Result<R>> {
     async move {
       // Can skip header ip extraction if disabled
       if limiter.disabled {
         return self.await;
       }
-      let ip = get_ip_from_headers(headers, fallback)?;
+      let ip = get_client_ip(headers, peer, trusted_proxies)?;
       self.with_failure_rate_limit_using_ip(limiter, &ip).await
     }
   }
@@ -198,37 +205,6 @@ fn spawn_cleanup_task(limiter: Arc<RateLimiter>) {
         .await;
     }
   });
-}
-
-pub fn get_ip_from_headers(
-  headers: &HeaderMap,
-  fallback: Option<IpAddr>,
-) -> mogh_error::Result<IpAddr> {
-  // Check X-Forwarded-For header (first IP in chain)
-  if let Some(forwarded) = headers.get("x-forwarded-for")
-    && let Ok(forwarded_str) = forwarded.to_str()
-    && let Some(ip) = forwarded_str.split(',').next()
-    && !ip.trim().is_empty()
-  {
-    return ip.trim().parse().status_code(StatusCode::UNAUTHORIZED);
-  }
-
-  // Check X-Real-IP header
-  if let Some(real_ip) = headers.get("x-real-ip")
-    && let Ok(ip) = real_ip.to_str()
-    && !ip.trim().is_empty()
-  {
-    return ip.trim().parse().status_code(StatusCode::UNAUTHORIZED);
-  }
-
-  if let Some(fallback) = fallback {
-    return Ok(fallback);
-  }
-
-  Err(
-    anyhow!("'x-forwarded-for' and 'x-real-ip' headers are both missing, and no fallback ip could be extracted from the request.")
-      .status_code(StatusCode::UNAUTHORIZED),
-  )
 }
 
 #[cfg(test)]
@@ -385,63 +361,64 @@ mod tests {
       "x-forwarded-for",
       HeaderValue::from_static("1.2.3.4, 10.0.0.1"),
     );
+    let proxy: IpAddr = "10.0.0.1".parse().unwrap();
+    let trusted = TrustedProxies::parse(["10.0.0.0/8"]).unwrap();
     let executions = AtomicUsize::new(0);
     failing(&executions)
-      .with_failure_rate_limit_using_headers(&limiter, &headers, None)
+      .with_failure_rate_limit_using_headers(
+        &limiter,
+        &headers,
+        Some(proxy),
+        &trusted,
+      )
       .await
       .unwrap_err();
     let err = failing(&executions)
-      .with_failure_rate_limit_using_headers(&limiter, &headers, None)
+      .with_failure_rate_limit_using_headers(
+        &limiter,
+        &headers,
+        Some(proxy),
+        &trusted,
+      )
       .await
       .unwrap_err();
     assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
+    // The limit was recorded against the forwarded client ip.
+    let err = failing(&executions)
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
   }
 
-  #[test]
-  fn get_ip_prefers_first_forwarded_for() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-      "x-forwarded-for",
-      HeaderValue::from_static(" 1.2.3.4 , 10.0.0.1"),
-    );
-    headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
-    assert_eq!(get_ip_from_headers(&headers, None).unwrap(), IP);
-  }
-
-  #[test]
-  fn get_ip_falls_back_to_real_ip_then_fallback() {
+  #[tokio::test]
+  async fn rate_limit_using_headers_ignores_untrusted_peer() {
+    let limiter = RateLimiter::new(false, 1, Duration::from_secs(60));
     let mut headers = HeaderMap::new();
     headers
-      .insert("x-real-ip", HeaderValue::from_static(" 9.9.9.9 "));
-    assert_eq!(
-      get_ip_from_headers(&headers, None).unwrap(),
-      "9.9.9.9".parse::<IpAddr>().unwrap()
-    );
-
-    let headers = HeaderMap::new();
-    assert_eq!(get_ip_from_headers(&headers, Some(IP)).unwrap(), IP);
-
-    let err = get_ip_from_headers(&headers, None).unwrap_err();
-    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-  }
-
-  #[test]
-  fn get_ip_empty_headers_fall_through() {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", HeaderValue::from_static("  "));
-    headers.insert("x-real-ip", HeaderValue::from_static(""));
-    assert_eq!(get_ip_from_headers(&headers, Some(IP)).unwrap(), IP);
-  }
-
-  #[test]
-  fn get_ip_invalid_ip_is_unauthorized() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-      "x-forwarded-for",
-      HeaderValue::from_static("not-an-ip"),
-    );
-    let err = get_ip_from_headers(&headers, Some(IP)).unwrap_err();
-    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+      .insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+    let peer: IpAddr = "203.0.113.7".parse().unwrap();
+    let executions = AtomicUsize::new(0);
+    failing(&executions)
+      .with_failure_rate_limit_using_headers(
+        &limiter,
+        &headers,
+        Some(peer),
+        &TrustedProxies::None,
+      )
+      .await
+      .unwrap_err();
+    // Recorded against the peer, not the spoofed header.
+    let err = failing(&executions)
+      .with_failure_rate_limit_using_ip(&limiter, &peer)
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    let err = failing(&executions)
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+    assert_ne!(err.status, StatusCode::TOO_MANY_REQUESTS);
   }
 }
