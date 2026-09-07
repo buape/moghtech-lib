@@ -16,7 +16,9 @@ mod interpolate;
 mod load;
 mod merge;
 
-pub use error::Error;
+pub use error::{
+  Error, deserialize_final, redact_serde_error, value_type,
+};
 pub use interpolate::*;
 pub use merge::{merge_config, merge_objects};
 
@@ -34,10 +36,17 @@ pub struct ConfigLoader<'outer, 'inner> {
   ///
   /// Patterns coming later in the array (higher index) will override
   /// configuration added by earlier patterns, however this is
-  /// only relavant for an individual `path`. Later `paths`
-  /// will still have higher priority.
+  /// only relavant within an individual directory. Later `paths`
+  /// and later includes will still have higher priority.
   pub match_wildcards: &'outer [&'inner str],
   /// The file name to search for `.include` file.
+  ///
+  /// Each line of the include file is a path (file or directory)
+  /// to load after the directory's own files. Includes are applied
+  /// in the order listed, recursively, and later includes override
+  /// earlier ones. Every include overrides the directory's own
+  /// files, so a directory can include shared defaults which are
+  /// then refined by later includes.
   pub include_file_name: &'static str,
   /// Whether to merge nested config objects.
   /// Otherwise, the object will be replaced at
@@ -114,17 +123,24 @@ impl ConfigLoader<'_, '_> {
 
       if metadata.is_dir() {
         let mut files = Vec::new();
+        // Guards against include cycles (A includes B includes A,
+        // or a directory including itself).
+        let mut visiting = std::collections::HashSet::new();
+        // Files come back in priority order (later overrides earlier).
         load::load_config_files(
           &mut files,
+          &mut visiting,
           path,
           &wildcards,
           include_file_name,
           debug_print,
         );
-        files.sort_by(|(a_index, a_path), (b_index, b_path)| {
-          a_index.cmp(b_index).then(a_path.cmp(b_path))
-        });
-        all_files.extend(files.into_iter().map(|(_, path)| path));
+        for path in files {
+          // If the same file comes up again later on, it should be
+          // removed and reinserted so it maintains higher priority.
+          all_files.shift_remove(&path);
+          all_files.insert(path);
+        }
       } else if metadata.is_file() {
         let path = path.to_path_buf();
         // If the same path comes up again later on, it should be removed and

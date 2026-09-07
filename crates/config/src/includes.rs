@@ -1,17 +1,18 @@
-use std::{
-  collections::HashSet,
-  path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
+use indexmap::IndexSet;
+
+/// Collects the paths listed in a directory's include file,
+/// in the order they are listed, without duplicates.
 pub struct IncludesLoader {
-  includes: HashSet<PathBuf>,
+  includes: IndexSet<PathBuf>,
   include_file_name: &'static str,
 }
 
 impl IncludesLoader {
   pub fn new(include_file_name: &'static str) -> Self {
     Self {
-      includes: HashSet::new(),
+      includes: IndexSet::new(),
       include_file_name,
     }
   }
@@ -22,7 +23,8 @@ impl IncludesLoader {
     includes
   }
 
-  pub fn finish(self) -> HashSet<PathBuf> {
+  /// The included paths, in include order.
+  pub fn finish(self) -> IndexSet<PathBuf> {
     self.includes
   }
 
@@ -43,10 +45,12 @@ impl IncludesLoader {
           .map(|line| line.trim())
           // Ignore empty / commented out lines
           .filter(|line| !line.is_empty() && !line.starts_with('#'))
-          // Remove end of line comments
+          // Remove end of line comments: a '#' preceded by
+          // whitespace. A '#' inside a path is kept.
           .map(|line| {
             line
-              .split_once('#')
+              .split_once(" #")
+              .or_else(|| line.split_once("\t#"))
               .map(|res| res.0.trim())
               .unwrap_or(line)
           })

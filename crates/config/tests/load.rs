@@ -197,6 +197,89 @@ fn include_file_pulls_in_other_directories() {
   let config = load(&[&dir.0], &["*.toml"], false, false);
   assert_eq!(config.get("extra"), Some(&serde_json::json!(1)));
   assert_eq!(config.get("main"), Some(&serde_json::json!(1)));
+  // Includes override the directory's own files.
+  assert_eq!(config.get("key"), Some(&serde_json::json!("included")));
+}
+
+#[test]
+fn includes_apply_in_include_order() {
+  // Directory names are chosen so that path order (zz < ...)
+  // disagrees with include order, proving include order wins.
+  let main = TestDir::new("zz_order_main");
+  let first = TestDir::new("yy_order_first");
+  let second = TestDir::new("aa_order_second");
+  let nested = TestDir::new("bb_order_nested");
+  main.write("main.toml", "key = \"main\"\nmain = 1");
+  first.write("first.toml", "key = \"first\"\nfirst = 1");
+  second.write("second.toml", "key = \"second\"\nsecond = 1");
+  nested.write("nested.toml", "key = \"nested\"\nnested = 1");
+  // first includes nested, so nested is applied right after
+  // first, before second.
+  first.write(
+    ".include",
+    &format!(
+      "{}
+",
+      nested.0.display()
+    ),
+  );
+  main.write(
+    ".include",
+    &format!(
+      "{}
+{}
+",
+      first.0.display(),
+      second.0.display()
+    ),
+  );
+
+  let config = load(&[&main.0], &["*.toml"], false, false);
+  assert_eq!(
+    config,
+    serde_json::json!({
+      "key": "second",
+      "main": 1,
+      "first": 1,
+      "nested": 1,
+      "second": 1,
+    })
+  );
+
+  // Reversing the include order reverses the priority.
+  main.write(
+    ".include",
+    &format!(
+      "{}
+{}
+",
+      second.0.display(),
+      first.0.display()
+    ),
+  );
+  let config = load(&[&main.0], &["*.toml"], false, false);
+  assert_eq!(config.get("key"), Some(&serde_json::json!("nested")));
+}
+
+#[test]
+fn wildcard_priority_is_per_directory() {
+  let main = TestDir::new("wc_per_dir_main");
+  let included = TestDir::new("wc_per_dir_included");
+  main.write("02_high.toml", "key = \"main-high\"");
+  included.write("01_low.toml", "key = \"included-low\"");
+  main.write(
+    ".include",
+    &format!(
+      "{}
+",
+      included.0.display()
+    ),
+  );
+  // 02_* is the higher priority wildcard, but only within a
+  // directory: the include still overrides the main directory.
+  let config =
+    load(&[&main.0], &["01_*.toml", "02_*.toml"], false, false);
+  assert_eq!(config, serde_json::json!({ "key": "included-low" }));
 }
 
 #[test]
@@ -219,4 +302,177 @@ fn interpolates_unset_env_vars_to_empty_string() {
   );
   let config = load(&[&toml], &[], false, false);
   assert_eq!(config, serde_json::json!({ "value": "" }));
+}
+
+#[test]
+fn include_cycles_do_not_recurse_forever() {
+  let a = TestDir::new("cycle_a");
+  // b is nested in a, so `..` from b is a.
+  let b = a.0.join("b");
+  std::fs::create_dir(&b).unwrap();
+  a.write("a.toml", "a = 1");
+  std::fs::write(b.join("b.toml"), "b = 2").unwrap();
+  // a includes b and itself, b includes a (absolute and relative).
+  a.write(".include", &format!("{}\n.\n", b.display()));
+  std::fs::write(
+    b.join(".include"),
+    format!("{}\n..\n", a.0.display()),
+  )
+  .unwrap();
+  let config = load(&[&a.0], &["*.toml"], false, false);
+  assert_eq!(config.get("a"), Some(&serde_json::json!(1)));
+  assert_eq!(config.get("b"), Some(&serde_json::json!(2)));
+}
+
+#[test]
+fn diamond_includes_keep_last_occurrence_priority() {
+  // main includes first then second, both include shared.
+  // shared is applied under second as well, so it overrides
+  // second, as the include order rule promises.
+  let main = TestDir::new("diamond_main");
+  let first = TestDir::new("diamond_first");
+  let second = TestDir::new("diamond_second");
+  let shared = TestDir::new("diamond_shared");
+  main.write("main.toml", "key = \"main\"");
+  first.write("first.toml", "key = \"first\"");
+  second.write("second.toml", "key = \"second\"");
+  shared.write("shared.toml", "key = \"shared\"\nshared = 1");
+  first.write(".include", &format!("{}\n", shared.0.display()));
+  second.write(".include", &format!("{}\n", shared.0.display()));
+  main.write(
+    ".include",
+    &format!("{}\n{}\n", first.0.display(), second.0.display()),
+  );
+  let config = load(&[&main.0], &["*.toml"], false, false);
+  assert_eq!(
+    config,
+    serde_json::json!({ "key": "shared", "shared": 1 })
+  );
+}
+
+#[test]
+fn include_file_is_not_loaded_as_config() {
+  let dir = TestDir::new("include_not_config");
+  dir.write("config.toml", "a = 1");
+  dir.write(".include", "# nothing\n");
+  // No wildcards: every file would otherwise be attempted.
+  let config = load(&[&dir.0], &[], false, false);
+  assert_eq!(config, serde_json::json!({ "a": 1 }));
+}
+
+#[test]
+fn include_paths_may_contain_hash() {
+  let included = TestDir::new("hash#dir");
+  included.write("extra.toml", "extra = 1");
+  let dir = TestDir::new("hash_include");
+  dir.write("main.toml", "main = 1");
+  dir.write(
+    ".include",
+    &format!("{} # trailing comment\n", included.0.display()),
+  );
+  let config = load(&[&dir.0], &["*.toml"], false, false);
+  assert_eq!(config.get("extra"), Some(&serde_json::json!(1)));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_files_in_directories_are_loaded() {
+  let real = TestDir::new("symlink_real");
+  let target = real.write("real.toml", "linked = 1");
+  let dir = TestDir::new("symlink_dir");
+  std::os::unix::fs::symlink(&target, dir.0.join("config.toml"))
+    .unwrap();
+  let config = load(&[&dir.0], &["*.toml"], false, false);
+  assert_eq!(config, serde_json::json!({ "linked": 1 }));
+}
+
+#[test]
+fn interpolated_values_cannot_inject_or_break_json() {
+  let var = "MOGH_CONFIG_TEST_INJECTION_VAR";
+  let value = "x\",\"admin\":true,\"y\":\"z\\\nline2 $(whoami)";
+  unsafe { std::env::set_var(var, value) };
+  let dir = TestDir::new("interpolation_injection");
+  let toml = dir.write(
+    "config.toml",
+    &format!("value = \"${{{var}}}\"\n[nested]\ninner = \"${{{var}}}\"\nlist = [\"${{{var}}}\"]"),
+  );
+  let config = load(&[&toml], &[], false, false);
+  assert_eq!(
+    config,
+    serde_json::json!({
+      "value": value,
+      "nested": { "inner": value, "list": [value] }
+    })
+  );
+}
+
+#[test]
+fn shell_output_and_env_values_are_not_reinterpolated() {
+  // The output of $(env) contains this literal `${...}` text,
+  // which must be kept verbatim rather than expanded.
+  let literal_var = "MOGH_CONFIG_TEST_LITERAL_VAR";
+  unsafe {
+    std::env::set_var(
+      literal_var,
+      "keep ${MOGH_CONFIG_TEST_UNSET} literal",
+    )
+  };
+  // An env var whose value references another env var expands
+  // one level, but `$(...)` in either value is never executed.
+  let outer = "MOGH_CONFIG_TEST_OUTER_VAR";
+  let inner = "MOGH_CONFIG_TEST_INNER_VAR";
+  unsafe {
+    std::env::set_var(outer, format!("outer ${{{inner}}} $(whoami)"));
+    std::env::set_var(inner, "inner $(whoami)");
+  }
+  let dir = TestDir::new("interpolation_no_reinterpolation");
+  let toml = dir.write(
+    "config.toml",
+    &format!("from_shell = \"$(env)\"\nfrom_env = \"${{{outer}}}\""),
+  );
+  let config = load(&[&toml], &[], false, false);
+  let from_shell = config["from_shell"].as_str().unwrap();
+  assert!(
+    from_shell.contains("keep ${MOGH_CONFIG_TEST_UNSET} literal"),
+    "{from_shell}"
+  );
+  assert_eq!(
+    config["from_env"],
+    serde_json::json!("outer inner $(whoami) $(whoami)")
+  );
+}
+
+#[test]
+fn interpolates_shell_commands_and_keys() {
+  let dir = TestDir::new("interpolation_shell");
+  let toml = dir.write(
+    "config.toml",
+    "value = \"$(true)\"\n\"${MOGH_CONFIG_TEST_DEFINITELY_UNSET_VAR}key\" = 1",
+  );
+  let config = load(&[&toml], &[], false, false);
+  assert_eq!(config, serde_json::json!({ "value": "", "key": 1 }));
+}
+
+#[test]
+fn errors_do_not_leak_config_values() {
+  #[derive(serde::Deserialize, Debug)]
+  #[allow(dead_code)]
+  struct Typed {
+    port: u16,
+  }
+  let dir = TestDir::new("error_redaction");
+  let toml = dir.write("config.toml", "port = \"hunter2secret\"");
+  let err = ConfigLoader {
+    paths: &[&toml],
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: false,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Typed>()
+  .unwrap_err();
+  let message = err.to_string();
+  assert!(!message.contains("hunter2secret"), "{message}");
+  assert!(message.contains("expected u16"), "{message}");
 }

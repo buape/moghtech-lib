@@ -4,6 +4,11 @@ Module for comprehensive loading of strongly typed configuration files using `st
 
 - Supports parsing JSON, YAML, and TOML formatted files.
 - Supports merging final configuration from multiple supplied files / directories.
+- Supports `${ENV_VAR}` and `$(shell_command)` interpolation in values.
+
+Priority (later overrides earlier): `paths` in order given. Within a directory,
+its own files (by wildcard, then name), then each path in the include file in
+the order listed, recursively, so includes override the directory's own files.
 
 ```rust
 #[derive(serde::Deserialize)]

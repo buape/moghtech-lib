@@ -39,7 +39,7 @@ pub fn merge_objects(
           _ => {
             return Err(Error::ObjectFieldTypeMismatch {
               key,
-              value,
+              found: crate::error::value_type(&value),
             });
           }
         }
@@ -55,7 +55,10 @@ pub fn merge_objects(
             target.insert(key, serde_json::Value::Array(target_arr));
           }
           _ => {
-            return Err(Error::ArrayFieldTypeMismatch { key, value });
+            return Err(Error::ArrayFieldTypeMismatch {
+              key,
+              found: crate::error::value_type(&value),
+            });
           }
         }
       }
@@ -88,8 +91,7 @@ pub fn merge_config<T: Serialize + DeserializeOwned>(
   };
   let object =
     merge_objects(target, source, merge_nested, extend_array)?;
-  serde_json::from_value(serde_json::Value::Object(object))
-    .map_err(|e| Error::ParseFinalJson { e })
+  crate::error::deserialize_final(&serde_json::Value::Object(object))
 }
 
 #[cfg(test)]

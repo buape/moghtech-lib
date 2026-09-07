@@ -1,4 +1,5 @@
 use std::{
+  collections::HashSet,
   fs::File,
   io::Read,
   path::{Path, PathBuf},
@@ -8,13 +9,27 @@ use colored::Colorize;
 use serde::de::DeserializeOwned;
 
 use crate::{
-  Error, Result, includes::IncludesLoader, interpolate_env_and_shell,
+  Error, Result, includes::IncludesLoader, interpolate_value,
   merge::merge_objects,
 };
 
+/// Collects config files under `path` into `files` in priority
+/// order (later overrides earlier):
+///
+/// 1. The directory's own matching files, ordered by the matched
+///    wildcard (later wildcards override earlier), then by name.
+/// 2. Each path listed in the directory's include file, in the
+///    order listed, recursively. Later includes override earlier
+///    ones, and every include overrides the directory's own files.
+///
+/// A path included more than once (eg two includes sharing a
+/// common include) is emitted each time, so its last occurrence
+/// takes the highest priority. Only true recursion (a directory
+/// including itself, directly or indirectly) is cut.
 pub fn load_config_files(
-  // stores index of matching keyword as well as path
-  files: &mut Vec<(usize, PathBuf)>,
+  files: &mut Vec<PathBuf>,
+  // canonical directories on the current include stack
+  visiting: &mut HashSet<PathBuf>,
   path: &Path,
   keywords: &[wildcard::Wildcard],
   include_file_name: &'static str,
@@ -22,7 +37,7 @@ pub fn load_config_files(
 ) {
   // File base case.
   if path.is_file() {
-    files.push((0, path.to_path_buf()));
+    files.push(path.to_path_buf());
     return;
   }
 
@@ -33,14 +48,28 @@ pub fn load_config_files(
   let Ok(folder) = path.canonicalize() else {
     return;
   };
+  if !visiting.insert(folder.clone()) {
+    if debug_print {
+      println!(
+        "{}: {}: {folder:?}",
+        "DEBUG".cyan(),
+        "Skipping include cycle".dimmed()
+      );
+    }
+    return;
+  }
   let Ok(read_dir) = std::fs::read_dir(&folder) else {
     return;
   };
 
-  // Collect any config files in the current dir.
+  // Collect any config files in the current dir,
+  // with the index of the matched wildcard.
+  let mut dir_files = Vec::new();
   for dir_entry in read_dir.flatten() {
     let path = dir_entry.path();
-    let Ok(metadata) = dir_entry.metadata() else {
+    // Follows symlinks (eg Kubernetes ConfigMap mounts),
+    // unlike DirEntry::metadata.
+    let Ok(metadata) = std::fs::metadata(&path) else {
       continue;
     };
     if metadata.is_file() {
@@ -48,6 +77,10 @@ pub fn load_config_files(
       let Some(file_name) = file_name.to_str() else {
         continue;
       };
+      // The include file is never a config file.
+      if file_name == include_file_name {
+        continue;
+      }
       // Ensure file name matches a wildcard keyword
       let index = if keywords.is_empty() {
         0
@@ -55,23 +88,25 @@ pub fn load_config_files(
         .iter()
         .position(|wc| wc.is_match(file_name.as_bytes()))
       {
-        // actual config keyword matches will have higher priority than
-        // when files are added via the base case.
-        index + 1
+        index
       } else {
         continue;
       };
       let Ok(path) = path.canonicalize() else {
         continue;
       };
-      files.push((index, path));
+      dir_files.push((index, path));
     }
   }
+  // Wildcard priority only applies within this directory.
+  dir_files.sort();
+  files.extend(dir_files.into_iter().map(|(_, path)| path));
 
   // Collect any paths specified in 'includes'
   let includes =
     IncludesLoader::init(&folder, include_file_name).finish();
   if includes.is_empty() {
+    visiting.remove(&folder);
     return;
   }
 
@@ -91,12 +126,14 @@ pub fn load_config_files(
   for path in includes {
     load_config_files(
       files,
+      visiting,
       &path,
       keywords,
       include_file_name,
       debug_print,
     );
   }
+  visiting.remove(&folder);
 }
 
 /// Splits a cicada path (`cicada://...`, `cicada:/...` or `cicada:...`)
@@ -197,12 +234,13 @@ pub fn load_parse_config_files<T: DeserializeOwned>(
     };
   }
 
-  let json = serde_json::to_string(&target)
-    .map_err(|e| Error::SerializeJson { e })?;
-  let interpolated = interpolate_env_and_shell(&json);
+  // Interpolate each string leaf (and key) individually, rather
+  // than the serialized document, so values containing quotes,
+  // backslashes or newlines cannot break or inject into the json.
+  let mut target = serde_json::Value::Object(target);
+  interpolate_value(&mut target);
 
-  serde_json::from_str(&interpolated)
-    .map_err(|e| Error::ParseFinalJson { e })
+  crate::error::deserialize_final(&target)
 }
 
 /// Loads and parses a single config file
