@@ -10,6 +10,14 @@ use anyhow::{Context as _, anyhow};
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroize;
 
+// Depended on only to enable their 'zeroize' features, so the
+// cipher key schedules built by aes-gcm / chacha20poly1305 are
+// wiped on drop along with the [Key] itself.
+use aes as _;
+use chacha20 as _;
+use ghash as _;
+use polyval as _;
+
 pub mod aead;
 
 pub use data_encoding::BASE64URL;
@@ -50,11 +58,25 @@ impl Key {
     Some(key)
   }
 
-  /// Fresh random key material from the thread rng.
+  /// Fresh random key material, read directly from the OS
+  /// random source ([rand::rngs::SysRng]) so the material cannot
+  /// repeat across a `fork`, unlike a userspace generator.
+  ///
+  /// Panics if the OS random source is unavailable,
+  /// see [Key::try_generate].
   pub fn generate() -> Key {
-    use rand::RngExt as _;
-    let mut bytes: [u8; Key::LEN] = rand::rng().random();
-    Key::from_bytes(&mut bytes)
+    Key::try_generate().expect("OS random source unavailable")
+  }
+
+  /// [Key::generate], returning an error if the
+  /// OS random source is unavailable.
+  pub fn try_generate() -> anyhow::Result<Key> {
+    use rand::TryRng as _;
+    let mut bytes = [0u8; Key::LEN];
+    rand::rngs::SysRng
+      .try_fill_bytes(&mut bytes)
+      .context("Failed to read from the OS random source")?;
+    Ok(Key::from_bytes(&mut bytes))
   }
 
   /// Decode base64url encoded key material (the encoding key
@@ -154,8 +176,16 @@ impl Cipher {
     let (marker, payload) = rest
       .split_once('$')
       .context("Invalid ciphertext format marker")?;
-    let cipher = Cipher::from_marker(marker)
-      .with_context(|| format!("Unknown cipher '{marker}'"))?;
+    let cipher = Cipher::from_marker(marker).with_context(|| {
+      // The marker is untrusted input: cap what is echoed.
+      let shown = marker.chars().take(32).collect::<String>();
+      let more = if marker.chars().count() > 32 {
+        "…"
+      } else {
+        ""
+      };
+      format!("Unknown cipher '{shown}{more}'")
+    })?;
     Ok((cipher, payload))
   }
 }
@@ -235,6 +265,30 @@ mod tests {
     assert!(Key::from_slice(&[1u8; 31]).is_none());
     assert!(Key::from_base64url(b"!!").is_err());
     assert_eq!(format!("{key:?}"), "Key([REDACTED])");
+  }
+
+  #[test]
+  fn key_from_base64url_rejects_wrong_lengths_and_padding() {
+    // Valid base64url, wrong decoded length.
+    let short = BASE64URL.encode(&[1u8; 31]);
+    let err = Key::from_base64url(short.as_bytes()).unwrap_err();
+    assert!(err.to_string().contains("length"));
+    let long = BASE64URL.encode(&[1u8; 33]);
+    assert!(Key::from_base64url(long.as_bytes()).is_err());
+    assert!(Key::from_base64url(b"").is_err());
+    // The stored format is padded base64url;
+    // unpadded input is not accepted.
+    let unpadded = BASE64URL.encode(&[7u8; 32]);
+    let unpadded = unpadded.trim_end_matches('=');
+    assert!(Key::from_base64url(unpadded.as_bytes()).is_err());
+  }
+
+  #[test]
+  fn unknown_marker_error_is_capped() {
+    let long = format!("${}$payload", "a".repeat(5_000));
+    let err = Cipher::parse(&long).unwrap_err().to_string();
+    assert!(err.len() < 100, "{}", err.len());
+    assert!(err.contains("Unknown cipher"));
   }
 
   #[test]

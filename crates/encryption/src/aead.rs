@@ -9,72 +9,63 @@ use chacha20poly1305::{
   aead::{Aead, Payload, generic_array::GenericArray},
 };
 use data_encoding::BASE64URL;
-use rand::{RngExt as _, rngs::ThreadRng};
+use rand::{TryRng as _, rngs::SysRng};
 use zeroize::Zeroizing;
 
 use crate::{
   AssociatedData, Cipher, EncryptedData, EnvelopeEncryptedData, Key,
 };
 
-#[derive(Default)]
-pub struct EncryptionProvider(pub ThreadRng);
-
-impl EncryptionProvider {
-  /// Encrypts the given bytes using the given key, a random
-  /// nonce, and the given associated data, with `cipher`.
-  pub fn encrypt<A: AssociatedData>(
-    &mut self,
-    data: &[u8],
-    key: &Key,
-    associated_data: &A,
-    cipher: Cipher,
-  ) -> anyhow::Result<EncryptedData> {
-    let nonce: Vec<u8> = match cipher {
-      Cipher::XChaCha20Poly1305 => {
-        self.0.random::<[u8; 24]>().to_vec()
-      }
-      Cipher::Aes256Gcm => self.0.random::<[u8; 12]>().to_vec(),
-    };
-    let payload = Payload {
-      msg: data,
-      aad: associated_data.as_bytes(),
-    };
-    let sealed = match cipher {
-      Cipher::XChaCha20Poly1305 => {
-        XChaCha20Poly1305::new(key.as_bytes().into())
-          .encrypt(GenericArray::from_slice(&nonce), payload)
-      }
-      Cipher::Aes256Gcm => Aes256Gcm::new(key.as_bytes().into())
-        .encrypt(GenericArray::from_slice(&nonce), payload),
+/// Encrypts the given bytes using the given key, a random nonce,
+/// and the given associated data, with `cipher`.
+///
+/// The nonce is read directly from the OS random source ([SysRng]),
+/// so it cannot repeat across a `fork` the way a userspace
+/// generator's stream can.
+pub fn encrypt<A: AssociatedData>(
+  data: &[u8],
+  key: &Key,
+  associated_data: &A,
+  cipher: Cipher,
+) -> anyhow::Result<EncryptedData> {
+  let mut nonce = vec![0u8; cipher.nonce_len()];
+  SysRng
+    .try_fill_bytes(&mut nonce)
+    .context("Failed to read nonce from the OS random source")?;
+  let payload = Payload {
+    msg: data,
+    aad: associated_data.as_bytes(),
+  };
+  let sealed = match cipher {
+    Cipher::XChaCha20Poly1305 => {
+      XChaCha20Poly1305::new(key.as_bytes().into())
+        .encrypt(GenericArray::from_slice(&nonce), payload)
     }
-    .map_err(|e| anyhow!("Encryption failed | {e:?}"))?;
-    Ok(EncryptedData {
-      data: cipher.mark(&BASE64URL.encode(&sealed)),
-      nonce: BASE64URL.encode(&nonce),
-    })
+    Cipher::Aes256Gcm => Aes256Gcm::new(key.as_bytes().into())
+      .encrypt(GenericArray::from_slice(&nonce), payload),
   }
+  .map_err(|e| anyhow!("Encryption failed | {e:?}"))?;
+  Ok(EncryptedData {
+    data: cipher.mark(&BASE64URL.encode(&sealed)),
+    nonce: BASE64URL.encode(&nonce),
+  })
+}
 
-  /// Encrypts the given bytes using a random key, a random nonce,
-  /// and the given associated data. Then encrypts the key using
-  /// the master key, a random nonce, and the same associated
-  /// data. Both layers use `cipher`.
-  pub fn envelope_encrypt<A: AssociatedData>(
-    &mut self,
-    data: &[u8],
-    master_key: &Key,
-    associated_data: &A,
-    cipher: Cipher,
-  ) -> anyhow::Result<EnvelopeEncryptedData> {
-    let key = Key::generate();
-    let data = self.encrypt(data, &key, associated_data, cipher)?;
-    let key = self.encrypt(
-      key.as_bytes(),
-      master_key,
-      associated_data,
-      cipher,
-    )?;
-    Ok(EnvelopeEncryptedData { key, data })
-  }
+/// Encrypts the given bytes using a random key, a random nonce,
+/// and the given associated data. Then encrypts the key using
+/// the master key, a random nonce, and the same associated
+/// data. Both layers use `cipher`.
+pub fn envelope_encrypt<A: AssociatedData>(
+  data: &[u8],
+  master_key: &Key,
+  associated_data: &A,
+  cipher: Cipher,
+) -> anyhow::Result<EnvelopeEncryptedData> {
+  let key = Key::try_generate()?;
+  let data = encrypt(data, &key, associated_data, cipher)?;
+  let key =
+    encrypt(key.as_bytes(), master_key, associated_data, cipher)?;
+  Ok(EnvelopeEncryptedData { key, data })
 }
 
 /// Decrypts the given [EncryptedData] back into bytes using the
@@ -142,11 +133,9 @@ mod tests {
 
   #[test]
   fn encrypt_decrypt_round_trip_every_cipher() {
-    let mut provider = EncryptionProvider::default();
     for cipher in Cipher::ALL {
-      let encrypted = provider
-        .encrypt(b"secret payload", &key(), &(), cipher)
-        .unwrap();
+      let encrypted =
+        encrypt(b"secret payload", &key(), &(), cipher).unwrap();
       assert!(
         encrypted
           .data
@@ -166,10 +155,9 @@ mod tests {
 
   #[test]
   fn unmarked_ciphertext_reads_as_xchacha() {
-    let mut provider = EncryptionProvider::default();
-    let encrypted = provider
-      .encrypt(b"legacy", &key(), &(), Cipher::XChaCha20Poly1305)
-      .unwrap();
+    let encrypted =
+      encrypt(b"legacy", &key(), &(), Cipher::XChaCha20Poly1305)
+        .unwrap();
     let (_, payload) = Cipher::parse(&encrypted.data).unwrap();
     let legacy = EncryptedData {
       data: payload.to_string(),
@@ -183,10 +171,8 @@ mod tests {
 
   #[test]
   fn marker_and_nonce_must_agree() {
-    let mut provider = EncryptionProvider::default();
-    let encrypted = provider
-      .encrypt(b"data", &key(), &(), Cipher::Aes256Gcm)
-      .unwrap();
+    let encrypted =
+      encrypt(b"data", &key(), &(), Cipher::Aes256Gcm).unwrap();
     // Relabelled as XChaCha: the 12 byte nonce is rejected before
     // any decryption is attempted.
     let (_, payload) = Cipher::parse(&encrypted.data).unwrap();
@@ -200,11 +186,9 @@ mod tests {
 
   #[test]
   fn round_trip_with_associated_data() {
-    let mut provider = EncryptionProvider::default();
     let aad = "user-123";
     for cipher in Cipher::ALL {
-      let encrypted =
-        provider.encrypt(b"data", &key(), &aad, cipher).unwrap();
+      let encrypted = encrypt(b"data", &key(), &aad, cipher).unwrap();
       assert_eq!(
         decrypt(&encrypted, &key(), &aad).unwrap().as_slice(),
         b"data"
@@ -218,10 +202,8 @@ mod tests {
 
   #[test]
   fn tampered_ciphertext_fails() {
-    let mut provider = EncryptionProvider::default();
     for cipher in Cipher::ALL {
-      let encrypted =
-        provider.encrypt(b"data", &key(), &(), cipher).unwrap();
+      let encrypted = encrypt(b"data", &key(), &(), cipher).unwrap();
       let (_, payload) = Cipher::parse(&encrypted.data).unwrap();
       let mut raw = BASE64URL.decode(payload.as_bytes()).unwrap();
       raw[0] ^= 0xff;
@@ -235,27 +217,148 @@ mod tests {
 
   #[test]
   fn nonces_are_unique_per_encryption() {
-    let mut provider = EncryptionProvider::default();
-    let a = provider
-      .encrypt(b"data", &key(), &(), Cipher::default())
-      .unwrap();
-    let b = provider
-      .encrypt(b"data", &key(), &(), Cipher::default())
-      .unwrap();
+    let a = encrypt(b"data", &key(), &(), Cipher::default()).unwrap();
+    let b = encrypt(b"data", &key(), &(), Cipher::default()).unwrap();
     assert_ne!(a.nonce, b.nonce);
     assert_ne!(a.data, b.data);
   }
 
   #[test]
   fn empty_plaintext_round_trip() {
-    let mut provider = EncryptionProvider::default();
-    let encrypted = provider
-      .encrypt(b"", &key(), &(), Cipher::Aes256Gcm)
+    for cipher in Cipher::ALL {
+      let encrypted = encrypt(b"", &key(), &(), cipher).unwrap();
+      assert_eq!(
+        decrypt(&encrypted, &key(), &()).unwrap().as_slice(),
+        b""
+      );
+      assert!(decrypt(&encrypted, &other_key(), &()).is_err());
+    }
+  }
+
+  #[test]
+  fn truncated_ciphertext_is_error_not_panic() {
+    for cipher in Cipher::ALL {
+      let encrypted = encrypt(b"data", &key(), &(), cipher).unwrap();
+      let (_, payload) = Cipher::parse(&encrypted.data).unwrap();
+      let raw = BASE64URL.decode(payload.as_bytes()).unwrap();
+      // Shorter than the 16 byte tag, and empty.
+      for len in [raw.len() - 1, 15, 1, 0] {
+        let truncated = EncryptedData {
+          data: cipher.mark(&BASE64URL.encode(&raw[..len])),
+          nonce: encrypted.nonce.clone(),
+        };
+        let err = decrypt(&truncated, &key(), &()).unwrap_err();
+        assert!(err.to_string().contains("Decryption failed"));
+      }
+    }
+  }
+
+  #[test]
+  fn tampered_nonce_or_tag_fails() {
+    for cipher in Cipher::ALL {
+      let encrypted = encrypt(b"data", &key(), &(), cipher).unwrap();
+      // Flip a bit in the nonce (still the right length).
+      let mut nonce =
+        BASE64URL.decode(encrypted.nonce.as_bytes()).unwrap();
+      nonce[0] ^= 0x01;
+      let bad_nonce = EncryptedData {
+        data: encrypted.data.clone(),
+        nonce: BASE64URL.encode(&nonce),
+      };
+      assert!(decrypt(&bad_nonce, &key(), &()).is_err());
+      // Flip a bit in the tag (last byte of the payload).
+      let (_, payload) = Cipher::parse(&encrypted.data).unwrap();
+      let mut raw = BASE64URL.decode(payload.as_bytes()).unwrap();
+      *raw.last_mut().unwrap() ^= 0x01;
+      let bad_tag = EncryptedData {
+        data: cipher.mark(&BASE64URL.encode(&raw)),
+        nonce: encrypted.nonce.clone(),
+      };
+      assert!(decrypt(&bad_tag, &key(), &()).is_err());
+    }
+  }
+
+  #[test]
+  fn xchacha_relabelled_as_aes_is_rejected() {
+    let encrypted =
+      encrypt(b"data", &key(), &(), Cipher::XChaCha20Poly1305)
+        .unwrap();
+    let (_, payload) = Cipher::parse(&encrypted.data).unwrap();
+    let relabelled = EncryptedData {
+      data: Cipher::Aes256Gcm.mark(payload),
+      nonce: encrypted.nonce.clone(),
+    };
+    let err = decrypt(&relabelled, &key(), &()).unwrap_err();
+    assert!(err.to_string().contains("Invalid nonce"));
+  }
+
+  #[test]
+  fn envelope_rejects_tampered_or_swapped_keys() {
+    let aad = "tenant";
+    let a = envelope_encrypt(b"a", &key(), &aad, Cipher::default())
       .unwrap();
-    assert_eq!(
-      decrypt(&encrypted, &key(), &()).unwrap().as_slice(),
-      b""
+    let b = envelope_encrypt(b"b", &key(), &aad, Cipher::default())
+      .unwrap();
+    let c = envelope_encrypt(b"c", &key(), &aad, Cipher::default())
+      .unwrap();
+    // Data key from another envelope under the same master key.
+    let swapped = EnvelopeEncryptedData {
+      key: b.key,
+      data: a.data,
+    };
+    assert!(envelope_decrypt(&swapped, &key(), &aad).is_err());
+    // Wrapped key which decrypts to the wrong length.
+    let wrong_len = EnvelopeEncryptedData {
+      key: encrypt(&[1u8; 16], &key(), &aad, Cipher::default())
+        .unwrap(),
+      data: c.data,
+    };
+    let err = envelope_decrypt(&wrong_len, &key(), &aad).unwrap_err();
+    assert!(err.to_string().contains("not 32 bytes"));
+    // Tampered wrapped key.
+    let (cipher, payload) = Cipher::parse(&a.key.data).unwrap();
+    let mut raw = BASE64URL.decode(payload.as_bytes()).unwrap();
+    raw[0] ^= 0xff;
+    let tampered = EnvelopeEncryptedData {
+      key: EncryptedData {
+        data: cipher.mark(&BASE64URL.encode(&raw)),
+        nonce: a.key.nonce.clone(),
+      },
+      data: b.data,
+    };
+    assert!(envelope_decrypt(&tampered, &key(), &aad).is_err());
+  }
+
+  /// Fixed ciphertexts produced by this crate, so a change to the
+  /// stored format (marker, encoding, nonce handling) is caught
+  /// rather than hidden by a round trip through the same code.
+  #[test]
+  fn known_answer_vectors() {
+    const XCHACHA: (&str, &str) = (
+      "$xchacha20poly1305$bgNSPhWMQyezLxOJKR7hBvtjrjgJ2yEvn-p4Zg==",
+      "QqrpYRkC0Eee51HST8rEu440AD-2CKgq",
     );
+    const AES: (&str, &str) = (
+      "$aes256gcm$iSi9HUEIH_JxguRGTpXqsdHbkSu7IGo_6IgQOA==",
+      "tKPaN50KUJKEZLAs",
+    );
+    // Legacy: the XChaCha payload without its marker.
+    const LEGACY: (&str, &str) = (
+      "bgNSPhWMQyezLxOJKR7hBvtjrjgJ2yEvn-p4Zg==",
+      "QqrpYRkC0Eee51HST8rEu440AD-2CKgq",
+    );
+    for (data, nonce) in [XCHACHA, AES, LEGACY] {
+      let encrypted = EncryptedData {
+        data: data.to_string(),
+        nonce: nonce.to_string(),
+      };
+      assert_eq!(
+        decrypt(&encrypted, &key(), &"aad").unwrap().as_slice(),
+        b"known answer",
+        "{data}"
+      );
+      assert!(decrypt(&encrypted, &key(), &"other").is_err());
+    }
   }
 
   #[test]
@@ -291,12 +394,11 @@ mod tests {
 
   #[test]
   fn envelope_round_trip_and_mixed_layers() {
-    let mut provider = EncryptionProvider::default();
     let aad = "tenant-1".to_string();
     for cipher in Cipher::ALL {
-      let envelope = provider
-        .envelope_encrypt(b"envelope contents", &key(), &aad, cipher)
-        .unwrap();
+      let envelope =
+        envelope_encrypt(b"envelope contents", &key(), &aad, cipher)
+          .unwrap();
       assert_eq!(
         envelope_decrypt(&envelope, &key(), &aad)
           .unwrap()
@@ -314,18 +416,16 @@ mod tests {
     }
     // The key layer rewrapped under the other cipher (a master
     // key rotation): each layer decrypts by its own marker.
-    let envelope = provider
-      .envelope_encrypt(
-        b"contents",
-        &key(),
-        &aad,
-        Cipher::XChaCha20Poly1305,
-      )
-      .unwrap();
+    let envelope = envelope_encrypt(
+      b"contents",
+      &key(),
+      &aad,
+      Cipher::XChaCha20Poly1305,
+    )
+    .unwrap();
     let inner = decrypt(&envelope.key, &key(), &aad).unwrap();
     let rewrapped = EnvelopeEncryptedData {
-      key: provider
-        .encrypt(&inner, &other_key(), &aad, Cipher::Aes256Gcm)
+      key: encrypt(&inner, &other_key(), &aad, Cipher::Aes256Gcm)
         .unwrap(),
       data: envelope.data,
     };
