@@ -1,7 +1,7 @@
 [package]
 name = "mogh_encryption"
 description = "Utilities to encrypt and decrypt data."
-version = "2.0.0"
+version = "2.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,11 +9,6 @@ repository.workspace = true
 [dependencies]
 chacha20poly1305.workspace = true
 aes-gcm.workspace = true
-# Only to enable the 'zeroize' features (see workspace Cargo.toml).
-chacha20.workspace = true
-aes.workspace = true
-ghash.workspace = true
-polyval.workspace = true
 data-encoding.workspace = true
 anyhow.workspace = true
 rand.workspace = true

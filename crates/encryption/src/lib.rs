@@ -10,14 +10,6 @@ use anyhow::{Context as _, anyhow};
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroize;
 
-// Depended on only to enable their 'zeroize' features, so the
-// cipher key schedules built by aes-gcm / chacha20poly1305 are
-// wiped on drop along with the [Key] itself.
-use aes as _;
-use chacha20 as _;
-use ghash as _;
-use polyval as _;
-
 pub mod aead;
 
 pub use data_encoding::BASE64URL;

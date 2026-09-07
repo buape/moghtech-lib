@@ -6,7 +6,7 @@ use aes_gcm::Aes256Gcm;
 use anyhow::{Context, anyhow};
 use chacha20poly1305::{
   KeyInit, XChaCha20Poly1305,
-  aead::{Aead, Payload, generic_array::GenericArray},
+  aead::{Aead, AeadCore, Nonce, Payload},
 };
 use data_encoding::BASE64URL;
 use rand::{TryRng as _, rngs::SysRng};
@@ -39,10 +39,10 @@ pub fn encrypt<A: AssociatedData>(
   let sealed = match cipher {
     Cipher::XChaCha20Poly1305 => {
       XChaCha20Poly1305::new(key.as_bytes().into())
-        .encrypt(GenericArray::from_slice(&nonce), payload)
+        .encrypt(&nonce_array::<XChaCha20Poly1305>(&nonce)?, payload)
     }
     Cipher::Aes256Gcm => Aes256Gcm::new(key.as_bytes().into())
-      .encrypt(GenericArray::from_slice(&nonce), payload),
+      .encrypt(&nonce_array::<Aes256Gcm>(&nonce)?, payload),
   }
   .map_err(|e| anyhow!("Encryption failed | {e:?}"))?;
   Ok(EncryptedData {
@@ -93,13 +93,21 @@ pub fn decrypt<A: AssociatedData>(
   match cipher {
     Cipher::XChaCha20Poly1305 => {
       XChaCha20Poly1305::new(key.as_bytes().into())
-        .decrypt(GenericArray::from_slice(&nonce), payload)
+        .decrypt(&nonce_array::<XChaCha20Poly1305>(&nonce)?, payload)
     }
     Cipher::Aes256Gcm => Aes256Gcm::new(key.as_bytes().into())
-      .decrypt(GenericArray::from_slice(&nonce), payload),
+      .decrypt(&nonce_array::<Aes256Gcm>(&nonce)?, payload),
   }
   .map(Zeroizing::new)
   .map_err(|e| anyhow!("Decryption failed | {e:?}"))
+}
+
+/// The nonce bytes as the cipher's fixed size nonce,
+/// erroring (never panicking) on a length mismatch.
+fn nonce_array<A: AeadCore>(
+  nonce: &[u8],
+) -> anyhow::Result<Nonce<A>> {
+  Nonce::<A>::try_from(nonce).map_err(|_| anyhow!("Invalid nonce"))
 }
 
 /// Decrypts the given [EnvelopeEncryptedData] back into bytes
