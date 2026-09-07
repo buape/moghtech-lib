@@ -122,6 +122,15 @@ pub trait AuthImpl: Send + Sync + 'static {
     self.registration_disabled()
   }
 
+  /// Validate api key CIDR whitelist entries.
+  fn validate_cidr_whitelist(
+    &self,
+    cidr_whitelist: &[String],
+  ) -> mogh_error::Result<()> {
+    validate_cidr_whitelist(cidr_whitelist)
+      .status_code(StatusCode::BAD_REQUEST)
+  }
+
   /// Provide usernames to lock credential updates for,
   /// such as demo users.
   fn locked_usernames(&self) -> &'static [String] {
@@ -656,15 +665,6 @@ pub trait AuthImpl: Send + Sync + 'static {
     api_key_name: &str,
   ) -> mogh_error::Result<()> {
     validate_api_key_name(api_key_name)
-      .status_code(StatusCode::BAD_REQUEST)
-  }
-
-  /// Validate api key CIDR whitelist entries.
-  fn validate_cidr_whitelist(
-    &self,
-    cidr_whitelist: &[String],
-  ) -> mogh_error::Result<()> {
-    validate_cidr_whitelist(cidr_whitelist)
       .status_code(StatusCode::BAD_REQUEST)
   }
 
