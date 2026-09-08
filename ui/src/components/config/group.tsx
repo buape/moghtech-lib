@@ -1,6 +1,6 @@
 import { Fragment } from "react";
 import { ConfigFieldArgs, ConfigGroupArgs } from ".";
-import { ConfigInput, ConfigSwitch } from "./item";
+import { ConfigInput, ConfigSelector, ConfigSwitch } from "./item";
 import { Group, Stack } from "@mantine/core";
 import { CircleQuestionMark } from "lucide-react";
 
@@ -37,19 +37,36 @@ export function ConfigGroup<T>({
             value !== undefined && value !== null ? typeof value : args?.type
           ) {
             case "string":
-              return (
-                <ConfigInput
-                  key={key}
-                  label={args?.label ?? key}
-                  value={value as string}
-                  onValueChange={(value) =>
-                    setUpdate({ [key]: value } as Partial<T>)
-                  }
-                  disabled={args?.disabled || disabled}
-                  placeholder={args?.placeholder}
-                  description={args?.description}
-                />
-              );
+              if (args?.options) {
+                return (
+                  <ConfigSelector
+                    key={key}
+                    label={args?.label ?? key}
+                    value={value as string}
+                    options={args.options}
+                    onValueChange={(value) =>
+                      setUpdate({ [key]: value } as Partial<T>)
+                    }
+                    disabled={args?.disabled || disabled}
+                    placeholder={args?.placeholder}
+                    description={args?.description}
+                  />
+                );
+              } else {
+                return (
+                  <ConfigInput
+                    key={key}
+                    label={args?.label ?? key}
+                    value={value as string}
+                    onValueChange={(value) =>
+                      setUpdate({ [key]: value } as Partial<T>)
+                    }
+                    disabled={args?.disabled || disabled}
+                    placeholder={args?.placeholder}
+                    description={args?.description}
+                  />
+                );
+              }
 
             case "number":
               return (

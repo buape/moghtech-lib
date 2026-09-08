@@ -2,6 +2,8 @@ import {
   Button,
   createPolymorphicComponent,
   Group,
+  Select,
+  SelectProps,
   Stack,
   StackProps,
   SwitchProps,
@@ -92,6 +94,62 @@ export function ConfigInput({
       onChange={(e) => {
         onChange?.(e);
         onValueChange?.(e.target.value);
+      }}
+      onBlur={(e) => onBlur?.(e.target.value)}
+      {...inputProps}
+    />
+  );
+  return (
+    <ConfigItem {...itemProps}>
+      {inputLeft || inputRight ? (
+        <Group>
+          {inputLeft}
+          {inputNode}
+          {inputRight}
+        </Group>
+      ) : (
+        inputNode
+      )}
+    </ConfigItem>
+  );
+}
+
+export function ConfigSelector({
+  value,
+  options,
+  disabled,
+  placeholder,
+  onValueChange,
+  onBlur,
+  inputLeft,
+  inputRight,
+  inputProps,
+  email,
+  ...itemProps
+}: {
+  value: string | undefined;
+  options?: { value: string; label?: string }[];
+  disabled?: boolean;
+  placeholder?: string;
+  onValueChange?: (value: string) => void;
+  onBlur?: (value: string) => void;
+  inputLeft?: ReactNode;
+  inputRight?: ReactNode;
+  inputProps?: SelectProps;
+  email?: boolean;
+} & Omit<ConfigItemProps, "children">) {
+  const inputNode = (
+    <Select
+      w={{ base: "85%", lg: 400 }}
+      value={value}
+      data={options?.map(({ value, label }) => ({
+        value,
+        label: label ?? value,
+      }))}
+      placeholder={placeholder}
+      disabled={disabled}
+      onChange={(value) => {
+        value && onValueChange?.(value);
       }}
       onBlur={(e) => onBlur?.(e.target.value)}
       {...inputProps}

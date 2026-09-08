@@ -38,7 +38,7 @@ export interface ConfigFieldArgs {
     | "object"
     | "function";
   /** Use a selector instead of input */
-  options?: { value: string; label?: string; icon?: ReactNode }[];
+  options?: { value: string; label?: string }[];
   placeholder?: string;
   hidden?: boolean;
   disabled?: boolean;
