@@ -75,6 +75,14 @@ impl ConfigLoader<'_, '_> {
       debug_print,
     } = self;
 
+    if debug_print {
+      println!(
+        "{}: {}: {paths:?}",
+        "DEBUG".cyan(),
+        "Config paths".dimmed()
+      );
+    }
+
     let mut wildcards = Vec::with_capacity(match_wildcards.len());
 
     for &wc in match_wildcards {
@@ -88,6 +96,14 @@ impl ConfigLoader<'_, '_> {
           );
         }
       }
+    }
+
+    if debug_print {
+      println!(
+        "{}: {}: {paths:?}",
+        "DEBUG".cyan(),
+        "Config wildcards".dimmed()
+      );
     }
 
     let mut all_files = IndexSet::new();
