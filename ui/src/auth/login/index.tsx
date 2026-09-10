@@ -32,12 +32,20 @@ export interface LoginBrandingProps {
 export function LoginPage({
   passkeyIsPending: _passkeyIsPending,
   totpIsPending: _totpIsPending,
+  alreadyLoggedIn: _alreadyLoggedIn,
   onLogin,
   exampleConfigLink,
   ...branding
 }: {
   passkeyIsPending?: boolean;
   totpIsPending?: boolean;
+  /**
+   * Whether another user is already signed in, which puts a back button
+   * on the form. Pass it from the host app's own session query. Left
+   * out, the login page has to query the api itself, which counts 
+   * against its auth rate limit.
+   */
+  alreadyLoggedIn?: boolean;
   onLogin?: () => void;
   exampleConfigLink: string;
 } & LoginBrandingProps) {
@@ -48,7 +56,8 @@ export function LoginPage({
   const [totpIsPending, setTotpPending] = useState(_totpIsPending ?? false);
   const secondFactorPending = passkeyIsPending || totpIsPending;
 
-  const alreadyLoggedIn = useUserId().data?.id!!;
+  const userId = useUserId({ enabled: _alreadyLoggedIn === undefined });
+  const alreadyLoggedIn = _alreadyLoggedIn ?? !!userId.data?.id;
 
   // Auto-redirect to OIDC provider if configured and disableAutoLogin is not set
   useEffect(() => {

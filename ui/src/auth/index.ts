@@ -66,11 +66,19 @@ export function useLogin<
   });
 }
 
-export function useUserId() {
+/**
+ * Look up the signed in user's id.
+ *
+ * Pass `enabled: false` where the host app already knows the answer
+ * from its own session query. Every request which fails auth counts
+ * against the server's per IP auth rate limit, so a token the server
+ * rejects should only ever be sent once.
+ */
+export function useUserId(options?: { enabled?: boolean }) {
   return useQuery({
-    queryKey: [""],
+    queryKey: ["GetUserId"],
     queryFn: () => authClient().manage("GetUserId", {}),
-    enabled: !!MoghAuth.LOGIN_TOKENS!.jwt(),
+    enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
   });
 }
 
