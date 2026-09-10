@@ -622,9 +622,9 @@ dependencies = [
 
 [[package]]
 name = "cicada_client"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5803d56940497f2caab77b63e259886b28adee36c139690b96e56c67378c9074"
+checksum = "b96dc6450d6bd4f850743e394a53919ab9660825f44336563b0f517b031527c6"
 dependencies = [
  "async_timing_util",
  "chrono",
@@ -633,7 +633,7 @@ dependencies = [
  "mogh_error",
  "mogh_pki",
  "mogh_resolver",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "strum",
@@ -643,9 +643,9 @@ dependencies = [
 
 [[package]]
 name = "cicada_loader"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "645ba41c7ca16b8137ef77f67bbcbc4db48897a4fd1caba1ddf90a8894a9f573"
+checksum = "12ce88ea92ab9162c5878b9aabd4a1c0f19b9c04cb9c98c9b3a743e1a298aa45"
 dependencies = [
  "anyhow",
  "cicada_client",
@@ -2041,7 +2041,7 @@ dependencies = [
  "anyhow",
  "mogh_error",
  "mogh_resolver",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "strum",
@@ -2069,7 +2069,7 @@ dependencies = [
  "mogh_validations",
  "openidconnect",
  "rand 0.10.2",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "strum",
@@ -2095,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_config"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "cicada_loader",
  "colored",
@@ -2484,7 +2484,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
 ]
 
 [[package]]
@@ -2499,7 +2499,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "thiserror 2.0.20",
  "tonic",
 ]
@@ -3110,11 +3110,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-channel",
  "futures-core",
