@@ -7,8 +7,18 @@ use tracing_subscriber::{
 
 mod config;
 mod otel;
+mod trace_context;
 
 pub use config::*;
+pub use trace_context::*;
+
+/// The OpenTelemetry crates the exporting layer is built on,
+/// re-exported so applications needing more than the helpers above
+/// (span attributes, status, links via
+/// `tracing_opentelemetry::OpenTelemetrySpanExt`) use the very
+/// version the layer does. A second version would not see it.
+pub use opentelemetry;
+pub use tracing_opentelemetry;
 
 pub fn init(config: impl config::LogConfig) -> anyhow::Result<()> {
   let mut filter_targets =
