@@ -11,6 +11,7 @@ pub use kinds::*;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkiKind {
   /// The client has server public key pinned, and transmits
   /// its public key in one zero trust call by encrypting

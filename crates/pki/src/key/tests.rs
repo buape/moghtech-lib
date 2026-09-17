@@ -305,3 +305,123 @@ fn generate_write_and_load_round_trip() {
 
   std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A fresh scratch directory per test (no tempfile dependency).
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+  let dir = std::env::temp_dir().join(format!(
+    "mogh_pki_{name}_{}_{}",
+    std::process::id(),
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_nanos()
+  ));
+  std::fs::create_dir_all(&dir).unwrap();
+  dir
+}
+
+#[test]
+fn rotation_commit_swaps_the_live_key_and_keeps_the_old_one() {
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_commit");
+  let path = dir.join("test.key");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  let original = pair.load().clone();
+  assert!(pair.retired(PkiKind::OneWay).unwrap().is_none());
+
+  assert!(!pair.rotation_pending());
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert!(pair.rotation_pending());
+  let candidate = rotation.candidate().clone();
+  assert_ne!(candidate.public, original.public);
+  // Nothing live changed before commit.
+  assert_eq!(pair.load().public, original.public);
+  assert!(dir.join("test.key.next").exists());
+  assert!(
+    Pkcs8PrivateKey::from_file(&path).unwrap() == original.private
+  );
+
+  rotation.commit().unwrap();
+  // The candidate is live, on disk and in memory; the previous
+  // key waits for revocation.
+  assert_eq!(pair.load().public, candidate.public);
+  assert!(
+    Pkcs8PrivateKey::from_file(&path).unwrap() == candidate.private
+  );
+  assert_eq!(
+    SpkiPublicKey::from_file(dir.join("test.pub")).unwrap(),
+    candidate.public
+  );
+  assert!(!dir.join("test.key.next").exists());
+  let retired = pair.retired(PkiKind::OneWay).unwrap().unwrap();
+  assert_eq!(retired.public, original.public);
+  // Until finished, no new rotation may start.
+  assert!(pair.begin_rotation(PkiKind::OneWay).is_err());
+
+  pair.finish_rotation().unwrap();
+  assert!(pair.retired(PkiKind::OneWay).unwrap().is_none());
+  assert!(!pair.rotation_pending());
+  // Idempotent.
+  pair.finish_rotation().unwrap();
+
+  // A restart loads the committed key.
+  let reloaded =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  assert_eq!(reloaded.load().public, candidate.public);
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rotation_resumes_and_aborts_a_candidate() {
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_resume");
+  let path = dir.join("test.key");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  let original = pair.load().clone();
+
+  // A candidate left behind (crash before commit) is resumed, not
+  // replaced: the caller may already have registered it.
+  let first = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = first.candidate().clone();
+  drop(first);
+  let resumed = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert_eq!(resumed.candidate().public, candidate.public);
+  assert_eq!(resumed.previous().public, original.public);
+
+  // Abort leaves the live key alone and drops the candidate.
+  resumed.abort().unwrap();
+  assert!(!dir.join("test.key.next").exists());
+  assert_eq!(pair.load().public, original.public);
+  assert!(
+    Pkcs8PrivateKey::from_file(&path).unwrap() == original.private
+  );
+
+  // An unreadable leftover is replaced.
+  std::fs::write(dir.join("test.key.next"), "garbage").unwrap();
+  let fresh = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert_ne!(fresh.candidate().public, candidate.public);
+  fresh.abort().unwrap();
+
+  // Not file backed: no rotation.
+  let inline = RotatableKeyPair::from_private_key_spec(
+    PkiKind::OneWay,
+    original.private.as_str(),
+  )
+  .unwrap();
+  assert!(!inline.rotatable());
+  assert!(inline.begin_rotation(PkiKind::OneWay).is_err());
+  assert!(inline.retired(PkiKind::OneWay).unwrap().is_none());
+  inline.finish_rotation().unwrap();
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
