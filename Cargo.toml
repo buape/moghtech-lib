@@ -51,7 +51,7 @@ serde_json = "1.0.151"
 serde_path_to_error = "0.1.20"
 serde_qs = "1.0.0"
 bson = "3.1.0"
-toml = "1.1.5"
+toml = "1.1.6"
 url = "2.5.8"
 
 # CRYPTO
@@ -67,7 +67,7 @@ subtle = "2.6.1"
 # AUTH
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 openidconnect = { version = "4.0.1", features = ["accept-rfc3339-timestamps"] }
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 totp-rs = { version = "6.0.0", features = ["qr", "serde"] }
 bcrypt = "0.19.3"
 
@@ -97,11 +97,11 @@ tracing = "0.1.44"
 # MACRO
 quote = "1.0.47"
 proc-macro2 = "1.0.107"
-syn = "3.0.5"
+syn = "3.0.6"
 
 # MISC
-clap = { version = "4.6.6", features = ["derive"] }
-uuid = { version = "1.26.0", features = ["v4"] }
+clap = { version = "4.6.7", features = ["derive"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 typeshare = "1.0.5"
 wildcard = "0.3.0"
 ipnet = "2.12.2"
