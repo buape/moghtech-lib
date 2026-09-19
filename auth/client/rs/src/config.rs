@@ -56,6 +56,37 @@ pub struct OidcConfig {
   /// instead of showing the login page.
   #[serde(default)]
   pub auto_redirect: bool,
+  /// Additional scopes to request from the provider,
+  /// on top of `openid`, `profile` and `email`.
+  ///
+  /// The `groups` scope is requested automatically when the
+  /// `groups` claim is used and the provider advertises the scope
+  /// (`scopes_supported`). Other scopes needed for the groups
+  /// claim, eg. `roles`, must be added here.
+  #[serde(default)]
+  pub additional_scopes: Vec<String>,
+  /// The claim containing the groups the user belongs to, eg. `groups`.
+  /// Nested claims can be reached with a dotted path,
+  /// eg. `realm_access.roles`.
+  ///
+  /// Group extraction is disabled if this is empty (default),
+  /// unless `allowed_groups` or `admin_groups` are set,
+  /// in which case it falls back to `groups`.
+  #[serde(default)]
+  pub groups_claim: String,
+  /// Only allow OIDC login, signup and account linking for
+  /// users in at least one of these groups, or in `admin_groups`.
+  /// Empty allows all users (default).
+  ///
+  /// If the provider does not send any group information
+  /// for the user, they are rejected.
+  #[serde(default)]
+  pub allowed_groups: Vec<String>,
+  /// Users in at least one of these groups are
+  /// reported to the app as admins on OIDC login / signup.
+  /// This can be used to onboard new admins through the provider.
+  #[serde(default)]
+  pub admin_groups: Vec<String>,
 }
 
 impl OidcConfig {
@@ -63,6 +94,20 @@ impl OidcConfig {
     self.enabled
       && !self.provider.is_empty()
       && !self.client_id.is_empty()
+  }
+
+  /// The claim to extract user groups from,
+  /// or None if group extraction is disabled.
+  pub fn groups_claim(&self) -> Option<&str> {
+    if !self.groups_claim.is_empty() {
+      Some(&self.groups_claim)
+    } else if !self.allowed_groups.is_empty()
+      || !self.admin_groups.is_empty()
+    {
+      Some("groups")
+    } else {
+      None
+    }
   }
 
   pub fn sanitize(&mut self) {
@@ -158,6 +203,41 @@ mod tests {
     let json = r#"{"enabled":true,"provider":"https://idp.example.com","client_id":"test-id","client_secret":"s","use_full_email":false,"additional_audiences":[]}"#;
     let config: OidcConfig = serde_json::from_str(json).unwrap();
     assert!(!config.auto_redirect);
+  }
+
+  #[test]
+  fn test_oidc_config_groups_disabled_by_default() {
+    // Backwards compatibility: old configs without any group options
+    let config: OidcConfig = serde_json::from_str("{}").unwrap();
+    assert!(config.additional_scopes.is_empty());
+    assert!(config.groups_claim.is_empty());
+    assert!(config.allowed_groups.is_empty());
+    assert!(config.admin_groups.is_empty());
+    assert_eq!(config.groups_claim(), None);
+  }
+
+  #[test]
+  fn test_oidc_config_groups_claim_explicit() {
+    let config = OidcConfig {
+      groups_claim: "realm_access.roles".into(),
+      allowed_groups: vec!["users".into()],
+      ..Default::default()
+    };
+    assert_eq!(config.groups_claim(), Some("realm_access.roles"));
+  }
+
+  #[test]
+  fn test_oidc_config_groups_claim_falls_back_when_groups_used() {
+    let config = OidcConfig {
+      allowed_groups: vec!["users".into()],
+      ..Default::default()
+    };
+    assert_eq!(config.groups_claim(), Some("groups"));
+    let config = OidcConfig {
+      admin_groups: vec!["admins".into()],
+      ..Default::default()
+    };
+    assert_eq!(config.groups_claim(), Some("groups"));
   }
 
   #[test]

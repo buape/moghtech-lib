@@ -629,7 +629,7 @@ dependencies = [
  "async_timing_util",
  "chrono",
  "http",
- "mogh_auth_client",
+ "mogh_auth_client 2.1.0",
  "mogh_error",
  "mogh_pki",
  "mogh_resolver",
@@ -2028,6 +2028,23 @@ dependencies = [
 [[package]]
 name = "mogh_auth_client"
 version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d3c0d6d964f8e64205ea3df31e56292f09818fd9f9aeec324f4721f85f89cb2"
+dependencies = [
+ "anyhow",
+ "mogh_error",
+ "mogh_resolver",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "strum",
+ "typeshare",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "mogh_auth_client"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "mogh_error",
@@ -2043,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_auth_server"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2051,7 +2068,7 @@ dependencies = [
  "bcrypt",
  "data-encoding",
  "jsonwebtoken",
- "mogh_auth_client",
+ "mogh_auth_client 3.0.0",
  "mogh_error",
  "mogh_pki",
  "mogh_rate_limit",

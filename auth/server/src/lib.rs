@@ -27,7 +27,9 @@ mod session;
 
 use crate::{
   api_key::BoxAuthApiKey,
-  provider::{jwt::JwtProvider, passkey::PasskeyProvider},
+  provider::{
+    jwt::JwtProvider, oidc::OidcLoginInfo, passkey::PasskeyProvider,
+  },
   user::BoxAuthUser,
   validations::{
     validate_api_key_name, validate_cidr_whitelist,
@@ -376,10 +378,16 @@ pub trait AuthImpl: Send + Sync + 'static {
   }
 
   /// Returns created user id, or error.
+  ///
+  /// The user should be stored with `info.subject` so it can be found
+  /// by [AuthImpl::find_user_with_oidc_subject].
+  /// `info.groups` / `info.admin` are available to create the
+  /// user with the correct access, or to reject the signup.
+  /// [AuthImpl::sync_oidc_user] is also called directly after signup.
   fn sign_up_oidc_user(
     &self,
     _username: String,
-    _subject: SubjectIdentifier,
+    _info: OidcLoginInfo,
     _no_users_exist: bool,
   ) -> DynFuture<mogh_error::Result<String>> {
     Box::pin(async {
@@ -388,6 +396,25 @@ pub trait AuthImpl: Send + Sync + 'static {
           .into(),
       )
     })
+  }
+
+  /// Called on every successful OIDC authentication of a user:
+  /// login, directly after signup, and directly after linking.
+  /// Use this to sync the users groups (`info.groups`) and
+  /// admin status (`info.admin`) from the provider.
+  /// Both are `None` when no information is available,
+  /// in which case the user should be left as is.
+  ///
+  /// Runs before the session is authenticated,
+  /// returning an error fails the login.
+  ///
+  /// Note. Changes at the provider only apply on the users next OIDC login.
+  fn sync_oidc_user(
+    &self,
+    _user_id: String,
+    _info: OidcLoginInfo,
+  ) -> DynFuture<mogh_error::Result<()>> {
+    Box::pin(async { Ok(()) })
   }
 
   fn link_oidc_login(

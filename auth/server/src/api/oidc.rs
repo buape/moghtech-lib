@@ -222,8 +222,8 @@ pub async fn oidc_callback<I: AuthImpl>(
       redirect,
     } = session.retrieve_oidc_login().await?;
 
-    let (subject, token) = provider
-      .validate_extract_subject_and_token(
+    let (info, token) = provider
+      .validate_extract_login_info_and_token(
         config,
         (state, csrf_token),
         code,
@@ -232,12 +232,16 @@ pub async fn oidc_callback<I: AuthImpl>(
       )
       .await?;
 
-    let user =
-      auth.find_user_with_oidc_subject(subject.clone()).await?;
+    let user = auth
+      .find_user_with_oidc_subject(info.subject.clone())
+      .await?;
 
     let user_id_or_two_factor = match user {
       // Log in existing user
       Some(user) => {
+        // Sync before the session is authenticated,
+        // so a failed sync does not leave a logged in session.
+        auth.sync_oidc_user(user.id().to_string(), info).await?;
         get_user_id_or_two_factor(&auth, &session, &user, ip).await?
       }
       // Sign up user
@@ -252,7 +256,7 @@ pub async fn oidc_callback<I: AuthImpl>(
         }
 
         let username =
-          provider.get_username(&subject, &token, &nonce).await;
+          provider.get_username(&info.subject, &token, &nonce).await;
 
         // Modify username if it already exists
         let username = unique_username(&auth, username).await?;
@@ -260,12 +264,14 @@ pub async fn oidc_callback<I: AuthImpl>(
         let user_id = auth
           .sign_up_oidc_user(
             username.clone(),
-            subject,
+            info.clone(),
             no_users_exist,
           )
           .await?;
 
         info!(user_id, username, "New user registration (OIDC)");
+
+        auth.sync_oidc_user(user_id.clone(), info).await?;
 
         session.insert_authenticated_user_id(&user_id).await?;
 
@@ -302,8 +308,8 @@ async fn link_oidc_callback<I: AuthImpl>(
     .context("OIDC login is not set up")
     .status_code(StatusCode::BAD_REQUEST)?;
 
-  let (subject, _) = provider
-    .validate_extract_subject_and_token(
+  let (info, _) = provider
+    .validate_extract_login_info_and_token(
       config,
       (state, csrf_token),
       code,
@@ -313,11 +319,13 @@ async fn link_oidc_callback<I: AuthImpl>(
     .await?;
 
   // Ensure there are no other existing users with this login linked.
-  if let Some(existing_user) =
-    auth.find_user_with_oidc_subject(subject.clone()).await?
+  if let Some(existing_user) = auth
+    .find_user_with_oidc_subject(info.subject.clone())
+    .await?
   {
     if existing_user.id() == user_id {
-      // Link is already complete, this is a no-op
+      // Link is already complete, only need to sync
+      auth.sync_oidc_user(user_id, info).await?;
       return Ok(Redirect::to(auth.post_link_redirect()));
     } else {
       return Err(
@@ -326,9 +334,13 @@ async fn link_oidc_callback<I: AuthImpl>(
     }
   }
 
-  auth.link_oidc_login(user_id.clone(), subject).await?;
+  auth
+    .link_oidc_login(user_id.clone(), info.subject.clone())
+    .await?;
 
   info!(user_id, "OIDC login linked");
+
+  auth.sync_oidc_user(user_id, info).await?;
 
   Ok(Redirect::to(auth.post_link_redirect()))
 }

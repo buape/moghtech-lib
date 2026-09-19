@@ -254,18 +254,41 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
   fn sign_up_oidc_user(
     &self,
     username: String,
-    subject: SubjectIdentifier,
+    info: OidcLoginInfo,
     no_users_exist: bool,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
       sign_up_external_user(
         username,
         ExternalLoginKind::Oidc,
-        subject.into(),
+        info.subject.into(),
         no_users_exist || core_config().enable_new_users,
       )
       .await
       .map_err(Into::into)
+    })
+  }
+
+  /// Optional. Called on every OIDC login, and directly after signup / link.
+  /// `groups` requires `groups_claim` in the OidcConfig, `admin` requires `admin_groups`.
+  /// The `groups` scope is requested automatically if the provider advertises it.
+  /// Both are None when the provider sent no group information,
+  /// the user should then be left as is.
+  fn sync_oidc_user(
+    &self,
+    user_id: String,
+    info: OidcLoginInfo,
+  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
+    Box::pin(async move {
+      if let Some(groups) = info.groups {
+        // Replace only the memberships managed by the provider,
+        // keeping any assigned manually in the app.
+        set_user_oidc_groups(&user_id, groups).await?;
+      }
+      if let Some(admin) = info.admin {
+        set_user_admin(&user_id, admin).await?;
+      }
+      Ok(())
     })
   }
 
