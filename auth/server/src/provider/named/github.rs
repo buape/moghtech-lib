@@ -1,31 +1,19 @@
-use std::sync::OnceLock;
-
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use mogh_auth_client::config::NamedOauthConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tracing::warn;
+use zeroize::Zeroizing;
 
 use crate::{
-  provider::named::{STATE_PREFIX_LENGTH, handle_response},
+  provider::named::{STATE_LENGTH, handle_response},
   rand::random_string,
 };
-
-pub fn github_provider(
-  host: &str,
-  path: &str,
-  config: &NamedOauthConfig,
-) -> Option<&'static GithubProvider> {
-  static GITHUB_PROVIDER: OnceLock<Option<GithubProvider>> =
-    OnceLock::new();
-  GITHUB_PROVIDER
-    .get_or_init(|| GithubProvider::new(host, path, config))
-    .as_ref()
-}
 
 pub struct GithubProvider {
   http: reqwest::Client,
   client_id: String,
-  client_secret: String,
+  /// Wiped from memory when the provider is dropped,
+  /// eg. after its configuration is updated or deleted.
+  client_secret: Zeroizing<String>,
   redirect_uri: String,
   scopes: String,
   user_agent: String,
@@ -33,38 +21,31 @@ pub struct GithubProvider {
 
 impl GithubProvider {
   pub fn new(
-    host: &str,
-    path: &str,
+    redirect_uri: String,
     NamedOauthConfig {
       enabled,
       client_id,
       client_secret,
     }: &NamedOauthConfig,
-  ) -> Option<GithubProvider> {
+  ) -> anyhow::Result<GithubProvider> {
     if !enabled {
-      return None;
-    }
-    if host.is_empty() {
-      warn!("Github oauth is enabled, but 'host' is not configured");
-      return None;
+      return Err(anyhow!("Github login is not enabled"));
     }
     if client_id.is_empty() {
-      warn!(
-        "Github oauth is enabled, but 'github_oauth.client_id' is not configured"
-      );
-      return None;
+      return Err(anyhow!(
+        "Github login is enabled, but 'client_id' is not configured"
+      ));
     }
     if client_secret.is_empty() {
-      warn!(
-        "Github oauth is enabled, but 'github_oauth.client_secret' is not configured"
-      );
-      return None;
+      return Err(anyhow!(
+        "Github login is enabled, but 'client_secret' is not configured"
+      ));
     }
-    GithubProvider {
+    Ok(GithubProvider {
       http: reqwest::Client::new(),
       client_id: client_id.clone(),
-      client_secret: client_secret.clone(),
-      redirect_uri: format!("{host}{path}/github/callback"),
+      client_secret: Zeroizing::new(client_secret.clone()),
+      redirect_uri,
       // The Github API rejects requests without a User-Agent header.
       user_agent: concat!(
         env!("CARGO_PKG_NAME"),
@@ -73,23 +54,16 @@ impl GithubProvider {
       )
       .to_string(),
       scopes: Default::default(),
-    }
-    .into()
+    })
   }
 
-  pub async fn get_state_and_login_redirect_url(
-    &self,
-    redirect: Option<String>,
-  ) -> (String, String) {
-    let state_prefix = random_string(STATE_PREFIX_LENGTH);
-    let state = match redirect {
-      Some(redirect) => state_prefix + &redirect,
-      None => state_prefix,
-    };
+  /// Returns (state, login redirect url)
+  pub fn get_state_and_login_redirect_url(&self) -> (String, String) {
+    let state = random_string(STATE_LENGTH);
     let redirect_url = format!(
       "https://github.com/login/oauth/authorize?state={}&client_id={}&redirect_uri={}&scope={}",
       urlencoding::encode(&state),
-      self.client_id,
+      urlencoding::encode(&self.client_id),
       urlencoding::encode(&self.redirect_uri),
       self.scopes
     );
@@ -196,106 +170,76 @@ pub struct GithubUserResponse {
 mod tests {
   use super::*;
 
+  const REDIRECT_URI: &str =
+    "https://example.com/auth/external/abc/callback";
+
+  fn config(
+    enabled: bool,
+    client_id: &str,
+    client_secret: &str,
+  ) -> NamedOauthConfig {
+    NamedOauthConfig {
+      enabled,
+      client_id: client_id.to_string(),
+      client_secret: client_secret.to_string(),
+    }
+  }
+
   fn test_provider() -> GithubProvider {
     GithubProvider::new(
-      "https://example.com",
-      "/auth",
-      &NamedOauthConfig {
-        enabled: true,
-        client_id: "test-client-id".to_string(),
-        client_secret: "test-client-secret".to_string(),
-      },
+      REDIRECT_URI.to_string(),
+      &config(true, "test-client-id", "test-client-secret"),
     )
     .unwrap()
   }
 
   #[test]
-  fn test_provider_disabled_or_misconfigured_returns_none() {
-    let config = NamedOauthConfig {
-      enabled: false,
-      client_id: "id".to_string(),
-      client_secret: "secret".to_string(),
-    };
-    assert!(
-      GithubProvider::new("https://example.com", "/auth", &config)
-        .is_none()
-    );
-    let config = NamedOauthConfig {
-      enabled: true,
-      client_id: String::new(),
-      client_secret: "secret".to_string(),
-    };
-    assert!(
-      GithubProvider::new("https://example.com", "/auth", &config)
-        .is_none()
-    );
-    let config = NamedOauthConfig {
-      enabled: true,
-      client_id: "id".to_string(),
-      client_secret: String::new(),
-    };
-    assert!(
-      GithubProvider::new("https://example.com", "/auth", &config)
-        .is_none()
-    );
-    let config = NamedOauthConfig {
-      enabled: true,
-      client_id: "id".to_string(),
-      client_secret: "secret".to_string(),
-    };
-    assert!(GithubProvider::new("", "/auth", &config).is_none());
+  fn test_provider_disabled_or_misconfigured_errors() {
+    for config in [
+      config(false, "id", "secret"),
+      config(true, "", "secret"),
+      config(true, "id", ""),
+    ] {
+      assert!(
+        GithubProvider::new(REDIRECT_URI.to_string(), &config)
+          .is_err()
+      );
+    }
   }
 
-  #[tokio::test]
-  async fn test_state_without_redirect() {
+  #[test]
+  fn test_state_and_login_redirect_url() {
     let provider = test_provider();
-    let (state, url) =
-      provider.get_state_and_login_redirect_url(None).await;
-    assert_eq!(state.len(), STATE_PREFIX_LENGTH);
+    let (state, url) = provider.get_state_and_login_redirect_url();
+    assert_eq!(state.len(), STATE_LENGTH);
     assert!(state.chars().all(|c| c.is_ascii_alphanumeric()));
     assert!(
       url.starts_with("https://github.com/login/oauth/authorize?")
     );
     assert!(url.contains(&format!("state={state}")));
     assert!(url.contains("client_id=test-client-id"));
-    // Redirect uri is urlencoded and derived from host + path.
-    assert!(
-      url.contains(
-        urlencoding::encode(
-          "https://example.com/auth/github/callback"
-        )
-        .as_ref()
-      )
-    );
+    // Redirect uri is urlencoded.
+    assert!(url.contains(urlencoding::encode(REDIRECT_URI).as_ref()));
     // The client secret must never appear in the user-facing URL.
     assert!(!url.contains("test-client-secret"));
   }
 
-  #[tokio::test]
-  async fn test_state_embeds_redirect_and_is_recoverable() {
-    let provider = test_provider();
-    let redirect = "https://example.com/dest?a=1&b=2";
-    let (state, url) = provider
-      .get_state_and_login_redirect_url(Some(redirect.to_string()))
-      .await;
-    // Random prefix + raw redirect suffix
-    assert_eq!(state.len(), STATE_PREFIX_LENGTH + redirect.len());
-    assert_eq!(&state[STATE_PREFIX_LENGTH..], redirect);
-    // The state must be urlencoded in the authorize URL so the
-    // redirect cannot inject additional query parameters.
-    assert!(
-      url.contains(&format!("state={}", urlencoding::encode(&state)))
-    );
-    assert!(!url.contains("&b=2"));
+  #[test]
+  fn test_client_id_cannot_inject_query_params() {
+    let provider = GithubProvider::new(
+      REDIRECT_URI.to_string(),
+      &config(true, "id&redirect_uri=https://evil", "secret"),
+    )
+    .unwrap();
+    let (_, url) = provider.get_state_and_login_redirect_url();
+    assert!(!url.contains("&redirect_uri=https://evil"));
   }
 
-  #[tokio::test]
-  async fn test_state_prefixes_are_unique() {
+  #[test]
+  fn test_states_are_unique() {
     let provider = test_provider();
-    let (state_a, _) =
-      provider.get_state_and_login_redirect_url(None).await;
-    let (state_b, _) =
-      provider.get_state_and_login_redirect_url(None).await;
+    let (state_a, _) = provider.get_state_and_login_redirect_url();
+    let (state_b, _) = provider.get_state_and_login_redirect_url();
     assert_ne!(state_a, state_b);
   }
 }

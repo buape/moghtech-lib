@@ -1,15 +1,183 @@
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumString};
+use typeshare::typeshare;
+use zeroize::Zeroize;
+
+/// Replaces secrets in sanitized configs.
+pub const REDACTED: &str = "##############";
 
 pub fn empty_or_redacted(src: &str) -> String {
   if src.is_empty() {
     String::new()
   } else {
-    String::from("##############")
+    String::from(REDACTED)
+  }
+}
+
+/// The kind of an external login provider.
+#[typeshare]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  Hash,
+  Serialize,
+  Deserialize,
+  Display,
+  EnumString,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum ExternalLoginKind {
+  Oidc,
+  Github,
+  Google,
+}
+
+impl ExternalLoginKind {
+  /// The reserved provider id for this kind: `oidc`, `github` or `google`.
+  ///
+  /// A provider using the reserved id of its kind keeps the
+  /// original login / callback paths (eg. `/oidc/callback`),
+  /// so redirect URIs already registered at the provider keep working.
+  /// All other providers use `/external/{id}/callback`.
+  pub fn reserved_id(&self) -> &'static str {
+    match self {
+      ExternalLoginKind::Oidc => "oidc",
+      ExternalLoginKind::Github => "github",
+      ExternalLoginKind::Google => "google",
+    }
+  }
+}
+
+/// An external login provider users can log in with.
+/// Any number of these can be configured, either statically
+/// by the app (file / env) or stored by the app and managed over the API.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ExternalLoginProvider {
+  /// The unique id of the provider. Part of the login / callback urls,
+  /// and stored alongside the external user id on linked users.
+  ///
+  /// External user ids are only unique per provider,
+  /// so an id must never be reused for another provider.
+  pub id: String,
+  /// The display name, eg. shown on the login button.
+  pub name: String,
+  /// Disable new user registration using this provider.
+  #[serde(default)]
+  pub registration_disabled: bool,
+  /// The kind specific provider configuration.
+  pub config: ExternalLoginProviderConfig,
+}
+
+impl ExternalLoginProvider {
+  pub fn kind(&self) -> ExternalLoginKind {
+    self.config.kind()
+  }
+
+  pub fn enabled(&self) -> bool {
+    self.config.enabled()
+  }
+
+  /// Whether the provider uses the reserved id of its kind,
+  /// see [ExternalLoginKind::reserved_id].
+  pub fn uses_reserved_id(&self) -> bool {
+    self.id == self.kind().reserved_id()
+  }
+
+  /// The path the provider redirects users back to after login,
+  /// relative to the auth api path.
+  pub fn callback_path(&self) -> String {
+    if self.uses_reserved_id() {
+      format!("/{}/callback", self.id)
+    } else {
+      format!("/external/{}/callback", self.id)
+    }
+  }
+}
+
+/// The kind specific configuration of an [ExternalLoginProvider].
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", content = "params")]
+pub enum ExternalLoginProviderConfig {
+  Oidc(OidcConfig),
+  Github(NamedOauthConfig),
+  Google(NamedOauthConfig),
+}
+
+impl ExternalLoginProviderConfig {
+  pub fn kind(&self) -> ExternalLoginKind {
+    match self {
+      ExternalLoginProviderConfig::Oidc(_) => ExternalLoginKind::Oidc,
+      ExternalLoginProviderConfig::Github(_) => {
+        ExternalLoginKind::Github
+      }
+      ExternalLoginProviderConfig::Google(_) => {
+        ExternalLoginKind::Google
+      }
+    }
+  }
+
+  pub fn enabled(&self) -> bool {
+    match self {
+      ExternalLoginProviderConfig::Oidc(config) => config.enabled(),
+      ExternalLoginProviderConfig::Github(config)
+      | ExternalLoginProviderConfig::Google(config) => {
+        config.enabled()
+      }
+    }
+  }
+
+  pub fn client_secret(&self) -> &str {
+    match self {
+      ExternalLoginProviderConfig::Oidc(config) => {
+        &config.client_secret
+      }
+      ExternalLoginProviderConfig::Github(config)
+      | ExternalLoginProviderConfig::Google(config) => {
+        &config.client_secret
+      }
+    }
+  }
+
+  pub fn client_secret_mut(&mut self) -> &mut String {
+    match self {
+      ExternalLoginProviderConfig::Oidc(config) => {
+        &mut config.client_secret
+      }
+      ExternalLoginProviderConfig::Github(config)
+      | ExternalLoginProviderConfig::Google(config) => {
+        &mut config.client_secret
+      }
+    }
+  }
+
+  /// Redacts only the client secret, leaving the client id
+  /// visible so the config can be shown in an edit form.
+  pub fn redact_secret(&mut self) {
+    let secret = self.client_secret_mut();
+    let redacted = empty_or_redacted(secret);
+    secret.zeroize();
+    *secret = redacted;
+  }
+}
+
+/// Wipes the client secret from memory.
+impl Zeroize for ExternalLoginProviderConfig {
+  fn zeroize(&mut self) {
+    self.client_secret_mut().zeroize();
   }
 }
 
 /// Configuration for OIDC provider
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[typeshare]
+#[derive(Clone, Default, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct OidcConfig {
   /// Enable login with configured OIDC provider.
   #[serde(default)]
@@ -116,9 +284,31 @@ impl OidcConfig {
   }
 }
 
+/// The client secret is redacted.
+impl std::fmt::Debug for OidcConfig {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("OidcConfig")
+      .field("enabled", &self.enabled)
+      .field("provider", &self.provider)
+      .field("redirect_host", &self.redirect_host)
+      .field("client_id", &self.client_id)
+      .field("client_secret", &empty_or_redacted(&self.client_secret))
+      .field("use_full_email", &self.use_full_email)
+      .field("additional_audiences", &self.additional_audiences)
+      .field("auto_redirect", &self.auto_redirect)
+      .field("additional_scopes", &self.additional_scopes)
+      .field("groups_claim", &self.groups_claim)
+      .field("allowed_groups", &self.allowed_groups)
+      .field("admin_groups", &self.admin_groups)
+      .finish()
+  }
+}
+
 /// Configuration for a named Oauth2 provider,
 /// like Github or Google.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[typeshare]
+#[derive(Clone, Default, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct NamedOauthConfig {
   /// Whether this login provider is enabled.
   #[serde(default)]
@@ -148,9 +338,87 @@ impl NamedOauthConfig {
   }
 }
 
+/// The client secret is redacted.
+impl std::fmt::Debug for NamedOauthConfig {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("NamedOauthConfig")
+      .field("enabled", &self.enabled)
+      .field("client_id", &self.client_id)
+      .field("client_secret", &empty_or_redacted(&self.client_secret))
+      .finish()
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn github_provider(id: &str) -> ExternalLoginProvider {
+    ExternalLoginProvider {
+      id: id.to_string(),
+      name: "Github".to_string(),
+      registration_disabled: false,
+      config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
+        enabled: true,
+        client_id: "client-id".into(),
+        client_secret: "super-secret".into(),
+      }),
+    }
+  }
+
+  #[test]
+  fn test_debug_redacts_client_secret() {
+    let provider = github_provider("github");
+    let debug = format!("{provider:?}");
+    assert!(debug.contains("client-id"));
+    assert!(!debug.contains("super-secret"));
+    let oidc = OidcConfig {
+      client_secret: "super-secret".into(),
+      ..Default::default()
+    };
+    assert!(!format!("{oidc:?}").contains("super-secret"));
+  }
+
+  #[test]
+  fn test_callback_path_reserved_id_keeps_original_path() {
+    assert_eq!(
+      github_provider("github").callback_path(),
+      "/github/callback"
+    );
+    // Reserved id of another kind is not special
+    assert_eq!(
+      github_provider("oidc").callback_path(),
+      "/external/oidc/callback"
+    );
+    assert_eq!(
+      github_provider("a1B2").callback_path(),
+      "/external/a1B2/callback"
+    );
+  }
+
+  #[test]
+  fn test_redact_secret_keeps_client_id() {
+    let mut provider = github_provider("github");
+    provider.config.redact_secret();
+    assert_eq!(provider.config.client_secret(), REDACTED);
+    let ExternalLoginProviderConfig::Github(config) =
+      &provider.config
+    else {
+      unreachable!()
+    };
+    assert_eq!(config.client_id, "client-id");
+  }
+
+  #[test]
+  fn test_provider_config_wire_format() {
+    let provider = github_provider("github");
+    let value = serde_json::to_value(&provider).unwrap();
+    assert_eq!(value["config"]["kind"], "Github");
+    assert_eq!(value["config"]["params"]["client_id"], "client-id");
+    let roundtrip: ExternalLoginProvider =
+      serde_json::from_value(value).unwrap();
+    assert_eq!(roundtrip, provider);
+  }
 
   #[test]
   fn test_empty_or_redacted() {

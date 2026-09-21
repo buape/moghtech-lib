@@ -15,10 +15,9 @@ use crate::{
   user::BoxAuthUser,
 };
 
+pub mod external;
 pub mod login;
 pub mod manage;
-pub mod named;
-pub mod oidc;
 
 /// This router should be nested without any additional middleware
 pub fn router<I: AuthImpl>() -> Router {
@@ -26,8 +25,7 @@ pub fn router<I: AuthImpl>() -> Router {
     .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
     .nest("/login", login::router::<I>())
     .nest("/manage", manage::router::<I>())
-    .nest("/oidc", oidc::router::<I>())
-    .merge(named::router::<I>())
+    .merge(external::router::<I>())
 }
 
 #[derive(serde::Deserialize)]

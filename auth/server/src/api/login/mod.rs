@@ -1,7 +1,9 @@
 use std::net::IpAddr;
 
 use axum::{Router, extract::Path, routing::post};
-use mogh_auth_client::api::login::*;
+use mogh_auth_client::{
+  api::login::*, config::ExternalLoginProviderConfig,
+};
 use mogh_error::Json;
 use mogh_rate_limit::WithFailureRateLimit;
 use mogh_request_ip::RequestIp;
@@ -15,7 +17,9 @@ use uuid::Uuid;
 
 use crate::{
   AuthImpl, BoxAuthImpl, api::Variant,
-  middleware::check_user_cidr_whitelist, session::Session,
+  middleware::check_user_cidr_whitelist,
+  provider::external::list_external_providers_lossy,
+  session::Session,
 };
 
 pub mod local;
@@ -102,28 +106,42 @@ async fn handler<I: AuthImpl>(
   res.map(|res| res.0)
 }
 
-pub fn get_login_options<I: AuthImpl + ?Sized>(
+pub async fn get_login_options<I: AuthImpl + ?Sized>(
   auth: &I,
 ) -> GetLoginOptionsResponse {
+  // Only lists the static providers if the stored ones fail
+  // to load, so the login page stays usable.
+  let providers = list_external_providers_lossy(auth)
+    .await
+    .into_iter()
+    .map(|resolved| resolved.provider)
+    .filter(|provider| provider.enabled())
+    .collect::<Vec<_>>();
+
+  let auto_redirect = providers
+    .iter()
+    .find(|provider| {
+      matches!(
+        &provider.config,
+        ExternalLoginProviderConfig::Oidc(config) if config.auto_redirect
+      )
+    })
+    .map(|provider| provider.id.clone());
+
   GetLoginOptionsResponse {
     local: auth.local_auth_enabled(),
-    oidc: auth
-      .oidc_config()
-      .map(|config| config.enabled())
-      .unwrap_or_default(),
-    github: auth
-      .github_config()
-      .map(|config| config.enabled())
-      .unwrap_or_default(),
-    google: auth
-      .google_config()
-      .map(|config| config.enabled())
-      .unwrap_or_default(),
     registration_disabled: auth.local_registration_disabled(),
-    oidc_auto_redirect: auth
-      .oidc_config()
-      .map(|config| config.enabled() && config.auto_redirect)
-      .unwrap_or_default(),
+    providers: providers
+      .into_iter()
+      .map(|provider| LoginOptionsProvider {
+        kind: provider.kind(),
+        registration_disabled: auth
+          .external_registration_disabled(&provider),
+        id: provider.id,
+        name: provider.name,
+      })
+      .collect(),
+    auto_redirect,
   }
 }
 
@@ -132,7 +150,7 @@ impl Resolve<LoginArgs> for GetLoginOptions {
     self,
     LoginArgs { auth, .. }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
-    Ok(get_login_options(auth.as_ref()))
+    Ok(get_login_options(auth.as_ref()).await)
   }
 }
 
@@ -160,25 +178,28 @@ impl Resolve<LoginArgs> for ExchangeForJwt {
 mod tests {
   use super::*;
   use crate::AuthImpl;
-  use mogh_auth_client::config::OidcConfig;
+  use mogh_auth_client::config::{
+    ExternalLoginKind, ExternalLoginProvider, NamedOauthConfig,
+    OidcConfig,
+  };
 
   /// Minimal AuthImpl for testing
   struct TestAuth {
     local: bool,
-    oidc: Option<OidcConfig>,
+    static_providers: Vec<ExternalLoginProvider>,
+    stored_providers: Option<Vec<ExternalLoginProvider>>,
     registration_disabled: bool,
     local_registration_disabled: Option<bool>,
-    oidc_registration_disabled: Option<bool>,
   }
 
   impl TestAuth {
     fn default_test() -> Self {
       Self {
         local: true,
-        oidc: None,
+        static_providers: Vec::new(),
+        stored_providers: Some(Vec::new()),
         registration_disabled: false,
         local_registration_disabled: None,
-        oidc_registration_disabled: None,
       }
     }
   }
@@ -192,8 +213,23 @@ mod tests {
       self.local
     }
 
-    fn oidc_config(&self) -> Option<&OidcConfig> {
-      self.oidc.as_ref()
+    fn static_external_providers(
+      &self,
+    ) -> Vec<ExternalLoginProvider> {
+      self.static_providers.clone()
+    }
+
+    fn list_external_providers(
+      &self,
+    ) -> crate::DynFuture<
+      mogh_error::Result<Vec<ExternalLoginProvider>>,
+    > {
+      let providers = self.stored_providers.clone();
+      Box::pin(async move {
+        providers.ok_or_else(|| {
+          anyhow::anyhow!("database unavailable").into()
+        })
+      })
     }
 
     fn registration_disabled(&self) -> bool {
@@ -203,12 +239,6 @@ mod tests {
     fn local_registration_disabled(&self) -> bool {
       self
         .local_registration_disabled
-        .unwrap_or_else(|| self.registration_disabled())
-    }
-
-    fn oidc_registration_disabled(&self) -> bool {
-      self
-        .oidc_registration_disabled
         .unwrap_or_else(|| self.registration_disabled())
     }
 
@@ -240,150 +270,169 @@ mod tests {
     }
   }
 
+  fn oidc(
+    id: &str,
+    enabled: bool,
+    auto_redirect: bool,
+  ) -> ExternalLoginProvider {
+    ExternalLoginProvider {
+      id: id.to_string(),
+      name: format!("OIDC {id}"),
+      registration_disabled: false,
+      config: ExternalLoginProviderConfig::Oidc(OidcConfig {
+        enabled,
+        provider: "https://idp.example.com".into(),
+        client_id: "test-id".into(),
+        auto_redirect,
+        ..Default::default()
+      }),
+    }
+  }
+
+  fn github(
+    id: &str,
+    registration_disabled: bool,
+  ) -> ExternalLoginProvider {
+    ExternalLoginProvider {
+      id: id.to_string(),
+      name: format!("Github {id}"),
+      registration_disabled,
+      config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
+        enabled: true,
+        client_id: "test-id".into(),
+        client_secret: "test-secret".into(),
+      }),
+    }
+  }
+
   #[test]
-  fn test_default_granular_methods_delegate_to_registration_disabled()
-  {
-    // When granular overrides are None, they should
-    // fall back to the global registration_disabled flag.
+  fn test_registration_disabled_defaults() {
+    // Local and external registration fall
+    // back to the global registration_disabled flag.
     let auth = TestAuth {
       registration_disabled: true,
       ..TestAuth::default_test()
     };
     assert!(auth.local_registration_disabled());
-    assert!(auth.oidc_registration_disabled());
-    assert!(auth.github_registration_disabled());
-    assert!(auth.google_registration_disabled());
+    assert!(auth.external_registration_disabled(&github("a", false)));
+
+    let auth = TestAuth::default_test();
+    assert!(!auth.local_registration_disabled());
+    assert!(
+      !auth.external_registration_disabled(&github("a", false))
+    );
+    // Provider level setting
+    assert!(auth.external_registration_disabled(&github("a", true)));
   }
 
   #[test]
   fn test_global_disabled_local_override_enabled() {
-    // Global registration disabled, but local override allows it
     let auth = TestAuth {
       registration_disabled: true,
       local_registration_disabled: Some(false),
       ..TestAuth::default_test()
     };
     assert!(!auth.local_registration_disabled());
-    assert!(auth.oidc_registration_disabled());
+    assert!(auth.external_registration_disabled(&github("a", false)));
   }
 
-  #[test]
-  fn test_global_enabled_local_override_disabled() {
-    // Global registration enabled, but local override blocks it
-    let auth = TestAuth {
-      registration_disabled: false,
-      local_registration_disabled: Some(true),
-      ..TestAuth::default_test()
-    };
-    assert!(auth.local_registration_disabled());
-    assert!(!auth.oidc_registration_disabled());
-  }
-
-  #[test]
-  fn test_disable_local_allow_oidc() {
-    // The #1087 use case: disable local signup, allow OIDC
-    let auth = TestAuth {
-      registration_disabled: false,
-      local_registration_disabled: Some(true),
-      oidc_registration_disabled: Some(false),
-      ..TestAuth::default_test()
-    };
-    assert!(auth.local_registration_disabled());
-    assert!(!auth.oidc_registration_disabled());
-  }
-
-  #[test]
-  fn test_registration_disabled_reflects_local_in_login_options() {
-    // registration_disabled in the response controls the Sign Up button,
-    // which is local-only. It should reflect local_registration_disabled.
-    let auth = TestAuth {
-      registration_disabled: false,
-      local_registration_disabled: Some(true),
-      oidc_registration_disabled: Some(false),
-      ..TestAuth::default_test()
-    };
-    let opts = get_login_options(&auth);
-    assert!(opts.registration_disabled);
-  }
-
-  #[test]
-  fn test_registration_disabled_false_when_local_allowed() {
-    let auth = TestAuth {
-      registration_disabled: true,
-      local_registration_disabled: Some(false),
-      oidc_registration_disabled: Some(true),
-      ..TestAuth::default_test()
-    };
-    let opts = get_login_options(&auth);
+  #[tokio::test]
+  async fn test_login_options_without_providers() {
+    let opts = get_login_options(&TestAuth::default_test()).await;
+    assert!(opts.local);
     assert!(!opts.registration_disabled);
+    assert!(opts.providers.is_empty());
+    assert_eq!(opts.auto_redirect, None);
   }
 
-  #[test]
-  fn test_oidc_auto_redirect_defaults_false() {
-    let auth = TestAuth::default_test();
-    let opts = get_login_options(&auth);
-    assert!(!opts.oidc_auto_redirect);
-  }
-
-  #[test]
-  fn test_oidc_auto_redirect_false_when_disabled() {
+  #[tokio::test]
+  async fn test_login_options_lists_enabled_static_and_stored_providers()
+   {
     let auth = TestAuth {
-      oidc: Some(OidcConfig {
-        enabled: true,
-        provider: "https://idp.example.com".into(),
-        client_id: "test-id".into(),
-        auto_redirect: false,
-        ..Default::default()
-      }),
+      static_providers: vec![oidc("oidc", true, false)],
+      stored_providers: Some(vec![
+        github("abc", true),
+        oidc("disabled", false, false),
+      ]),
       ..TestAuth::default_test()
     };
-    let opts = get_login_options(&auth);
-    assert!(opts.oidc);
-    assert!(!opts.oidc_auto_redirect);
+    let opts = get_login_options(&auth).await;
+    assert_eq!(
+      opts.providers,
+      vec![
+        LoginOptionsProvider {
+          id: "oidc".into(),
+          name: "OIDC oidc".into(),
+          kind: ExternalLoginKind::Oidc,
+          registration_disabled: false,
+        },
+        LoginOptionsProvider {
+          id: "abc".into(),
+          name: "Github abc".into(),
+          kind: ExternalLoginKind::Github,
+          registration_disabled: true,
+        },
+      ]
+    );
   }
 
-  #[test]
-  fn test_oidc_auto_redirect_true_when_enabled() {
+  #[tokio::test]
+  async fn test_login_options_never_include_provider_config() {
     let auth = TestAuth {
-      oidc: Some(OidcConfig {
-        enabled: true,
-        provider: "https://idp.example.com".into(),
-        client_id: "test-id".into(),
-        auto_redirect: true,
-        ..Default::default()
-      }),
+      stored_providers: Some(vec![github("abc", false)]),
       ..TestAuth::default_test()
     };
-    let opts = get_login_options(&auth);
-    assert!(opts.oidc);
-    assert!(opts.oidc_auto_redirect);
+    let opts = get_login_options(&auth).await;
+    let json = serde_json::to_string(&opts).unwrap();
+    assert!(!json.contains("test-secret"));
+    assert!(!json.contains("test-id"));
   }
 
-  #[test]
-  fn test_oidc_auto_redirect_false_when_oidc_not_fully_enabled() {
-    // auto_redirect is true but OIDC is not fully enabled (missing client_id)
+  #[tokio::test]
+  async fn test_login_options_survive_stored_provider_failure() {
     let auth = TestAuth {
-      oidc: Some(OidcConfig {
-        enabled: true,
-        provider: "https://idp.example.com".into(),
-        client_id: String::new(), // empty = not fully enabled
-        auto_redirect: true,
-        ..Default::default()
-      }),
+      static_providers: vec![oidc("oidc", true, false)],
+      stored_providers: None,
       ..TestAuth::default_test()
     };
-    let opts = get_login_options(&auth);
-    assert!(!opts.oidc);
-    assert!(!opts.oidc_auto_redirect);
+    let opts = get_login_options(&auth).await;
+    assert!(opts.local);
+    assert_eq!(opts.providers.len(), 1);
+    assert_eq!(opts.providers[0].id, "oidc");
   }
 
-  #[test]
-  fn test_oidc_auto_redirect_false_when_no_oidc_config() {
+  #[tokio::test]
+  async fn test_auto_redirect_first_enabled_oidc_provider() {
     let auth = TestAuth {
-      oidc: None,
+      static_providers: vec![oidc("oidc", true, false)],
+      stored_providers: Some(vec![
+        // Disabled providers are never redirected to
+        oidc("disabled", false, true),
+        oidc("first", true, true),
+        oidc("second", true, true),
+      ]),
       ..TestAuth::default_test()
     };
-    let opts = get_login_options(&auth);
-    assert!(!opts.oidc_auto_redirect);
+    let opts = get_login_options(&auth).await;
+    assert_eq!(opts.auto_redirect.as_deref(), Some("first"));
+  }
+
+  #[tokio::test]
+  async fn test_auto_redirect_none_when_not_fully_enabled() {
+    let mut provider = oidc("oidc", true, true);
+    let ExternalLoginProviderConfig::Oidc(config) =
+      &mut provider.config
+    else {
+      unreachable!()
+    };
+    // Enabled but missing client id
+    config.client_id = String::new();
+    let auth = TestAuth {
+      static_providers: vec![provider],
+      ..TestAuth::default_test()
+    };
+    let opts = get_login_options(&auth).await;
+    assert!(opts.providers.is_empty());
+    assert_eq!(opts.auto_redirect, None);
   }
 }

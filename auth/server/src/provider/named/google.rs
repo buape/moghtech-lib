@@ -1,46 +1,12 @@
-use std::sync::{Arc, OnceLock};
-
-use anyhow::Context;
-use arc_swap::ArcSwapOption;
+use anyhow::{Context, anyhow};
 use mogh_auth_client::config::NamedOauthConfig;
 use openidconnect::{
   ClientId, ClientSecret, EndpointMaybeSet, EndpointNotSet,
   EndpointSet, IssuerUrl, Nonce, RedirectUrl,
   core::CoreProviderMetadata, reqwest as oidc_reqwest,
 };
-use tracing::warn;
 
-use crate::{
-  provider::named::STATE_PREFIX_LENGTH, rand::random_string,
-};
-
-fn google_provider() -> &'static ArcSwapOption<GoogleProvider> {
-  static GOOGLE_PROVIDER: OnceLock<ArcSwapOption<GoogleProvider>> =
-    OnceLock::new();
-  GOOGLE_PROVIDER.get_or_init(Default::default)
-}
-
-pub async fn load_google_provider(
-  app_user_agent: &'static str,
-  host: &str,
-  path: &str,
-  config: &NamedOauthConfig,
-) -> Option<Arc<GoogleProvider>> {
-  // Google OpenID discovery only needs to happen once,
-  // reuse the cached provider on subsequent calls.
-  if let Some(client) = google_provider().load_full() {
-    return Some(client);
-  }
-
-  let client: Arc<_> =
-    GoogleProvider::new(app_user_agent, host, path, config)
-      .await?
-      .into();
-
-  google_provider().store(Some(client.clone()));
-
-  Some(client)
-}
+use crate::{provider::named::STATE_LENGTH, rand::random_string};
 
 type GoogleOidcClient = openidconnect::core::CoreClient<
   EndpointSet,
@@ -60,37 +26,30 @@ pub struct GoogleProvider {
 }
 
 impl GoogleProvider {
+  /// Initialize a new Google provider using Googles
+  /// OpenID discovery endpoint, which includes the
+  /// signing keys used to verify the ID token.
   pub async fn new(
     app_user_agent: &'static str,
-    host: &str,
-    path: &str,
+    redirect_uri: String,
     NamedOauthConfig {
       enabled,
       client_id,
       client_secret,
     }: &NamedOauthConfig,
-  ) -> Option<GoogleProvider> {
+  ) -> anyhow::Result<GoogleProvider> {
     if !enabled {
-      return None;
+      return Err(anyhow!("Google login is not enabled"));
     }
-
-    if host.is_empty() {
-      warn!("Google oauth is enabled, but 'host' is not configured");
-      return None;
-    }
-
     if client_id.is_empty() {
-      warn!(
-        "Google oauth is enabled, but 'google_oauth.client_id' is not configured"
-      );
-      return None;
+      return Err(anyhow!(
+        "Google login is enabled, but 'client_id' is not configured"
+      ));
     }
-
     if client_secret.is_empty() {
-      warn!(
-        "Google oauth is enabled, but 'google_oauth.client_secret' is not configured"
-      );
-      return None;
+      return Err(anyhow!(
+        "Google login is enabled, but 'client_secret' is not configured"
+      ));
     }
 
     let scopes = urlencoding::encode(
@@ -106,22 +65,16 @@ impl GoogleProvider {
       .redirect(oidc_reqwest::redirect::Policy::none())
       .user_agent(app_user_agent)
       .build()
-      .context("Failed to build Google HTTP client")
-      .inspect_err(|e| warn!("{e:#}"))
-      .ok()?;
+      .context("Failed to build Google HTTP client")?;
 
     let issuer_url =
       IssuerUrl::new("https://accounts.google.com".to_string())
-        .context("Failed to initialize Google issuer url")
-        .inspect_err(|e| warn!("{e:#}"))
-        .ok()?;
+        .context("Failed to initialize Google issuer url")?;
 
     let provider_metadata =
       CoreProviderMetadata::discover_async(issuer_url, &http_client)
         .await
-        .context("Failed to discover Google OpenID configuration")
-        .inspect_err(|e| warn!("{e:#}"))
-        .ok()?;
+        .context("Failed to discover Google OpenID configuration")?;
 
     let oidc_client =
       openidconnect::core::CoreClient::from_provider_metadata(
@@ -130,37 +83,30 @@ impl GoogleProvider {
         Some(ClientSecret::new(client_secret.clone())),
       )
       .set_redirect_uri(
-        RedirectUrl::new(format!("{host}{path}/google/callback"))
-          .context("Invalid Google redirect URI")
-          .inspect_err(|e| warn!("{e:#}"))
-          .ok()?,
+        RedirectUrl::new(redirect_uri.clone())
+          .context("Invalid Google redirect URI")?,
       );
 
-    GoogleProvider {
+    Ok(GoogleProvider {
       http_client,
       oidc_client,
       client_id: client_id.clone(),
-      redirect_uri: format!("{host}{path}/google/callback"),
+      redirect_uri,
       scopes,
-    }
-    .into()
+    })
   }
 
-  pub async fn get_state_and_login_redirect_url(
+  /// Returns (state, nonce, login redirect url)
+  pub fn get_state_and_login_redirect_url(
     &self,
-    redirect: Option<String>,
   ) -> (String, Nonce, String) {
-    let state_prefix = random_string(STATE_PREFIX_LENGTH);
-    let state = match redirect {
-      Some(redirect) => state_prefix + &redirect,
-      None => state_prefix,
-    };
+    let state = random_string(STATE_LENGTH);
     let nonce = Nonce::new(random_string(32));
     let redirect_url = format!(
       "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&state={}&nonce={}&client_id={}&redirect_uri={}&scope={}",
       urlencoding::encode(&state),
       urlencoding::encode(nonce.secret()),
-      self.client_id,
+      urlencoding::encode(&self.client_id),
       urlencoding::encode(&self.redirect_uri),
       self.scopes
     );

@@ -20,6 +20,7 @@ utoipa = { workspace = true, optional = true }
 webauthn-rs.workspace = true
 serde_json.workspace = true
 typeshare.workspace = true
+zeroize.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
 serde.workspace = true

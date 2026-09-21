@@ -24,7 +24,13 @@ mod auth {
     auth::update_password,
     // External
     auth::begin_external_login_link,
-    auth::unlink_login,
+    auth::unlink_local_login,
+    auth::unlink_external_login,
+    // External login providers (admin)
+    auth::list_external_login_providers,
+    auth::create_external_login_provider,
+    auth::update_external_login_provider,
+    auth::delete_external_login_provider,
     // Passkey 2FA
     auth::begin_passkey_enrollment,
     auth::confirm_passkey_enrollment,
@@ -46,15 +52,19 @@ mod auth {
     // Local
     auth::sign_up_local_user,
     auth::login_local_user,
-    // Oidc
+    // External
+    auth::external_login,
+    auth::external_link,
+    auth::external_callback,
+    // Oidc (reserved id 'oidc')
     auth::oidc_login,
     auth::oidc_link,
     auth::oidc_callback,
-    // Github
+    // Github (reserved id 'github')
     auth::github_login,
     auth::github_link,
     auth::github_callback,
-    // Google
+    // Google (reserved id 'google')
     auth::google_login,
     auth::google_link,
     auth::google_callback,

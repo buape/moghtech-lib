@@ -20,6 +20,7 @@ pub mod api_key;
 pub mod external;
 pub mod local;
 pub mod passkey;
+pub mod provider;
 pub mod totp;
 
 mod middleware;
@@ -49,7 +50,13 @@ pub enum ManageRequest {
   UpdatePassword(UpdatePassword),
   // External
   BeginExternalLoginLink(BeginExternalLoginLink),
-  UnlinkLogin(UnlinkLogin),
+  UnlinkLocalLogin(UnlinkLocalLogin),
+  UnlinkExternalLogin(UnlinkExternalLogin),
+  // External login providers (admin)
+  ListExternalLoginProviders(ListExternalLoginProviders),
+  CreateExternalLoginProvider(CreateExternalLoginProvider),
+  UpdateExternalLoginProvider(UpdateExternalLoginProvider),
+  DeleteExternalLoginProvider(DeleteExternalLoginProvider),
   // Passkey
   BeginPasskeyEnrollment(BeginPasskeyEnrollment),
   ConfirmPasskeyEnrollment(ConfirmPasskeyEnrollment),

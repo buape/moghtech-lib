@@ -29,6 +29,16 @@ pub trait AuthUserImpl: Send + Sync + 'static {
     true
   }
 
+  /// Whether the user can manage app wide auth settings,
+  /// which is the external login providers.
+  ///
+  /// ⚠️ Managing login providers is equivalent to full control of
+  /// the app: a provider under the users control can sign up
+  /// new users, and make them admin using 'admin_groups'.
+  fn is_admin(&self) -> bool {
+    false
+  }
+
   /// Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
   /// from which user logins / api calls are accepted.
   /// Empty means all ips allowed.

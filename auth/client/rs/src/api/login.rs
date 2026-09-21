@@ -6,10 +6,12 @@
 
 use mogh_resolver::{HasResponse, Resolve};
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString};
 use typeshare::typeshare;
 
-use crate::passkey::{PublicKeyCredential, RequestChallengeResponse};
+use crate::{
+  config::ExternalLoginKind,
+  passkey::{PublicKeyCredential, RequestChallengeResponse},
+};
 
 /// JSON containing a jwt authentication token.
 #[typeshare]
@@ -42,29 +44,22 @@ pub enum UserIdOrTwoFactor {
   Totp {},
 }
 
-/// The available login providers
+/// An enabled external login provider to show on the login page.
+///
+/// Login is started by redirecting the user to `/external/{id}/login`
+/// relative to the auth api path, linking with `/external/{id}/link`.
 #[typeshare]
-#[derive(
-  Debug, Clone, Serialize, Deserialize, Display, EnumString,
-)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-pub enum LoginProvider {
-  Local,
-  Oidc,
-  Github,
-  Google,
-}
-
-/// The available external login providers
-#[typeshare]
-#[derive(
-  Debug, Clone, Serialize, Deserialize, Display, EnumString,
-)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-pub enum ExternalLoginProvider {
-  Oidc,
-  Github,
-  Google,
+pub struct LoginOptionsProvider {
+  /// The provider id
+  pub id: String,
+  /// The display name of the provider
+  pub name: String,
+  /// The kind of provider, eg. to choose an icon.
+  pub kind: ExternalLoginKind,
+  /// Whether new user registration is disabled for this provider
+  pub registration_disabled: bool,
 }
 
 //
@@ -98,21 +93,19 @@ pub struct GetLoginOptions {}
 
 /// The response for [GetLoginOptions].
 #[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct GetLoginOptionsResponse {
   /// Whether Local login is enabled.
   pub local: bool,
-  /// Whether OIDC login is enabled.
-  pub oidc: bool,
-  /// Whether Github login is enabled.
-  pub github: bool,
-  /// Whether Google login is enabled.
-  pub google: bool,
-  /// Whether user registration (Sign Up) has been disabled
+  /// Whether local user registration (Sign Up) has been disabled
   pub registration_disabled: bool,
-  /// Whether the login page should auto-redirect to the OIDC provider
-  pub oidc_auto_redirect: bool,
+  /// The enabled external login providers.
+  pub providers: Vec<LoginOptionsProvider>,
+  /// The id of the provider the login page should auto-redirect to
+  /// instead of showing the login page, if any.
+  /// This is the first enabled OIDC provider with `auto_redirect`.
+  pub auto_redirect: Option<String>,
 }
 
 //
@@ -322,7 +315,6 @@ pub type CompleteTotpRecoveryLoginResponse = JwtResponse;
 
 #[cfg(test)]
 mod tests {
-  use std::str::FromStr;
 
   use mogh_resolver::HasResponse;
   use serde_json::json;
@@ -400,50 +392,31 @@ mod tests {
   }
 
   #[test]
-  fn test_login_provider_representations() {
-    // serde representation
-    assert_eq!(
-      serde_json::to_value(LoginProvider::Local).unwrap(),
-      json!("Local")
-    );
-    let provider: LoginProvider =
-      serde_json::from_value(json!("Github")).unwrap();
-    assert!(matches!(provider, LoginProvider::Github));
-    // strum Display / FromStr representation
-    assert_eq!(LoginProvider::Oidc.to_string(), "Oidc");
-    assert!(matches!(
-      LoginProvider::from_str("Google").unwrap(),
-      LoginProvider::Google
-    ));
-    assert!(LoginProvider::from_str("Unknown").is_err());
-    // External providers
-    assert_eq!(ExternalLoginProvider::Oidc.to_string(), "Oidc");
-    assert!(matches!(
-      ExternalLoginProvider::from_str("Github").unwrap(),
-      ExternalLoginProvider::Github
-    ));
-  }
-
-  #[test]
   fn test_get_login_options_response_wire_format() {
     let value = serde_json::to_value(GetLoginOptionsResponse {
       local: true,
-      oidc: false,
-      github: true,
-      google: false,
       registration_disabled: true,
-      oidc_auto_redirect: false,
+      providers: vec![LoginOptionsProvider {
+        id: "oidc".into(),
+        name: "Authentik".into(),
+        kind: ExternalLoginKind::Oidc,
+        registration_disabled: false,
+      }],
+      auto_redirect: None,
     })
     .unwrap();
     assert_eq!(
       value,
       json!({
         "local": true,
-        "oidc": false,
-        "github": true,
-        "google": false,
         "registration_disabled": true,
-        "oidc_auto_redirect": false,
+        "providers": [{
+          "id": "oidc",
+          "name": "Authentik",
+          "kind": "Oidc",
+          "registration_disabled": false,
+        }],
+        "auto_redirect": null,
       })
     );
   }

@@ -6,7 +6,7 @@ use webauthn_rs::prelude::{
   PasskeyAuthentication, PasskeyRegistration,
 };
 
-use crate::provider::oidc::{SessionOidcLink, SessionOidcLogin};
+use crate::provider::external::SessionExternalLogin;
 
 #[derive(Clone)]
 pub struct Session(pub tower_sessions::Session);
@@ -70,86 +70,36 @@ impl Session {
       .status_code(StatusCode::UNAUTHORIZED)
   }
 
-  const OIDC_LOGIN: &str = "oidc-login";
+  const EXTERNAL_LOGIN: &str = "external-login";
 
-  pub async fn insert_oidc_login(
+  /// Store the in flight external login or link.
+  /// Only one can be in flight per session, starting
+  /// another replaces the previous one.
+  pub async fn insert_external_login(
     &self,
-    data: &SessionOidcLogin,
+    login: &SessionExternalLogin,
   ) -> mogh_error::Result<()> {
     self
       .0
-      .insert(Self::OIDC_LOGIN, data)
+      .insert(Self::EXTERNAL_LOGIN, login)
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
   }
 
-  pub async fn retrieve_oidc_login(
+  /// Takes the in flight external login or link,
+  /// it can only be completed once.
+  pub async fn retrieve_external_login(
     &self,
-  ) -> mogh_error::Result<SessionOidcLogin> {
+  ) -> mogh_error::Result<SessionExternalLogin> {
     self
       .0
-      .remove(Self::OIDC_LOGIN)
+      .remove(Self::EXTERNAL_LOGIN)
       .await
       .context("Internal session type error")?
-      .context("OIDC login has not been initiated for this session")
-      .status_code(StatusCode::UNAUTHORIZED)
-  }
-
-  const GITHUB_LOGIN: &str = "github-login";
-
-  /// Store the CSRF state for validation
-  pub async fn insert_github_login(
-    &self,
-    state: &str,
-  ) -> mogh_error::Result<()> {
-    self
-      .0
-      .insert(Self::GITHUB_LOGIN, state)
-      .await
-      .context("Failed to serialize session data")
-      .map_err(Into::into)
-  }
-
-  /// Returns the CSRF state for validation
-  pub async fn retrieve_github_login(
-    &self,
-  ) -> mogh_error::Result<String> {
-    self
-      .0
-      .remove(Self::GITHUB_LOGIN)
-      .await
-      .context("Internal session type error")?
-      .context("Github login has not been initiated for this session")
-      .status_code(StatusCode::UNAUTHORIZED)
-  }
-
-  const GOOGLE_LOGIN: &str = "google-login";
-
-  /// Store the CSRF state for validation
-  pub async fn insert_google_login(
-    &self,
-    state: &str,
-    nonce: &str,
-  ) -> mogh_error::Result<()> {
-    self
-      .0
-      .insert(Self::GOOGLE_LOGIN, (state, nonce))
-      .await
-      .context("Failed to serialize session data")
-      .map_err(Into::into)
-  }
-
-  /// Returns the CSRF state for validation
-  pub async fn retrieve_google_login(
-    &self,
-  ) -> mogh_error::Result<(String, String)> {
-    self
-      .0
-      .remove(Self::GOOGLE_LOGIN)
-      .await
-      .context("Internal session type error")?
-      .context("Google login has not been initiated for this session")
+      .context(
+        "External login has not been initiated for this session",
+      )
       .status_code(StatusCode::UNAUTHORIZED)
   }
 
@@ -282,7 +232,7 @@ impl Session {
 
   const EXTERNAL_LINK: &str = "external-link";
 
-  /// Insert the totp which began totp enrollment
+  /// Insert the user id which began external login linking
   pub async fn insert_external_link_user_id(
     &self,
     user_id: &str,
@@ -295,7 +245,7 @@ impl Session {
       .map_err(Into::into)
   }
 
-  /// Returns the user id which began totp enrollment
+  /// Returns the user id which began external login linking
   pub async fn retrieve_external_link_user_id(
     &self,
   ) -> mogh_error::Result<String> {
@@ -308,85 +258,5 @@ impl Session {
         "External link has not been initiated for this session",
       )
       .status_code(StatusCode::UNAUTHORIZED)
-  }
-
-  const OIDC_LINK: &str = "oidc-link";
-
-  pub async fn insert_oidc_link(
-    &self,
-    link: &SessionOidcLink,
-  ) -> mogh_error::Result<()> {
-    self
-      .0
-      .insert(Self::OIDC_LINK, link)
-      .await
-      .context("Failed to serialize session data")
-      .map_err(Into::into)
-  }
-
-  pub async fn retrieve_oidc_link(
-    &self,
-  ) -> mogh_error::Result<Option<SessionOidcLink>> {
-    self
-      .0
-      .remove(Self::OIDC_LINK)
-      .await
-      .context("Internal session type error")
-      .map_err(Into::into)
-  }
-
-  const GITHUB_LINK: &str = "github-link";
-
-  pub async fn insert_github_link(
-    &self,
-    user_id: &str,
-    state: &str,
-  ) -> mogh_error::Result<()> {
-    self
-      .0
-      .insert(Self::GITHUB_LINK, (user_id, state))
-      .await
-      .context("Failed to serialize session data")
-      .map_err(Into::into)
-  }
-
-  /// Returns (user_id, state)
-  pub async fn retrieve_github_link(
-    &self,
-  ) -> mogh_error::Result<Option<(String, String)>> {
-    self
-      .0
-      .remove(Self::GITHUB_LINK)
-      .await
-      .context("Internal session type error")
-      .map_err(Into::into)
-  }
-
-  const GOOGLE_LINK: &str = "google-link";
-
-  pub async fn insert_google_link(
-    &self,
-    user_id: &str,
-    state: &str,
-    nonce: &str,
-  ) -> mogh_error::Result<()> {
-    self
-      .0
-      .insert(Self::GOOGLE_LINK, (user_id, state, nonce))
-      .await
-      .context("Failed to serialize session data")
-      .map_err(Into::into)
-  }
-
-  /// Returns (user_id, state)
-  pub async fn retrieve_google_link(
-    &self,
-  ) -> mogh_error::Result<Option<(String, String, String)>> {
-    self
-      .0
-      .remove(Self::GOOGLE_LINK)
-      .await
-      .context("Internal session type error")
-      .map_err(Into::into)
   }
 }

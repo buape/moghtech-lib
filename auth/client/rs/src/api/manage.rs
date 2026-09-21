@@ -10,7 +10,8 @@ use typeshare::typeshare;
 
 use crate::{
   U64,
-  api::{NoData, login::LoginProvider},
+  api::NoData,
+  config::{ExternalLoginProvider, ExternalLoginProviderConfig},
   passkey::{CreationChallengeResponse, RegisterPublicKeyCredential},
 };
 
@@ -343,11 +344,9 @@ fn begin_external_login_link() {}
 
 /// Begin linking flow for an external login. Response: [NoData].
 ///
-/// First call this method when authenticated, then
-/// redirect user to /auth/{provider}/link.
-///
-/// 'provider' can be:
-/// - oidc
+/// First call this method when authenticated, then redirect the
+/// user to `/auth/external/{provider_id}/link`, using a provider id
+/// from [GetLoginOptions][crate::api::login::GetLoginOptions].
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -365,33 +364,234 @@ pub type BeginExternalLoginLinkResponse = NoData;
 #[cfg(feature = "utoipa")]
 #[utoipa::path(
   post,
-  path = "/manage/UnlinkLogin",
-  description = "Unlink a login provider.",
-  request_body(content = UnlinkLogin),
+  path = "/manage/UnlinkLocalLogin",
+  description = "Remove the password of the calling user, disabling local login.",
+  request_body(content = UnlinkLocalLogin),
   responses(
-    (status = 200, description = "Login provider unlinked", body = UnlinkLoginResponse),
+    (status = 200, description = "Local login unlinked", body = UnlinkLocalLoginResponse),
     (status = 401, description = "Unauthorized", body = mogh_error::Serror),
     (status = 500, description = "Request failed", body = mogh_error::Serror)
   ),
 )]
-fn unlink_login() {}
+fn unlink_local_login() {}
 
-/// Unlink a login provider. Response: [NoData].
+/// Remove the password of the calling user,
+/// disabling local login. Response: [NoData].
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthManageRequest)]
-#[response(UnlinkLoginResponse)]
+#[response(UnlinkLocalLoginResponse)]
 #[error(mogh_error::Error)]
-pub struct UnlinkLogin {
-  /// 'provider' can be:
-  /// - Local
-  /// - Oidc
-  pub provider: LoginProvider,
+pub struct UnlinkLocalLogin {}
+
+#[typeshare]
+pub type UnlinkLocalLoginResponse = NoData;
+
+//
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
+  path = "/manage/UnlinkExternalLogin",
+  description = "Unlink an external login provider from the calling user.",
+  request_body(content = UnlinkExternalLogin),
+  responses(
+    (status = 200, description = "External login unlinked", body = UnlinkExternalLoginResponse),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn unlink_external_login() {}
+
+/// Unlink an external login provider from the calling user.
+/// Response: [NoData].
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthManageRequest)]
+#[response(UnlinkExternalLoginResponse)]
+#[error(mogh_error::Error)]
+pub struct UnlinkExternalLogin {
+  /// The id of the provider to unlink.
+  pub provider_id: String,
 }
 
 #[typeshare]
-pub type UnlinkLoginResponse = NoData;
+pub type UnlinkExternalLoginResponse = NoData;
+
+//
+
+/// An external login provider as listed for admins.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ExternalLoginProviderListItem {
+  /// The provider. The client secret is redacted.
+  pub provider: ExternalLoginProvider,
+  /// Whether the provider comes from static app configuration
+  /// (file / env), in which case it cannot be updated or deleted.
+  pub read_only: bool,
+  /// The redirect / callback URI which
+  /// must be registered at the provider.
+  pub redirect_uri: String,
+}
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
+  path = "/manage/ListExternalLoginProviders",
+  description = "List all configured external login providers. Admin only.",
+  request_body(content = ListExternalLoginProviders),
+  responses(
+    (status = 200, description = "The external login providers", body = ListExternalLoginProvidersResponse),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 403, description = "Forbidden", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn list_external_login_providers() {}
+
+/// List all configured external login providers,
+/// including disabled ones. Admin only.
+/// Response: [ListExternalLoginProvidersResponse].
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthManageRequest)]
+#[response(ListExternalLoginProvidersResponse)]
+#[error(mogh_error::Error)]
+pub struct ListExternalLoginProviders {}
+
+#[typeshare]
+pub type ListExternalLoginProvidersResponse =
+  Vec<ExternalLoginProviderListItem>;
+
+//
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
+  path = "/manage/CreateExternalLoginProvider",
+  description = "Create an external login provider. Admin only.",
+  request_body(content = CreateExternalLoginProvider),
+  responses(
+    (status = 200, description = "The created provider", body = CreateExternalLoginProviderResponse),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 403, description = "Forbidden", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn create_external_login_provider() {}
+
+/// Create an external login provider. Admin only.
+/// The provider id is generated by the server.
+/// Response: [ExternalLoginProviderListItem].
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthManageRequest)]
+#[response(CreateExternalLoginProviderResponse)]
+#[error(mogh_error::Error)]
+pub struct CreateExternalLoginProvider {
+  /// The display name, eg. shown on the login button.
+  pub name: String,
+  /// Disable new user registration using this provider.
+  #[serde(default)]
+  pub registration_disabled: bool,
+  /// The kind specific provider configuration.
+  pub config: ExternalLoginProviderConfig,
+}
+
+#[typeshare]
+pub type CreateExternalLoginProviderResponse =
+  ExternalLoginProviderListItem;
+
+//
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
+  path = "/manage/UpdateExternalLoginProvider",
+  description = "Update an external login provider. Admin only.",
+  request_body(content = UpdateExternalLoginProvider),
+  responses(
+    (status = 200, description = "The updated provider", body = UpdateExternalLoginProviderResponse),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 403, description = "Forbidden", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn update_external_login_provider() {}
+
+/// Update an external login provider, replacing its
+/// name and configuration. Admin only.
+/// Response: [ExternalLoginProviderListItem].
+///
+/// - The kind of the provider cannot be changed.
+/// - If the client secret is empty or the redacted value from
+///   [ListExternalLoginProviders], the existing secret is kept.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthManageRequest)]
+#[response(UpdateExternalLoginProviderResponse)]
+#[error(mogh_error::Error)]
+pub struct UpdateExternalLoginProvider {
+  /// The id of the provider to update.
+  pub id: String,
+  /// The display name, eg. shown on the login button.
+  pub name: String,
+  /// Disable new user registration using this provider.
+  #[serde(default)]
+  pub registration_disabled: bool,
+  /// The kind specific provider configuration.
+  pub config: ExternalLoginProviderConfig,
+}
+
+#[typeshare]
+pub type UpdateExternalLoginProviderResponse =
+  ExternalLoginProviderListItem;
+
+//
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
+  path = "/manage/DeleteExternalLoginProvider",
+  description = "Delete an external login provider. Admin only.",
+  request_body(content = DeleteExternalLoginProvider),
+  responses(
+    (status = 200, description = "Provider deleted", body = DeleteExternalLoginProviderResponse),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 403, description = "Forbidden", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn delete_external_login_provider() {}
+
+/// Delete an external login provider. Admin only.
+/// Users can no longer log in with the provider,
+/// and their links to it are removed by the app.
+/// Response: [NoData].
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthManageRequest)]
+#[response(DeleteExternalLoginProviderResponse)]
+#[error(mogh_error::Error)]
+pub struct DeleteExternalLoginProvider {
+  /// The id of the provider to delete.
+  pub id: String,
+}
+
+#[typeshare]
+pub type DeleteExternalLoginProviderResponse = NoData;
 
 //
 
@@ -647,7 +847,27 @@ mod tests {
       BeginExternalLoginLink::req_type(),
       "BeginExternalLoginLink"
     );
-    assert_eq!(UnlinkLogin::req_type(), "UnlinkLogin");
+    assert_eq!(UnlinkLocalLogin::req_type(), "UnlinkLocalLogin");
+    assert_eq!(
+      UnlinkExternalLogin::req_type(),
+      "UnlinkExternalLogin"
+    );
+    assert_eq!(
+      ListExternalLoginProviders::req_type(),
+      "ListExternalLoginProviders"
+    );
+    assert_eq!(
+      CreateExternalLoginProvider::req_type(),
+      "CreateExternalLoginProvider"
+    );
+    assert_eq!(
+      UpdateExternalLoginProvider::req_type(),
+      "UpdateExternalLoginProvider"
+    );
+    assert_eq!(
+      DeleteExternalLoginProvider::req_type(),
+      "DeleteExternalLoginProvider"
+    );
     assert_eq!(
       UpdateExternalSkip2fa::req_type(),
       "UpdateExternalSkip2fa"
@@ -759,12 +979,32 @@ mod tests {
   }
 
   #[test]
-  fn test_unlink_login_wire_format() {
-    let value = serde_json::to_value(UnlinkLogin {
-      provider: LoginProvider::Oidc,
+  fn test_unlink_external_login_wire_format() {
+    let value = serde_json::to_value(UnlinkExternalLogin {
+      provider_id: "oidc".into(),
     })
     .unwrap();
-    assert_eq!(value, json!({ "provider": "Oidc" }));
+    assert_eq!(value, json!({ "provider_id": "oidc" }));
+  }
+
+  #[test]
+  fn test_create_external_login_provider_wire_format() {
+    let request: CreateExternalLoginProvider =
+      serde_json::from_value(json!({
+        "name": "Github",
+        "config": {
+          "kind": "Github",
+          "params": { "enabled": true, "id": "client-id" },
+        },
+      }))
+      .unwrap();
+    assert!(!request.registration_disabled);
+    let ExternalLoginProviderConfig::Github(config) = request.config
+    else {
+      panic!("expected github config")
+    };
+    assert!(config.enabled);
+    assert_eq!(config.client_id, "client-id");
   }
 
   #[test]

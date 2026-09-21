@@ -1,11 +1,6 @@
-use std::{
-  collections::HashMap,
-  sync::{Arc, OnceLock},
-  time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, sync::OnceLock};
 
 use anyhow::{Context, anyhow};
-use arc_swap::ArcSwapOption;
 use axum::http::StatusCode;
 use mogh_auth_client::config::OidcConfig;
 use mogh_error::AddStatusCodeError;
@@ -20,7 +15,7 @@ use openidconnect::{
   reqwest::{self, Url},
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 pub use openidconnect::SubjectIdentifier;
 
@@ -47,24 +42,6 @@ pub type TokenResponse = StandardTokenResponse<
   >,
   CoreTokenType,
 >;
-
-#[derive(Serialize, Deserialize)]
-pub struct SessionOidcLogin {
-  pub csrf_token: String,
-  pub pkce_verifier: openidconnect::PkceCodeVerifier,
-  pub nonce: openidconnect::Nonce,
-  pub redirect: Option<String>,
-}
-
-//
-
-#[derive(Serialize, Deserialize)]
-pub struct SessionOidcLink {
-  pub user_id: String,
-  pub csrf_token: String,
-  pub pkce_verifier: openidconnect::PkceCodeVerifier,
-  pub nonce: openidconnect::Nonce,
-}
 
 fn reqwest(app_user_agent: &str) -> &'static reqwest::Client {
   static REQWEST: OnceLock<reqwest::Client> = OnceLock::new();
@@ -97,57 +74,9 @@ pub type InnerOidcProvider = Client<
   EndpointMaybeSet,
 >;
 
-/// Cache discovery data for 1min
-const PROVIDER_VALID_FOR_MS: u128 = 60_000;
-
-fn oidc_provider() -> &'static ArcSwapOption<OidcProvider> {
-  static OIDC_CLIENT: OnceLock<ArcSwapOption<OidcProvider>> =
-    OnceLock::new();
-  OIDC_CLIENT.get_or_init(Default::default)
-}
-
-pub async fn load_oidc_provider(
-  app_user_agent: &'static str,
-  host: &str,
-  path: &str,
-  config: &OidcConfig,
-) -> Option<Arc<OidcProvider>> {
-  let now = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .ok()?
-    .as_millis();
-
-  if let Some(curr) = oidc_provider().load().as_ref()
-    && curr.valid_until > now
-  {
-    return Some(curr.clone());
-  }
-
-  let client = match OidcProvider::new(
-    app_user_agent,
-    host,
-    path,
-    config,
-    now + PROVIDER_VALID_FOR_MS,
-  )
-  .await
-  {
-    Ok(client) => Arc::new(client),
-    Err(e) => {
-      error!("Failed to initialize OIDC client | {e:#}");
-      return None;
-    }
-  };
-
-  oidc_provider().store(Some(client.clone()));
-
-  Some(client)
-}
-
 pub struct OidcProvider {
   app_user_agent: &'static str,
   client: InnerOidcProvider,
-  valid_until: u128,
   use_full_email: bool,
   additional_scopes: Vec<String>,
 }
@@ -157,10 +86,8 @@ impl OidcProvider {
   /// discovery endpoint.
   pub async fn new(
     app_user_agent: &'static str,
-    host: &str,
-    path: &str,
+    redirect_uri: String,
     config: &OidcConfig,
-    valid_until: u128,
   ) -> anyhow::Result<OidcProvider> {
     if !config.enabled() {
       return Err(anyhow!(
@@ -194,13 +121,13 @@ impl OidcProvider {
       },
     )
     // Set the URL the user will be redirected to after the authorization process.
-    .set_redirect_uri(RedirectUrl::new(format!(
-      "{host}{path}/oidc/callback",
-    ))?);
+    .set_redirect_uri(
+      RedirectUrl::new(redirect_uri)
+        .context("Invalid OIDC redirect URI")?,
+    );
 
     Ok(OidcProvider {
       client,
-      valid_until,
       app_user_agent,
       use_full_email: config.use_full_email,
       additional_scopes,

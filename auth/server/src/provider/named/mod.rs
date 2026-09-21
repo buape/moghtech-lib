@@ -5,8 +5,8 @@ use serde::de::DeserializeOwned;
 pub mod github;
 pub mod google;
 
-/// Length of random token in Oauth 'state'
-pub const STATE_PREFIX_LENGTH: usize = 20;
+/// Length of the random Oauth 'state' token
+pub const STATE_LENGTH: usize = 32;
 
 async fn handle_response<T: DeserializeOwned>(
   res: reqwest::Response,
