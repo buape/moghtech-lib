@@ -25,7 +25,10 @@ use mogh_auth_client::{
     TOKEN_TYPE_ID_TOKEN, TOKEN_TYPE_JWT, TokenExchangeError,
     TokenExchangeRequest, TokenExchangeResponse,
   },
-  config::{ExternalLoginProvider, ExternalLoginProviderConfig},
+  config::{
+    ExternalLoginProvider, ExternalLoginProviderConfig,
+    TrustedIssuer, WorkloadRule,
+  },
 };
 use mogh_error::AddStatusCodeError as _;
 use mogh_rate_limit::WithFailureRateLimit as _;
@@ -42,9 +45,16 @@ use crate::{
   provider::{
     external::{
       BuiltProvider, ExternalLoginInfo, list_external_providers,
+      validate_provider_id,
     },
+    load_cache::LoadFailedRecently,
     token_exchange::{
-      MAX_SUBJECT_TOKEN_LENGTH, issuers_match, unverified_issuer,
+      MAX_SUBJECT_TOKEN_LENGTH, TokenVerificationKeys, issuers_match,
+      unverified_issuer,
+    },
+    workload::{
+      Claims, WorkloadIdentity, list_trusted_issuers,
+      load_verification_keys, lookup_claim, match_rule,
     },
   },
   user::BoxAuthUser,
@@ -106,9 +116,16 @@ fn error_response(e: mogh_error::Error) -> Response {
           error_description: Some(oauth.description.clone()),
         },
       )
-    } else if e.status == StatusCode::TOO_MANY_REQUESTS {
+    } else if [
+      StatusCode::TOO_MANY_REQUESTS,
+      // A provider / issuer which can't be reached. The reason
+      // was logged where it happened, and isn't part of the error.
+      StatusCode::SERVICE_UNAVAILABLE,
+    ]
+    .contains(&e.status)
+    {
       (
-        StatusCode::TOO_MANY_REQUESTS,
+        e.status,
         TokenExchangeError {
           error: "temporarily_unavailable".to_string(),
           error_description: Some(e.error.to_string()),
@@ -160,9 +177,15 @@ async fn token<I: AuthImpl>(
       invalid_request(format!("Invalid token request | {e}"))
     })?;
     let auth = &auth;
-    exchange(auth, ip, request, |provider| async move {
-      load_provider_client(auth, &provider).await
-    })
+    exchange(
+      auth,
+      ip,
+      request,
+      |provider| async move {
+        load_provider_client(auth, &provider).await
+      },
+      load_issuer_keys,
+    )
     .await
   }
   .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
@@ -241,25 +264,65 @@ fn exchange_candidates(
     .collect()
 }
 
-/// The RFC 8693 exchange of the `/token` endpoint.
-/// `load_client` loads the client which verifies tokens of a provider.
+/// The RFC 8693 exchange of the `/token` endpoint. The token is either
+/// of a user of an external login provider, or of a workload of a
+/// trusted issuer.
+///
+/// `load_client` loads the client which verifies tokens of a provider,
+/// `load_keys` the keys which verify tokens of a trusted issuer.
 #[instrument("TokenExchange", skip_all, fields(ip = ip.to_string()))]
-async fn exchange<I, L, F>(
+async fn exchange<I, L, F, K, G>(
   auth: &I,
   ip: IpAddr,
   request: TokenExchangeRequest,
   load_client: L,
+  load_keys: K,
 ) -> mogh_error::Result<TokenExchangeResponse>
 where
   I: AuthImpl + ?Sized,
   L: Fn(ExternalLoginProvider) -> F,
   F: Future<Output = mogh_error::Result<Arc<BuiltProvider>>>,
+  K: Fn(TrustedIssuer) -> G,
+  G: Future<Output = mogh_error::Result<Arc<TokenVerificationKeys>>>,
 {
   let issued_token_type = validate_request(&request)?;
-  let verified =
-    verify_exchange(auth, &request.subject_token, load_client)
-      .await?;
-  complete_exchange(auth, ip, verified, issued_token_type).await
+  let token = request.subject_token.as_str();
+
+  let user_rejection =
+    match verify_exchange(auth, token, load_client).await {
+      Ok(Some(verified)) => {
+        return complete_exchange(
+          auth,
+          ip,
+          verified,
+          issued_token_type,
+        )
+        .await;
+      }
+      Ok(None) => None,
+      Err(e) => Some(e),
+    };
+
+  let workload_rejection =
+    match verify_workload(auth, token, load_keys).await {
+      Ok(Some(verified)) => {
+        return complete_workload(
+          auth,
+          ip,
+          verified,
+          issued_token_type,
+        )
+        .await;
+      }
+      Ok(None) => None,
+      Err(e) => Some(e),
+    };
+
+  Err(user_rejection.or(workload_rejection).unwrap_or_else(|| {
+    invalid_grant(
+      "No login provider or trusted issuer accepts tokens of this issuer",
+    )
+  }))
 }
 
 /// A verified token, and the user it belongs to.
@@ -274,11 +337,13 @@ pub(crate) struct VerifiedExchange {
 ///
 /// The login rules for the user (cidr whitelist, second
 /// factor, sync) are still up to the caller.
+///
+/// `None` if no login provider takes tokens of the issuer.
 pub(crate) async fn verify_exchange<I, L, F>(
   auth: &I,
   token: &str,
   load_client: L,
-) -> mogh_error::Result<VerifiedExchange>
+) -> mogh_error::Result<Option<VerifiedExchange>>
 where
   I: AuthImpl + ?Sized,
   // Takes the provider by value, a future borrowing its
@@ -306,9 +371,7 @@ where
   );
 
   if candidates.is_empty() {
-    return Err(invalid_grant(
-      "No login provider accepts tokens of this issuer for token exchange",
-    ));
+    return Ok(None);
   }
 
   // Providers can share an issuer (several clients at the same
@@ -347,11 +410,11 @@ where
       )));
       continue;
     };
-    return Ok(VerifiedExchange {
+    return Ok(Some(VerifiedExchange {
       provider,
       user,
       info,
-    });
+    }));
   }
 
   // Report the furthest any provider got.
@@ -366,6 +429,258 @@ where
     Some(e) => Err(e),
     None => Err(invalid_grant("Token was rejected")),
   }
+}
+
+/// Loads the keys of a trusted issuer. The reason a load fails may
+/// include internal addresses, so it is only logged.
+async fn load_issuer_keys(
+  issuer: TrustedIssuer,
+) -> mogh_error::Result<Arc<TokenVerificationKeys>> {
+  load_verification_keys(&issuer).await.map_err(|e| {
+    // Logged once per attempt, not by every request while it is down.
+    if !LoadFailedRecently::is(&e) {
+      error!(
+        issuer_id = issuer.id,
+        issuer = issuer.name,
+        "Failed to load keys of trusted issuer | {e:#}"
+      );
+    }
+    anyhow::anyhow!(
+      "Trusted issuer '{}' is not available",
+      issuer.name
+    )
+    .status_code(StatusCode::SERVICE_UNAVAILABLE)
+  })
+}
+
+/// A verified workload token, and the rule it matched.
+struct VerifiedWorkload {
+  issuer: TrustedIssuer,
+  rule: WorkloadRule,
+  claims: Claims,
+}
+
+/// Finds the trusted issuer which accepts the token, and the rule
+/// the token matches. `None` if no trusted issuer has that issuer.
+async fn verify_workload<I, K, G>(
+  auth: &I,
+  token: &str,
+  load_keys: K,
+) -> mogh_error::Result<Option<VerifiedWorkload>>
+where
+  I: AuthImpl + ?Sized,
+  K: Fn(TrustedIssuer) -> G,
+  G: Future<Output = mogh_error::Result<Arc<TokenVerificationKeys>>>,
+{
+  let issuer = unverified_issuer(token).ok_or_else(|| {
+    invalid_grant("The token is not a JWT with an issuer")
+  })?;
+
+  // Issuers aren't always unique. Kubernetes clusters share a default
+  // issuer and only differ by their keys, so each candidate gets to
+  // verify the token with its own.
+  let candidates = list_trusted_issuers(auth)
+    .await?
+    .into_iter()
+    .map(|resolved| resolved.issuer)
+    .filter(|trusted| {
+      trusted.enabled && issuers_match(&trusted.issuer, &issuer)
+    })
+    .collect::<Vec<_>>();
+
+  if candidates.is_empty() {
+    return Ok(None);
+  }
+
+  let mut unavailable = None;
+  let mut rejected = None;
+  let mut unmatched = None;
+  for trusted in candidates {
+    let keys = match load_keys(trusted.clone()).await {
+      Ok(keys) => keys,
+      // Already logged
+      Err(e) => {
+        unavailable.get_or_insert(e);
+        continue;
+      }
+    };
+    let claims = match keys.verify_payload(
+      token,
+      &trusted.audiences,
+      trusted.max_token_age_secs,
+    ) {
+      Ok(claims) => claims,
+      Err(e) => {
+        // Only describes the token the caller presented
+        rejected = Some(invalid_grant(format!("{e:#}")));
+        continue;
+      }
+    };
+    let Some(rule) = match_rule(&trusted.rules, &claims).cloned()
+    else {
+      unmatched.get_or_insert(invalid_grant(format!(
+        "The token is valid, but matches no rule of '{}'",
+        trusted.name
+      )));
+      continue;
+    };
+    check_rule_id(&trusted, &rule)?;
+    return Ok(Some(VerifiedWorkload {
+      issuer: trusted,
+      rule,
+      claims,
+    }));
+  }
+
+  // Report the furthest any issuer got.
+  Err(
+    unmatched
+      .or(rejected)
+      .or(unavailable)
+      .unwrap_or_else(|| invalid_grant("Token was rejected")),
+  )
+}
+
+/// The rule id identifies the user of the rule. Ids of stored issuers
+/// are generated, but static issuers come from the app configuration,
+/// where a missing or repeated id would make rules share one user,
+/// and with it each others groups.
+fn check_rule_id(
+  issuer: &TrustedIssuer,
+  rule: &WorkloadRule,
+) -> mogh_error::Result<()> {
+  let unique = issuer
+    .rules
+    .iter()
+    .filter(|other| other.id == rule.id)
+    .count()
+    == 1;
+  if unique && validate_provider_id(&rule.id).is_ok() {
+    return Ok(());
+  }
+  error!(
+    issuer_id = issuer.id,
+    issuer = issuer.name,
+    rule = rule.name,
+    rule_id = rule.id,
+    "Rules of a trusted issuer need a unique id (a-z A-Z 0-9 - _)"
+  );
+  Err(
+    anyhow::anyhow!(
+      "Trusted issuer '{}' is misconfigured",
+      issuer.name
+    )
+    .into(),
+  )
+}
+
+/// Claim values end up in the logs, and are as long as the issuer likes.
+fn truncate_for_log(value: &str) -> String {
+  const MAX: usize = 200;
+  match value.char_indices().nth(MAX) {
+    Some((index, _)) => format!("{}...", &value[..index]),
+    None => value.to_string(),
+  }
+}
+
+/// Gets the user of the matched rule from the app,
+/// applies the login rules and issues a short lived app token.
+async fn complete_workload<I: AuthImpl + ?Sized>(
+  auth: &I,
+  ip: IpAddr,
+  VerifiedWorkload {
+    issuer,
+    rule,
+    claims,
+  }: VerifiedWorkload,
+  issued_token_type: &str,
+) -> mogh_error::Result<TokenExchangeResponse> {
+  // What identifies the workload, for the audit log below.
+  let subject = truncate_for_log(
+    claims
+      .get("sub")
+      .and_then(|sub| sub.as_str())
+      .unwrap_or_default(),
+  );
+  let matched = rule
+    .claims
+    .iter()
+    .filter_map(|condition| {
+      let value = lookup_claim(&claims, &condition.claim)?;
+      Some(format!(
+        "{}={}",
+        condition.claim,
+        truncate_for_log(&value.to_string())
+      ))
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+
+  let user_id = auth
+    .get_or_create_workload_user(WorkloadIdentity {
+      issuer_id: issuer.id.clone(),
+      rule_id: rule.id.clone(),
+      rule_name: rule.name.clone(),
+      groups: rule.groups.clone(),
+      admin: rule.admin,
+      claims,
+    })
+    .await?;
+  let user = auth.get_user(user_id).await?;
+
+  // Without the flag the management API wouldn't
+  // stop the workload from creating credentials.
+  if !user.is_workload() {
+    return Err(
+      anyhow::anyhow!(
+        "The user returned by 'AuthImpl::get_or_create_workload_user' must report 'AuthUserImpl::is_workload'"
+      )
+      .into(),
+    );
+  }
+
+  // Being an admin has to be a decision made on the rule.
+  if user.is_admin() && !rule.admin {
+    return Err(invalid_grant(format!(
+      "The user of rule '{}' is an admin, which the rule doesn't allow",
+      rule.name
+    )));
+  }
+
+  check_user_cidr_whitelist(user.as_ref(), ip)?;
+
+  if external_login_requires_two_factor(user.as_ref()) {
+    return Err(invalid_grant(
+      "The user of the workload requires a second factor, which a workload can't provide",
+    ));
+  }
+
+  let default_ttl_ms = auth.jwt_provider().ttl_ms();
+  let ttl_ms = match u128::from(rule.token_ttl_secs) * 1000 {
+    0 => default_ttl_ms,
+    ttl_ms => ttl_ms.min(default_ttl_ms),
+  };
+  let jwt =
+    auth.jwt_provider().encode_sub_with_ttl(user.id(), ttl_ms)?;
+
+  info!(
+    user_id = user.id(),
+    username = user.username(),
+    issuer_id = issuer.id,
+    issuer = issuer.name,
+    rule_id = rule.id,
+    rule = rule.name,
+    subject,
+    matched,
+    "Workload logged in (token exchange)"
+  );
+
+  Ok(TokenExchangeResponse {
+    access_token: jwt.jwt,
+    issued_token_type: issued_token_type.to_string(),
+    token_type: "Bearer".to_string(),
+    expires_in: u64::try_from(ttl_ms / 1000).unwrap_or(u64::MAX),
+  })
 }
 
 /// Applies the login rules to the user the verified
@@ -420,7 +735,10 @@ mod tests {
   use anyhow::anyhow;
 
   use mogh_auth_client::{
-    config::{NamedOauthConfig, OidcConfig, TokenExchangeConfig},
+    config::{
+      NamedOauthConfig, OidcConfig, TokenExchangeConfig,
+      TrustedIssuerKeys, WorkloadClaim,
+    },
     passkey::Passkey,
   };
 
@@ -430,7 +748,8 @@ mod tests {
       jwt::JwtProvider,
       oidc::{OidcProvider, UsernameAdditionalClaims},
       token_exchange::test_tokens::{
-        CLIENT_ID, ISSUER, TestToken, metadata,
+        CLIENT_ID, ISSUER, Signer, TestToken, jwks_json, metadata,
+        other_jwks_json,
       },
     },
     user::AuthUserImpl,
@@ -444,6 +763,8 @@ mod tests {
     external_skip_2fa: bool,
     totp: bool,
     cidr_whitelist: Vec<String>,
+    workload: bool,
+    admin: bool,
   }
 
   impl AuthUserImpl for TestUser {
@@ -465,10 +786,20 @@ mod tests {
     fn cidr_whitelist(&self) -> &[String] {
       &self.cidr_whitelist
     }
+    fn is_workload(&self) -> bool {
+      self.workload
+    }
+    fn is_admin(&self) -> bool {
+      self.admin
+    }
   }
 
   struct TestAuth {
     providers: Vec<ExternalLoginProvider>,
+    issuers: Vec<TrustedIssuer>,
+    /// The user the app returns for workloads
+    workload_user: TestUser,
+    workloads: Arc<Mutex<Vec<WorkloadIdentity>>>,
     /// The user linked to ("oidc", "subject-123"), if any
     user: Option<TestUser>,
     sync_fails: bool,
@@ -480,6 +811,12 @@ mod tests {
     fn with_user(user: Option<TestUser>) -> TestAuth {
       TestAuth {
         providers: vec![oidc_provider("oidc", true)],
+        issuers: Vec::new(),
+        workload_user: TestUser {
+          workload: true,
+          ..Default::default()
+        },
+        workloads: Default::default(),
         user,
         sync_fails: false,
         synced: Default::default(),
@@ -529,11 +866,27 @@ mod tests {
       Box::pin(async { Ok(()) })
     }
 
+    fn static_trusted_issuers(&self) -> Vec<TrustedIssuer> {
+      self.issuers.clone()
+    }
+
+    fn get_or_create_workload_user(
+      &self,
+      identity: WorkloadIdentity,
+    ) -> crate::DynFuture<mogh_error::Result<String>> {
+      self.workloads.lock().unwrap().push(identity);
+      Box::pin(async { Ok("workload-user".to_string()) })
+    }
+
     fn get_user(
       &self,
-      _user_id: String,
+      user_id: String,
     ) -> crate::DynFuture<mogh_error::Result<BoxAuthUser>> {
-      Box::pin(async { Err(anyhow!("not implemented").into()) })
+      let user = (user_id == "workload-user")
+        .then(|| Box::new(self.workload_user.clone()) as BoxAuthUser);
+      Box::pin(async move {
+        user.ok_or_else(|| anyhow!("no user").into())
+      })
     }
 
     fn handle_request_authentication(
@@ -632,8 +985,325 @@ mod tests {
       IP,
       TokenExchangeRequest::id_token(token),
       load_client,
+      load_issuer_keys,
     )
     .await
+  }
+
+  // =====================
+  // = WORKLOAD IDENTITY =
+  // =====================
+
+  const WORKLOAD_AUDIENCE: &str = "https://app.example.com";
+
+  /// A Github Actions like token of the test issuer.
+  fn workload_token(
+    repository_id: u64,
+    git_ref: &str,
+  ) -> TestToken<UsernameAdditionalClaims> {
+    TestToken {
+      subject: format!("repo:org/app:ref:{git_ref}"),
+      audiences: vec![WORKLOAD_AUDIENCE.to_string()],
+      ..TestToken::new(UsernameAdditionalClaims {
+        username: None,
+        extra: [
+          (
+            "repository_id".to_string(),
+            serde_json::json!(repository_id),
+          ),
+          ("ref".to_string(), serde_json::json!(git_ref)),
+        ]
+        .into(),
+      })
+    }
+  }
+
+  fn deploy_rule() -> WorkloadRule {
+    WorkloadRule {
+      id: "deploy".to_string(),
+      name: "Deploy".to_string(),
+      enabled: true,
+      claims: vec![
+        WorkloadClaim {
+          claim: "repository_id".to_string(),
+          pattern: "12345".to_string(),
+        },
+        WorkloadClaim {
+          claim: "ref".to_string(),
+          pattern: "refs/heads/release/*".to_string(),
+        },
+      ],
+      groups: vec!["deployers".to_string()],
+      admin: false,
+      token_ttl_secs: 900,
+    }
+  }
+
+  /// Static keys, so nothing is fetched.
+  fn trusted_issuer(rules: Vec<WorkloadRule>) -> TrustedIssuer {
+    TrustedIssuer {
+      id: "ci".to_string(),
+      name: "CI".to_string(),
+      enabled: true,
+      issuer: ISSUER.to_string(),
+      keys: TrustedIssuerKeys::Static(jwks_json()),
+      audiences: vec![WORKLOAD_AUDIENCE.to_string()],
+      max_token_age_secs: 0,
+      rules,
+    }
+  }
+
+  fn workload_auth(rules: Vec<WorkloadRule>) -> TestAuth {
+    let mut auth = TestAuth::with_user(None);
+    auth.providers = Vec::new();
+    auth.issuers = vec![trusted_issuer(rules)];
+    auth
+  }
+
+  #[tokio::test]
+  async fn test_workload_gets_short_lived_token_for_rule_user() {
+    let auth = workload_auth(vec![deploy_rule()]);
+    let token =
+      workload_token(12345, "refs/heads/release/1.2").mint();
+    let response = run(&auth, token).await.unwrap();
+
+    assert_eq!(
+      auth.jwt.decode_sub(&response.access_token).unwrap(),
+      "user-id"
+    );
+    // The rule's lifetime, not the (longer) app default
+    assert_eq!(response.expires_in, 900);
+
+    // The app is asked for the user of the rule, with its definition
+    let workloads = auth.workloads.lock().unwrap();
+    assert_eq!(workloads.len(), 1);
+    assert_eq!(workloads[0].issuer_id, "ci");
+    assert_eq!(workloads[0].rule_id, "deploy");
+    assert_eq!(workloads[0].groups, ["deployers"]);
+    assert!(!workloads[0].admin);
+    assert_eq!(workloads[0].claims["repository_id"], 12345);
+    // Login provider hooks are not involved
+    assert!(auth.synced.lock().unwrap().is_empty());
+  }
+
+  #[tokio::test]
+  async fn test_workload_token_ttl_is_capped_at_app_default() {
+    let mut rule = deploy_rule();
+    rule.token_ttl_secs = 365 * 24 * 60 * 60;
+    let auth = workload_auth(vec![rule]);
+    let token = workload_token(12345, "refs/heads/release/1").mint();
+    assert_eq!(run(&auth, token).await.unwrap().expires_in, 3600);
+
+    let mut rule = deploy_rule();
+    rule.token_ttl_secs = 0;
+    let auth = workload_auth(vec![rule]);
+    let token = workload_token(12345, "refs/heads/release/1").mint();
+    assert_eq!(run(&auth, token).await.unwrap().expires_in, 3600);
+  }
+
+  #[tokio::test]
+  async fn test_workload_token_must_match_a_rule() {
+    let auth = workload_auth(vec![deploy_rule()]);
+    for token in [
+      // Another repository, and another branch
+      workload_token(99999, "refs/heads/release/1"),
+      workload_token(12345, "refs/heads/main"),
+    ] {
+      let err = run(&auth, token.mint()).await.unwrap_err();
+      assert_eq!(code(&err), "invalid_grant");
+      assert!(err.error.to_string().contains("matches no rule"));
+    }
+    assert!(auth.workloads.lock().unwrap().is_empty());
+
+    // No rules, a disabled rule, or a disabled issuer accept nothing
+    let mut disabled_rule = deploy_rule();
+    disabled_rule.enabled = false;
+    let mut disabled_issuer = workload_auth(vec![deploy_rule()]);
+    disabled_issuer.issuers[0].enabled = false;
+    for auth in [
+      workload_auth(Vec::new()),
+      workload_auth(vec![disabled_rule]),
+      disabled_issuer,
+    ] {
+      let token =
+        workload_token(12345, "refs/heads/release/1").mint();
+      assert!(run(&auth, token).await.is_err());
+      assert!(auth.workloads.lock().unwrap().is_empty());
+    }
+  }
+
+  #[tokio::test]
+  async fn test_workload_token_is_verified_like_any_other() {
+    let auth = workload_auth(vec![deploy_rule()]);
+    let valid = || workload_token(12345, "refs/heads/release/1");
+    for token in [
+      // The platform default audience, shared with other services
+      TestToken {
+        audiences: vec!["https://github.com/org".to_string()],
+        ..valid()
+      },
+      TestToken {
+        signer: Signer::Other,
+        ..valid()
+      },
+      TestToken {
+        expires_in: chrono::Duration::minutes(-1),
+        ..valid()
+      },
+    ] {
+      let err = run(&auth, token.mint()).await.unwrap_err();
+      assert_eq!(code(&err), "invalid_grant");
+    }
+    assert!(auth.workloads.lock().unwrap().is_empty());
+
+    // No accepted audience configured accepts nothing
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.issuers[0].audiences = Vec::new();
+    assert!(run(&auth, valid().mint()).await.is_err());
+  }
+
+  /// Issuers aren't unique (Kubernetes clusters share a default),
+  /// the one whose keys verify the token decides.
+  #[tokio::test]
+  async fn test_workload_issuers_sharing_an_issuer_url() {
+    let mut other_cluster = trusted_issuer(vec![deploy_rule()]);
+    other_cluster.id = "other-cluster".to_string();
+    // Publishes other keys
+    other_cluster.keys = TrustedIssuerKeys::Static(other_jwks_json());
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.issuers.insert(0, other_cluster);
+
+    let token = workload_token(12345, "refs/heads/release/1").mint();
+    assert!(run(&auth, token).await.is_ok());
+    assert_eq!(auth.workloads.lock().unwrap()[0].issuer_id, "ci");
+  }
+
+  /// Static issuers come from the app configuration. Rules without
+  /// (or sharing) an id would share a user, and each others groups.
+  #[tokio::test]
+  async fn test_workload_rules_need_unique_ids() {
+    let token =
+      || workload_token(12345, "refs/heads/release/1").mint();
+    let mut admin_rule = deploy_rule();
+    admin_rule.name = "Admin".to_string();
+    admin_rule.admin = true;
+    admin_rule.claims[0].pattern = "99999".to_string();
+
+    for id in ["", "deploy", "not valid"] {
+      let mut rules = vec![deploy_rule(), admin_rule.clone()];
+      rules[0].id = id.to_string();
+      rules[1].id = id.to_string();
+      let auth = workload_auth(rules);
+      let err = run(&auth, token()).await.unwrap_err();
+      assert_eq!(
+        err.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{id}"
+      );
+      assert!(auth.workloads.lock().unwrap().is_empty());
+    }
+  }
+
+  #[test]
+  fn test_truncate_for_log() {
+    assert_eq!(truncate_for_log("short"), "short");
+    let long = "ü".repeat(500);
+    let truncated = truncate_for_log(&long);
+    assert_eq!(truncated.chars().count(), 203);
+    assert!(truncated.ends_with("..."));
+  }
+
+  /// An issuer which can't be reached is a temporary
+  /// condition for the caller, not a server error.
+  #[tokio::test]
+  async fn test_workload_unavailable_issuer() {
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.issuers[0].id = "unavailable-issuer".to_string();
+    auth.issuers[0].keys = TrustedIssuerKeys::Static("broken".into());
+    let token =
+      || workload_token(12345, "refs/heads/release/1").mint();
+
+    // The attempt, and a request during the retry delay
+    for _ in 0..2 {
+      let err = run(&auth, token()).await.unwrap_err();
+      assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+      // Without the reason
+      let message = format!("{:#}", err.error);
+      assert_eq!(message, "Trusted issuer 'CI' is not available");
+
+      let (status, _, body) = error_body(err).await;
+      assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+      assert!(body.contains("temporarily_unavailable"));
+    }
+    assert!(auth.workloads.lock().unwrap().is_empty());
+  }
+
+  #[tokio::test]
+  async fn test_workload_user_must_be_flagged_as_workload() {
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.workload_user.workload = false;
+    let token = workload_token(12345, "refs/heads/release/1").mint();
+    let err = run(&auth, token).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+  }
+
+  #[tokio::test]
+  async fn test_workload_admin_has_to_be_allowed_by_the_rule() {
+    // Made an admin some other way
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.workload_user.admin = true;
+    let token =
+      || workload_token(12345, "refs/heads/release/1").mint();
+    let err = run(&auth, token()).await.unwrap_err();
+    assert_eq!(code(&err), "invalid_grant");
+
+    let mut rule = deploy_rule();
+    rule.admin = true;
+    let mut auth = workload_auth(vec![rule]);
+    auth.workload_user.admin = true;
+    assert!(run(&auth, token()).await.is_ok());
+    assert!(auth.workloads.lock().unwrap()[0].admin);
+  }
+
+  #[tokio::test]
+  async fn test_workload_user_login_rules() {
+    let token =
+      || workload_token(12345, "refs/heads/release/1").mint();
+
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.workload_user.cidr_whitelist =
+      vec!["192.168.0.0/16".to_string()];
+    let err = run(&auth, token()).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.workload_user.totp = true;
+    let err = run(&auth, token()).await.unwrap_err();
+    assert_eq!(code(&err), "invalid_grant");
+  }
+
+  /// A login provider and a trusted issuer are independent: tokens of
+  /// an issuer only known as a trusted issuer never reach user logins.
+  #[tokio::test]
+  async fn test_user_and_workload_paths_are_separate() {
+    let mut auth = TestAuth::with_user(Some(TestUser {
+      external_skip_2fa: true,
+      ..Default::default()
+    }));
+    auth.issuers = vec![trusted_issuer(vec![deploy_rule()])];
+
+    // A user token (audience of the login provider) logs in the user
+    let response = run(&auth, token().mint()).await.unwrap();
+    assert_eq!(response.expires_in, 3600);
+    assert!(auth.workloads.lock().unwrap().is_empty());
+
+    // A workload token is rejected by the login provider
+    // (audience), and accepted by the trusted issuer.
+    let workload =
+      workload_token(12345, "refs/heads/release/1").mint();
+    let response = run(&auth, workload).await.unwrap();
+    assert_eq!(response.expires_in, 900);
+    assert_eq!(auth.workloads.lock().unwrap().len(), 1);
   }
 
   fn code(e: &mogh_error::Error) -> &'static str {
@@ -973,6 +1643,16 @@ mod tests {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(body.contains("temporarily_unavailable"));
+
+    // A provider or issuer which can't be reached
+    let (status, _, body) = error_body(
+      anyhow!("Trusted issuer 'CI' is not available")
+        .status_code(StatusCode::SERVICE_UNAVAILABLE),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("temporarily_unavailable"));
+    assert!(body.contains("not available"));
   }
 
   #[tokio::test]

@@ -2,10 +2,9 @@
 //! and building / caching of the provider clients.
 
 use std::{
-  collections::HashMap,
   hash::{DefaultHasher, Hash as _, Hasher as _},
-  sync::{Arc, OnceLock, RwLock},
-  time::{Duration, Instant},
+  sync::{Arc, OnceLock},
+  time::Duration,
 };
 
 use anyhow::{Context as _, anyhow};
@@ -24,6 +23,7 @@ use tracing::warn;
 use crate::{
   AuthImpl,
   provider::{
+    load_cache::LoadCache,
     named::{github::GithubProvider, google::GoogleProvider},
     oidc::{OidcProvider, TokenResponse},
   },
@@ -210,13 +210,13 @@ impl BuiltProvider {
     Ok(provider)
   }
 
-  /// How long the built provider can be reused,
+  /// How long a built provider of the kind can be reused,
   /// or None if it never has to be rebuilt.
-  fn valid_for(&self) -> Option<Duration> {
-    match self {
-      BuiltProvider::Oidc(_) => Some(OIDC_VALID_FOR),
-      BuiltProvider::Github(_) => None,
-      BuiltProvider::Google(_) => Some(GOOGLE_VALID_FOR),
+  fn valid_for(kind: ExternalLoginKind) -> Option<Duration> {
+    match kind {
+      ExternalLoginKind::Oidc => Some(OIDC_VALID_FOR),
+      ExternalLoginKind::Github => None,
+      ExternalLoginKind::Google => Some(GOOGLE_VALID_FOR),
     }
   }
 
@@ -416,21 +416,16 @@ impl BuiltProvider {
 // = CACHE =
 // =========
 
-struct CachedProvider {
-  /// Identifies the configuration the provider was built from,
-  /// so configuration changes apply on the next login.
-  fingerprint: u64,
-  built_at: Instant,
-  provider: Arc<BuiltProvider>,
-}
-
 /// The built provider clients by provider id.
 ///
 /// This is never the source of truth: the provider is always
 /// resolved from the app first, and the cached client is only
 /// used if it was built from that same configuration.
+///
+/// Building a client means discovery requests to the provider, see
+/// [LoadCache] for how concurrent logins and outages are handled.
 #[derive(Default)]
-struct BuiltProviderCache(RwLock<HashMap<String, CachedProvider>>);
+struct BuiltProviderCache(LoadCache<BuiltProvider>);
 
 fn provider_cache() -> &'static BuiltProviderCache {
   static CACHE: OnceLock<BuiltProviderCache> = OnceLock::new();
@@ -476,77 +471,38 @@ impl BuiltProviderCache {
     }
 
     let redirect_uri = redirect_uri(host, path, provider);
-    let fingerprint = fingerprint(&redirect_uri, provider);
 
-    if let Some(cached) = self
+    self
       .0
-      .read()
-      .unwrap_or_else(|e| e.into_inner())
-      .get(&provider.id)
-      && cached.fingerprint == fingerprint
-      && cached
-        .provider
-        .valid_for()
-        .is_none_or(|valid_for| cached.built_at.elapsed() < valid_for)
-    {
-      return Ok(cached.provider.clone());
-    }
-
-    let built = Arc::new(
-      BuiltProvider::new(
-        app_user_agent,
-        redirect_uri,
-        &provider.config,
+      .load(
+        &provider.id,
+        fingerprint(&redirect_uri, provider),
+        BuiltProvider::valid_for(provider.kind()),
+        || {
+          BuiltProvider::new(
+            app_user_agent,
+            redirect_uri,
+            &provider.config,
+          )
+        },
       )
-      .await?,
-    );
-
-    self.0.write().unwrap_or_else(|e| e.into_inner()).insert(
-      provider.id.clone(),
-      CachedProvider {
-        fingerprint,
-        built_at: Instant::now(),
-        provider: built.clone(),
-      },
-    );
-
-    Ok(built)
+      .await
   }
 
   fn evict(&self, provider_id: &str) {
-    self
-      .0
-      .write()
-      .unwrap_or_else(|e| e.into_inner())
-      .remove(provider_id);
+    self.0.evict(provider_id);
   }
 
   /// Drops the clients of providers which can no longer be logged in
   /// with (deleted or disabled), so their secrets don't stay in memory.
   /// `providers` must be the complete list of providers.
   fn prune(&self, providers: &[ResolvedProvider]) {
-    let keep = |provider_id: &String| {
+    self.0.retain(|provider_id| {
       providers.iter().any(|resolved| {
-        resolved.provider.id == *provider_id
+        resolved.provider.id == provider_id
           && resolved.provider.enabled()
       })
-    };
-    // This runs on every listing, only take the
-    // write lock if there is something to drop.
-    if self
-      .0
-      .read()
-      .unwrap_or_else(|e| e.into_inner())
-      .keys()
-      .all(keep)
-    {
-      return;
-    }
-    self
-      .0
-      .write()
-      .unwrap_or_else(|e| e.into_inner())
-      .retain(|provider_id, _| keep(provider_id));
+    });
   }
 }
 
@@ -852,10 +808,7 @@ mod tests {
 
     cache.prune(&[resolved(&kept), resolved(&now_disabled)]);
 
-    {
-      let cached = cache.0.read().unwrap();
-      assert_eq!(cached.keys().collect::<Vec<_>>(), ["kept"]);
-    }
+    assert_eq!(cache.0.keys(), ["kept"]);
     // The kept client is reused, the cache held the last
     // reference to the dropped ones (wiping the Github secret).
     assert!(Arc::ptr_eq(&kept_client, &load(&cache, &kept).await));
@@ -863,7 +816,7 @@ mod tests {
 
     // Nothing to drop leaves the cache as is
     cache.prune(&[resolved(&kept)]);
-    assert_eq!(cache.0.read().unwrap().len(), 1);
+    assert_eq!(cache.0.keys().len(), 1);
   }
 
   struct TestAuth {
@@ -938,10 +891,7 @@ mod tests {
     let providers = list_providers_pruning_lossy(&auth, &cache).await;
     assert_eq!(providers.len(), 2);
 
-    let cached = cache.0.read().unwrap();
-    let mut ids = cached.keys().collect::<Vec<_>>();
-    ids.sort();
-    assert_eq!(ids, ["github", "stored"]);
+    assert_eq!(cache.0.keys(), ["github", "stored"]);
   }
 
   /// When the stored providers can't be loaded the list is incomplete,
@@ -964,7 +914,7 @@ mod tests {
     // Only the static provider is listed
     assert_eq!(providers.len(), 1);
 
-    assert_eq!(cache.0.read().unwrap().len(), 2);
+    assert_eq!(cache.0.keys().len(), 2);
   }
 
   #[tokio::test]

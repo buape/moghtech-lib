@@ -7,6 +7,7 @@ import {
 import * as MoghAuth from "mogh_auth_client";
 import { sanitizeQueryInner } from "./utils";
 
+export * from "./issuers";
 export * from "./login";
 export * from "./profile";
 export * from "./providers";
@@ -42,6 +43,20 @@ export function useExternalLoginProviders(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["ListExternalLoginProviders"],
     queryFn: () => authClient().manage("ListExternalLoginProviders", {}),
+    enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
+    // A user who isn't an admin gets the same answer every time
+    retry: false,
+  });
+}
+
+/**
+ * List the token issuers trusted for workload
+ * identity. Only available to admin users.
+ */
+export function useTrustedIssuers(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: ["ListTrustedIssuers"],
+    queryFn: () => authClient().manage("ListTrustedIssuers", {}),
     enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
     // A user who isn't an admin gets the same answer every time
     retry: false,

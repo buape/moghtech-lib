@@ -17,6 +17,7 @@ mogh_resolver.workspace = true
 mogh_pki.workspace = true
 # EXTERNAL
 tower-sessions.workspace = true
+tokio.workspace = true
 data-encoding.workspace = true
 openidconnect.workspace = true
 jsonwebtoken.workspace = true
@@ -39,5 +40,4 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 chrono.workspace = true

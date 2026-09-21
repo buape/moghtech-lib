@@ -33,6 +33,11 @@ mod auth {
     auth::create_external_login_provider,
     auth::update_external_login_provider,
     auth::delete_external_login_provider,
+    // Trusted issuers for workload identity (admin)
+    auth::list_trusted_issuers,
+    auth::create_trusted_issuer,
+    auth::update_trusted_issuer,
+    auth::delete_trusted_issuer,
     // Passkey 2FA
     auth::begin_passkey_enrollment,
     auth::confirm_passkey_enrollment,

@@ -4,10 +4,13 @@
 
 use std::{net::IpAddr, sync::Arc};
 
+use anyhow::Context as _;
+use axum::http::StatusCode;
 use mogh_auth_client::{
   api::login::{ExchangeExternalForJwt, JwtOrTwoFactor},
   config::ExternalLoginProvider,
 };
+use mogh_error::AddStatusCode as _;
 use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
@@ -42,7 +45,12 @@ where
     provider,
     user,
     info,
-  } = verify_exchange(auth, token, load_client).await?;
+  } = verify_exchange(auth, token, load_client)
+    .await?
+    .context(
+      "No login provider accepts tokens of this issuer for token exchange",
+    )
+    .status_code(StatusCode::BAD_REQUEST)?;
 
   // Users outside their whitelist are rejected
   // before the exchange has any effect on them.
@@ -109,7 +117,6 @@ mod tests {
   use std::sync::Mutex;
 
   use anyhow::anyhow;
-  use axum::http::StatusCode;
   use mogh_auth_client::config::{
     ExternalLoginProviderConfig, OidcConfig, TokenExchangeConfig,
   };

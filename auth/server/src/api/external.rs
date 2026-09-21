@@ -27,9 +27,12 @@ use crate::{
     unique_username, user_id_or_two_factor_redirect,
   },
   middleware::check_user_cidr_whitelist,
-  provider::external::{
-    BuiltProvider, CompletedExternalLogin, SessionExternalLogin,
-    load_built_provider, resolve_external_provider,
+  provider::{
+    external::{
+      BuiltProvider, CompletedExternalLogin, SessionExternalLogin,
+      load_built_provider, resolve_external_provider,
+    },
+    load_cache::LoadFailedRecently,
   },
   session::Session,
   validations::constant_time_eq,
@@ -141,12 +144,16 @@ pub(crate) async fn load_provider_client<I: AuthImpl + ?Sized>(
   )
   .await
   .map_err(|e| {
-    error!(
-      provider_id = provider.id,
-      provider = provider.name,
-      "Failed to initialize external login provider | {e:#}"
-    );
+    // Logged once per attempt, not by every request while it is down.
+    if !LoadFailedRecently::is(&e) {
+      error!(
+        provider_id = provider.id,
+        provider = provider.name,
+        "Failed to initialize external login provider | {e:#}"
+      );
+    }
     anyhow!("Login provider '{}' is not available", provider.name)
+      .status_code(StatusCode::SERVICE_UNAVAILABLE)
   })?;
 
   Ok(built)
@@ -771,7 +778,7 @@ mod tests {
       .await
       .err()
       .unwrap();
-    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
     let message = format!("{:#}", err.error);
     assert!(message.contains("not available"), "{message}");
     assert!(!message.contains("client_secret"), "{message}");

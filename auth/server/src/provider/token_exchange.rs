@@ -33,6 +33,46 @@ pub struct TokenVerificationKeys {
 }
 
 impl TokenVerificationKeys {
+  /// For issuers without provider metadata (workload identity).
+  /// Any asymmetric algorithm the keys support is accepted.
+  pub fn new(issuer: IssuerUrl, jwks: CoreJsonWebKeySet) -> Self {
+    use CoreJwsSigningAlgorithm::*;
+    Self {
+      issuer,
+      jwks,
+      signing_algs: vec![
+        RsaSsaPkcs1V15Sha256,
+        RsaSsaPkcs1V15Sha384,
+        RsaSsaPkcs1V15Sha512,
+        EcdsaP256Sha256,
+        EcdsaP384Sha384,
+        EcdsaP521Sha512,
+        RsaSsaPssSha256,
+        RsaSsaPssSha384,
+        RsaSsaPssSha512,
+        EdDsa,
+      ],
+    }
+  }
+
+  /// [Self::verify], returning all the claims of the token.
+  pub fn verify_payload(
+    &self,
+    token: &str,
+    audiences: &[String],
+    max_age_secs: u64,
+  ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    self.verify::<openidconnect::EmptyAdditionalClaims>(
+      token,
+      audiences,
+      &[],
+      max_age_secs,
+    )?;
+    // Authentic, as the token is verified.
+    unverified_payload(token)
+      .context("Token payload is not an object")
+  }
+
   pub fn from_metadata(metadata: &CoreProviderMetadata) -> Self {
     Self {
       issuer: metadata.issuer().clone(),
@@ -104,6 +144,7 @@ impl TokenVerificationKeys {
               "Security event tokens (eg. logout tokens) can't be exchanged"
             ));
           }
+          check_not_before(raw_token, unix_timestamp_secs())?;
           check_token_age(
             claims.issue_time().timestamp(),
             unix_timestamp_secs(),
@@ -127,6 +168,25 @@ fn unix_timestamp_secs() -> i64 {
     .duration_since(std::time::UNIX_EPOCH)
     .map(|duration| duration.as_secs() as i64)
     .unwrap_or_default()
+}
+
+/// `nbf` is not part of ID tokens, so the jwt library doesn't
+/// check it, but platforms issuing workload tokens set it.
+fn check_not_before(token: &str, now: i64) -> anyhow::Result<()> {
+  // Some issuers write timestamps as floats
+  let not_before = unverified_payload(token).and_then(|payload| {
+    let nbf = payload.get("nbf")?;
+    nbf.as_i64().or_else(|| nbf.as_f64().map(|nbf| nbf as i64))
+  });
+  match not_before {
+    Some(not_before)
+      if not_before
+        > now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) =>
+    {
+      Err(anyhow!("Token is not valid yet (nbf)"))
+    }
+    _ => Ok(()),
+  }
 }
 
 /// `max_age_secs` of 0 is no limit.
@@ -246,6 +306,22 @@ pub(crate) mod test_tokens {
       pem,
       Some(JsonWebKeyId::new("test-key".to_string())),
     )
+    .unwrap()
+  }
+
+  /// The key set publishing the key of [Signer::Provider], as json.
+  pub fn jwks_json() -> String {
+    serde_json::to_string(&CoreJsonWebKeySet::new(vec![
+      rsa_key(KEY_A).as_verification_key(),
+    ]))
+    .unwrap()
+  }
+
+  /// A key set publishing the key of [Signer::Other] instead.
+  pub fn other_jwks_json() -> String {
+    serde_json::to_string(&CoreJsonWebKeySet::new(vec![
+      rsa_key(KEY_B).as_verification_key(),
+    ]))
     .unwrap()
   }
 
@@ -570,6 +646,27 @@ mod tests {
     assert!(verify(Duration::hours(-1), 300).is_err());
     // Without a limit the issue time is not judged at all
     assert!(verify(Duration::hours(-1), 0).is_ok());
+  }
+
+  #[test]
+  fn test_not_before() {
+    let token = |nbf: i64| {
+      let payload = BASE64URL_NOPAD
+        .encode(format!(r#"{{"nbf":{nbf}}}"#).as_bytes());
+      format!("header.{payload}.signature")
+    };
+    let now = 1_800_000_000;
+    assert!(check_not_before(&token(now - 10), now).is_ok());
+    assert!(check_not_before(&token(now + 30), now).is_ok());
+    assert!(check_not_before(&token(now + 3600), now).is_err());
+    assert!(check_not_before(&token(i64::MAX), now).is_err());
+    let float = format!(
+      "header.{}.signature",
+      BASE64URL_NOPAD.encode(br#"{"nbf":9999999999.5}"#)
+    );
+    assert!(check_not_before(&float, now).is_err());
+    // Tokens without nbf
+    assert!(check_not_before("header.e30.signature", now).is_ok());
   }
 
   #[test]

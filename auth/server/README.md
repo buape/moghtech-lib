@@ -586,3 +586,125 @@ continue, and rejects users who need a second factor for external logins.
 - Users who need a second factor for external logins are rejected
   by `/token`, and continue with it using `ExchangeExternalForJwt`.
 - Errors use the OAuth format: `{"error":"invalid_grant","error_description":"..."}`.
+
+### Workload identity
+
+Machines can use the same `/token` endpoint: a CI job or Kubernetes service
+account exchanges the short lived token its platform issues it for a short
+lived app token, so it doesn't need an api key stored as a secret.
+
+Instead of a login provider this uses a `TrustedIssuer`, which only needs
+the keys the platform signs with, and rules deciding which tokens are accepted:
+
+```rust
+fn static_trusted_issuers(&self) -> Vec<TrustedIssuer> {
+  vec![TrustedIssuer {
+    id: String::from("github-actions"),
+    name: String::from("Github Actions"),
+    enabled: true,
+    issuer: String::from("https://token.actions.githubusercontent.com"),
+    // Or `JwksUri(url)`, or `Static(jwks_json)` for issuers the server can't
+    // reach, like most clusters: `kubectl get --raw /openid/v1/jwks`
+    keys: TrustedIssuerKeys::Discovery {},
+    // ⚠️ An audience specific to this app, which the workload requests its
+    // token for. The platform default is shared with every other service.
+    audiences: vec![String::from("https://app.example.com")],
+    max_token_age_secs: 300,
+    rules: vec![WorkloadRule {
+      id: String::from("deploy"),
+      name: String::from("Deploy"),
+      enabled: true,
+      // All have to match, `*` is a wildcard. Prefer ids over names.
+      claims: vec![
+        WorkloadClaim { claim: "repository_id".into(), pattern: "12345".into() },
+        WorkloadClaim { claim: "ref".into(), pattern: "refs/heads/release/*".into() },
+      ],
+      groups: vec![String::from("deployers")],
+      admin: false,
+      token_ttl_secs: 900,
+    }],
+  }]
+}
+```
+
+Keys which are fetched are cached for 5 minutes. The same goes for the
+discovery data of login providers (OIDC 1 minute, Google 1 hour), and both
+are loaded the same way, as they are loaded on demand by unauthenticated requests:
+
+- Concurrent requests share one load, eg. a CI matrix starting many jobs at once.
+- A load is given 15 seconds, so a hanging server can't block the others waiting on it.
+- A failed load is only tried again after 30 seconds. Requests in between
+  get `503` right away (`temporarily_unavailable` from `/token`), and the
+  reason is logged once per attempt, not by every request.
+- While the source can't be reached, what was loaded before stays in use for
+  up to an hour, so a short outage doesn't stop every login or workload.
+
+Issuers can also be stored by the app and managed by admins over the API
+(`ListTrustedIssuers`, `CreateTrustedIssuer`, ...), with the same storage
+methods as for login providers (`list_trusted_issuers`, `create_trusted_issuer`, ...).
+
+Each rule has its own user, which the app provides:
+
+```rust
+fn get_or_create_workload_user(
+  &self,
+  identity: WorkloadIdentity,
+) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
+  Box::pin(async move {
+    // One user per (issuer_id, rule_id). Apply the groups and admin
+    // status every time, they are the full definition of the user.
+    let user = get_or_create_service_user(
+      &identity.issuer_id,
+      &identity.rule_id,
+      &identity.rule_name,
+    )
+    .await?;
+    set_user_groups(&user.id, identity.groups).await?;
+    set_user_admin(&user.id, identity.admin).await?;
+    // `identity.claims` tell which repository / run / service account it was.
+    Ok(user.id)
+  })
+}
+```
+
+- That user must report `AuthUserImpl::is_workload`, otherwise the exchange
+  is refused. Workload users are refused by the whole auth management API,
+  so a workload can't create an api key (or password, 2fa, linked login,
+  login provider, ...) which outlives its rule. ⚠️ Apps with their own ways to
+  create credentials must refuse workload users there as well.
+- Rules of static issuers need an `id` which is unique within the issuer,
+  it identifies the user of the rule. Tokens matching a rule without one
+  are refused. Ids of rules managed over the API are generated.
+- An admin user is only accepted if the rule has `admin` set.
+- The user cidr whitelist applies. Users requiring a second factor are refused.
+- The app token is valid for `token_ttl_secs`, capped at the app default.
+- Every exchange is logged with the issuer, rule, subject and matched claims.
+
+⚠️ **Rate limiting and shared runners.** Failed exchanges count against
+`AuthImpl::general_rate_limiter` by client ip, like failed logins. Hosted CI
+runners (eg. Github's) share their ips between many customers and jobs, so with a
+strict limit one misconfigured job failing repeatedly, or anyone else running jobs
+on the same runners and sending tokens no rule accepts, can get the ip limited and
+make your other jobs fail with `429` / `temporarily_unavailable` for a while.
+If workloads come from shared ips, keep the failure limit generous, make jobs
+retry an exchange with a delay rather than in a tight loop, or use self hosted
+runners with their own ips. Successful exchanges are never rate limited.
+
+Github Actions:
+
+```yaml
+permissions:
+  id-token: write
+steps:
+  - run: |
+      ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+        "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://app.example.com" | jq -r .value)
+      APP_TOKEN=$(curl -s https://app.example.com/auth/token \
+        -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+        -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+        -d subject_token=$ID_TOKEN | jq -r .access_token)
+```
+
+Kubernetes, with a projected service account token for the audience
+(`serviceAccountToken: { audience: https://app.example.com, path: token }`),
+matching eg. `sub` = `system:serviceaccount:<namespace>:<name>`.

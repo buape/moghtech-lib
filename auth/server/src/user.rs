@@ -39,6 +39,21 @@ pub trait AuthUserImpl: Send + Sync + 'static {
     false
   }
 
+  /// Whether this is the user of a workload
+  /// ([AuthImpl::get_or_create_workload_user][crate::AuthImpl::get_or_create_workload_user]),
+  /// which only ever acts through short lived tokens it gets by
+  /// token exchange.
+  ///
+  /// Workload users are refused by the auth management API
+  /// (api keys, passwords, 2fa, linked logins, login providers, ...),
+  /// so a workload can't create a credential which outlives its rule.
+  ///
+  /// ⚠️ Apps with their own ways to create credentials
+  /// (eg. api keys) must refuse these users there as well.
+  fn is_workload(&self) -> bool {
+    false
+  }
+
   /// Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
   /// from which user logins / api calls are accepted.
   /// Empty means all ips allowed.

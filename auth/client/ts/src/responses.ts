@@ -25,6 +25,11 @@ export type ManageResponses = {
   CreateExternalLoginProvider: Types.CreateExternalLoginProviderResponse;
   UpdateExternalLoginProvider: Types.UpdateExternalLoginProviderResponse;
   DeleteExternalLoginProvider: Types.DeleteExternalLoginProviderResponse;
+  // Trusted issuers for workload identity (admin)
+  ListTrustedIssuers: Types.ListTrustedIssuersResponse;
+  CreateTrustedIssuer: Types.CreateTrustedIssuerResponse;
+  UpdateTrustedIssuer: Types.UpdateTrustedIssuerResponse;
+  DeleteTrustedIssuer: Types.DeleteTrustedIssuerResponse;
   // Passkey
   BeginPasskeyEnrollment: Types.BeginPasskeyEnrollmentResponse;
   ConfirmPasskeyEnrollment: Types.ConfirmPasskeyEnrollmentResponse;

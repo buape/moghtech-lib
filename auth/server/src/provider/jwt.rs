@@ -125,9 +125,19 @@ impl JwtProvider {
   }
 
   pub fn encode_sub(&self, sub: &str) -> anyhow::Result<JwtResponse> {
+    self.encode_sub_with_ttl(sub, self.ttl_ms)
+  }
+
+  /// Encodes a token which is valid for a shorter time than
+  /// the default. `ttl_ms` is capped at [Self::ttl_ms].
+  pub fn encode_sub_with_ttl(
+    &self,
+    sub: &str,
+    ttl_ms: u128,
+  ) -> anyhow::Result<JwtResponse> {
     let iat =
       SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let exp = iat + self.ttl_ms;
+    let exp = iat + ttl_ms.min(self.ttl_ms);
     let claims = BorrowedJwtClaims {
       sub,
       iss: &self.iss,
@@ -216,6 +226,27 @@ mod tests {
     let provider = JwtProvider::new(SECRET, 60_000);
     let jwt = provider.encode_sub("user-123").unwrap().jwt;
     assert_eq!(provider.decode_sub(&jwt).unwrap(), "user-123");
+  }
+
+  #[test]
+  fn test_encode_sub_with_ttl_is_capped_at_default() {
+    let provider = JwtProvider::new(b"secret", 60_000);
+    let claims = |jwt: &str| {
+      decode::<JwtClaims>(
+        jwt,
+        &provider.decoding_key,
+        provider.validation(),
+      )
+      .unwrap()
+      .claims
+    };
+    let short = provider.encode_sub_with_ttl("user", 1_000).unwrap();
+    let short = claims(&short.jwt);
+    assert_eq!(short.exp, short.iat + 1_000);
+    let long =
+      provider.encode_sub_with_ttl("user", u128::MAX).unwrap();
+    let long = claims(&long.jwt);
+    assert_eq!(long.exp, long.iat + 60_000);
   }
 
   #[test]

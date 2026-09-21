@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{Router, extract::Path, routing::post};
 use mogh_auth_client::api::{NoData, manage::*};
-use mogh_error::Json;
+use mogh_error::{AddStatusCodeError as _, Json};
 use mogh_resolver::Resolve;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,6 +18,7 @@ use crate::{
 
 pub mod api_key;
 pub mod external;
+pub mod issuer;
 pub mod local;
 pub mod passkey;
 pub mod provider;
@@ -57,6 +58,11 @@ pub enum ManageRequest {
   CreateExternalLoginProvider(CreateExternalLoginProvider),
   UpdateExternalLoginProvider(UpdateExternalLoginProvider),
   DeleteExternalLoginProvider(DeleteExternalLoginProvider),
+  // Trusted issuers for workload identity (admin)
+  ListTrustedIssuers(ListTrustedIssuers),
+  CreateTrustedIssuer(CreateTrustedIssuer),
+  UpdateTrustedIssuer(UpdateTrustedIssuer),
+  DeleteTrustedIssuer(DeleteTrustedIssuer),
   // Passkey
   BeginPasskeyEnrollment(BeginPasskeyEnrollment),
   ConfirmPasskeyEnrollment(ConfirmPasskeyEnrollment),
@@ -112,6 +118,8 @@ async fn handler<I: AuthImpl>(
     username,
   );
 
+  check_not_workload(user.as_ref().as_ref(), &request)?;
+
   let args = ManageArgs {
     auth: Box::new(I::new()),
     user,
@@ -131,6 +139,28 @@ async fn handler<I: AuthImpl>(
   }
 
   res.map(|res| res.0)
+}
+
+/// Workloads only act through the short lived tokens they get by token
+/// exchange. Everything here either creates a way to log in which
+/// outlives that (api keys, passwords, 2fa, linked logins) or configures
+/// who can log in, so all of it is refused, including any request added
+/// in the future.
+fn check_not_workload(
+  user: &dyn crate::user::AuthUserImpl,
+  request: &ManageRequest,
+) -> mogh_error::Result<()> {
+  if !user.is_workload()
+    || matches!(request, ManageRequest::GetUserId(_))
+  {
+    return Ok(());
+  }
+  Err(
+    anyhow::anyhow!(
+      "Workload users can't use the auth management API"
+    )
+    .status_code(axum::http::StatusCode::FORBIDDEN),
+  )
 }
 
 impl Resolve<ManageArgs> for GetUserId {
@@ -157,5 +187,97 @@ impl Resolve<ManageArgs> for UpdateExternalSkip2fa {
       )
       .await?;
     Ok(NoData {})
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use axum::http::StatusCode;
+  use mogh_auth_client::config::{
+    ExternalLoginProviderConfig, NamedOauthConfig,
+  };
+
+  use super::*;
+  use crate::user::AuthUserImpl;
+
+  struct TestUser {
+    workload: bool,
+  }
+
+  impl AuthUserImpl for TestUser {
+    fn id(&self) -> &str {
+      "id"
+    }
+    fn username(&self) -> &str {
+      "user"
+    }
+    fn is_workload(&self) -> bool {
+      self.workload
+    }
+    // Even an admin workload can't configure logins
+    fn is_admin(&self) -> bool {
+      true
+    }
+  }
+
+  /// One of each kind of request.
+  fn requests() -> Vec<ManageRequest> {
+    vec![
+      ManageRequest::UpdatePassword(UpdatePassword {
+        password: "password".into(),
+      }),
+      ManageRequest::BeginExternalLoginLink(
+        BeginExternalLoginLink {},
+      ),
+      ManageRequest::BeginPasskeyEnrollment(
+        BeginPasskeyEnrollment {},
+      ),
+      ManageRequest::BeginTotpEnrollment(BeginTotpEnrollment {}),
+      ManageRequest::CreateApiKey(CreateApiKey {
+        name: "key".into(),
+        expires: 0,
+        cidr_whitelist: Vec::new(),
+      }),
+      ManageRequest::CreateExternalLoginProvider(
+        CreateExternalLoginProvider {
+          name: "Github".into(),
+          registration_disabled: false,
+          token_exchange: Default::default(),
+          config: ExternalLoginProviderConfig::Github(
+            NamedOauthConfig::default(),
+          ),
+        },
+      ),
+      ManageRequest::ListTrustedIssuers(ListTrustedIssuers {}),
+      ManageRequest::DeleteTrustedIssuer(DeleteTrustedIssuer {
+        id: "id".into(),
+      }),
+    ]
+  }
+
+  #[test]
+  fn test_workload_users_are_refused() {
+    let workload = TestUser { workload: true };
+    for request in requests() {
+      let method: ManageRequestMethod = (&request).into();
+      let err = check_not_workload(&workload, &request).unwrap_err();
+      assert_eq!(err.status, StatusCode::FORBIDDEN, "{method}");
+    }
+    // Harmless, and lets a workload check who it is
+    assert!(
+      check_not_workload(
+        &workload,
+        &ManageRequest::GetUserId(GetUserId {})
+      )
+      .is_ok()
+    );
+  }
+
+  #[test]
+  fn test_other_users_are_not_affected() {
+    let user = TestUser { workload: false };
+    for request in requests() {
+      assert!(check_not_workload(&user, &request).is_ok());
+    }
   }
 }
