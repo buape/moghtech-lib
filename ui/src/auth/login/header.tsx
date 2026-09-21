@@ -1,14 +1,10 @@
-import {
-  Button,
-  Group,
-  Stack,
-  Text,
-  useComputedColorScheme,
-} from "@mantine/core";
-import { KeyRound } from "lucide-react";
-import * as MoghAuth from "mogh_auth_client";
+import { Group, Stack, Text } from "@mantine/core";
 import { LoginBrandingProps } from ".";
-import { authClient, useLoginOptions } from "../..";
+import { useLoginOptions } from "../..";
+import {
+  LoginProviderButton,
+  MAX_HEADER_LOGIN_PROVIDERS,
+} from "./providers";
 
 export default function LoginHeader({
   secondFactorPending,
@@ -18,8 +14,7 @@ export default function LoginHeader({
 }: {
   secondFactorPending: boolean;
 } & LoginBrandingProps) {
-  const options = useLoginOptions().data;
-  const theme = useComputedColorScheme();
+  const providers = useLoginOptions().data?.providers ?? [];
   return (
     <Group justify="space-between">
       <Group gap="sm">
@@ -33,44 +28,19 @@ export default function LoginHeader({
           </Text>
         </Stack>
       </Group>
-      <Group gap="sm">
-        {(
-          [
-            [options?.oidc, "Oidc"],
-            [options?.github, "Github"],
-            [options?.google, "Google"],
-          ] as Array<
-            [boolean | undefined, MoghAuth.Types.ExternalLoginProvider]
-          >
-        ).map(
-          ([enabled, provider]) =>
-            enabled && (
-              <Button
-                key={provider}
-                onClick={() => authClient().externalLogin(provider)}
-                leftSection={
-                  provider === "Oidc" ? (
-                    <KeyRound size="1rem" />
-                  ) : (
-                    <img
-                      src={`/icons/${provider.toLowerCase()}.svg`}
-                      alt={provider}
-                      style={{
-                        width: "1rem",
-                        height: "1rem",
-                        filter: theme === "dark" ? "invert(1)" : undefined,
-                      }}
-                    />
-                  )
-                }
-                w={110}
-                disabled={secondFactorPending}
-              >
-                {provider}
-              </Button>
-            ),
-        )}
-      </Group>
+      {providers.length <= MAX_HEADER_LOGIN_PROVIDERS && (
+        <Group gap="sm">
+          {providers.map((provider) => (
+            <LoginProviderButton
+              key={provider.id}
+              provider={provider}
+              miw={110}
+              maw={180}
+              disabled={secondFactorPending}
+            />
+          ))}
+        </Group>
+      )}
     </Group>
   );
 }

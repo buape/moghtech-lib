@@ -17,7 +17,13 @@ export type ManageResponses = {
   UpdatePassword: Types.UpdatePasswordResponse;
   // External
   BeginExternalLoginLink: Types.BeginExternalLoginLinkResponse;
-  UnlinkLogin: Types.UnlinkLoginResponse;
+  UnlinkLocalLogin: Types.UnlinkLocalLoginResponse;
+  UnlinkExternalLogin: Types.UnlinkExternalLoginResponse;
+  // External login providers (admin)
+  ListExternalLoginProviders: Types.ListExternalLoginProvidersResponse;
+  CreateExternalLoginProvider: Types.CreateExternalLoginProviderResponse;
+  UpdateExternalLoginProvider: Types.UpdateExternalLoginProviderResponse;
+  DeleteExternalLoginProvider: Types.DeleteExternalLoginProviderResponse;
   // Passkey
   BeginPasskeyEnrollment: Types.BeginPasskeyEnrollmentResponse;
   ConfirmPasskeyEnrollment: Types.ConfirmPasskeyEnrollmentResponse;

@@ -96,20 +96,37 @@ fn validate_config(
       .status_code(StatusCode::BAD_REQUEST),
     );
   }
-  if let ExternalLoginProviderConfig::Oidc(config) = config {
-    if !config.provider.is_empty() {
-      validate_http_url("provider", &config.provider)
-        .status_code(StatusCode::BAD_REQUEST)?;
+  match config {
+    ExternalLoginProviderConfig::Oidc(config) => {
+      if !config.provider.is_empty() {
+        validate_http_url("provider", &config.provider)
+          .status_code(StatusCode::BAD_REQUEST)?;
+      }
+      if !config.redirect_host.is_empty() {
+        validate_http_url("redirect_host", &config.redirect_host)
+          .status_code(StatusCode::BAD_REQUEST)?;
+      }
     }
-    if !config.redirect_host.is_empty() {
-      validate_http_url("redirect_host", &config.redirect_host)
-        .status_code(StatusCode::BAD_REQUEST)?;
+    // Unlike OIDC (public clients using PKCE), these can't work
+    // without a secret. Enabled, they would show a login
+    // button which always fails.
+    ExternalLoginProviderConfig::Github(config)
+    | ExternalLoginProviderConfig::Google(config) => {
+      if config.enabled && config.client_secret.is_empty() {
+        return Err(
+          anyhow!(
+            "A client secret is required to enable this provider"
+          )
+          .status_code(StatusCode::BAD_REQUEST),
+        );
+      }
     }
   }
   Ok(())
 }
 
-/// An empty or redacted client secret keeps the existing one.
+/// An empty or redacted client secret keeps the existing one,
+/// unless it is explicitly cleared.
 ///
 /// The secret is sent to the token endpoint the OIDC provider url
 /// points to. If the url changes, the secret has to be entered again,
@@ -118,9 +135,25 @@ fn validate_config(
 fn keep_existing_secret(
   config: &mut ExternalLoginProviderConfig,
   existing: &ExternalLoginProviderConfig,
+  clear: bool,
 ) -> mogh_error::Result<()> {
   let secret = config.client_secret();
-  if !secret.is_empty() && secret != REDACTED {
+  let new_secret = !secret.is_empty() && secret != REDACTED;
+  if clear {
+    if new_secret {
+      return Err(
+        anyhow!(
+          "Cannot both clear the client secret and set a new one"
+        )
+        .status_code(StatusCode::BAD_REQUEST),
+      );
+    }
+    // Nothing is kept, so there is nothing to protect
+    // if the provider url changes at the same time.
+    config.client_secret_mut().clear();
+    return Ok(());
+  }
+  if new_secret {
     return Ok(());
   }
   if let (
@@ -241,6 +274,7 @@ async fn resolve_managed_provider<I: AuthImpl + ?Sized>(
 fn merge_update(
   config: &mut ExternalLoginProviderConfig,
   existing: &ExternalLoginProviderConfig,
+  clear_client_secret: bool,
 ) -> mogh_error::Result<()> {
   // The external user ids linked to the provider
   // only have meaning for the same kind.
@@ -252,7 +286,7 @@ fn merge_update(
       .status_code(StatusCode::BAD_REQUEST),
     );
   }
-  keep_existing_secret(config, existing)?;
+  keep_existing_secret(config, existing, clear_client_secret)?;
   validate_config(config)
 }
 
@@ -269,7 +303,11 @@ pub async fn update_provider<I: AuthImpl + ?Sized>(
     resolve_managed_provider(auth, &request.id).await?;
 
   // Wipe the secrets held here however the checks turn out.
-  let merged = merge_update(&mut request.config, &existing.config);
+  let merged = merge_update(
+    &mut request.config,
+    &existing.config,
+    request.clear_client_secret,
+  );
   existing.config.zeroize();
   if let Err(e) = merged {
     request.config.zeroize();
@@ -510,6 +548,7 @@ mod tests {
       name: "Renamed".into(),
       registration_disabled: true,
       config,
+      clear_client_secret: false,
     }
   }
 
@@ -708,6 +747,107 @@ mod tests {
     .await
     .unwrap();
     assert_eq!(stored_secret(&auth, &id), "new");
+  }
+
+  #[tokio::test]
+  async fn test_update_clear_secret() {
+    let auth = TestAuth::default();
+    let id = create_provider(
+      &auth,
+      &ADMIN,
+      CreateExternalLoginProvider {
+        name: "OIDC".into(),
+        registration_disabled: false,
+        config: oidc_config("https://idp.example.com", "secret"),
+      },
+    )
+    .await
+    .unwrap()
+    .provider
+    .id;
+
+    // Clearing together with a new secret is ambiguous
+    let err = update_provider(
+      &auth,
+      &ADMIN,
+      UpdateExternalLoginProvider {
+        clear_client_secret: true,
+        ..update_request(
+          &id,
+          oidc_config("https://idp.example.com", "other"),
+        )
+      },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(stored_secret(&auth, &id), "secret");
+
+    // The redacted value sent back by the UI counts as no new secret.
+    // Nothing is kept, so the url can change in the same update.
+    let item = update_provider(
+      &auth,
+      &ADMIN,
+      UpdateExternalLoginProvider {
+        clear_client_secret: true,
+        ..update_request(
+          &id,
+          oidc_config("https://new.example.com", REDACTED),
+        )
+      },
+    )
+    .await
+    .unwrap();
+    assert_eq!(item.provider.config.client_secret(), "");
+    assert_eq!(stored_secret(&auth, &id), "");
+  }
+
+  #[tokio::test]
+  async fn test_named_provider_needs_secret_to_be_enabled() {
+    let auth = TestAuth::default();
+    let err = create_provider(&auth, &ADMIN, create_request(""))
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+
+    let id = create_provider(&auth, &ADMIN, create_request("secret"))
+      .await
+      .unwrap()
+      .provider
+      .id;
+
+    // Can't clear the secret of an enabled provider
+    let err = update_provider(
+      &auth,
+      &ADMIN,
+      UpdateExternalLoginProvider {
+        clear_client_secret: true,
+        ..update_request(&id, github_config(""))
+      },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(stored_secret(&auth, &id), "secret");
+
+    // Disabled it can, eg. to remove a leaked secret from storage
+    let disabled =
+      ExternalLoginProviderConfig::Github(NamedOauthConfig {
+        enabled: false,
+        client_id: "client-id".into(),
+        client_secret: String::new(),
+      });
+    update_provider(
+      &auth,
+      &ADMIN,
+      UpdateExternalLoginProvider {
+        clear_client_secret: true,
+        ..update_request(&id, disabled)
+      },
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_secret(&auth, &id), "");
   }
 
   #[tokio::test]

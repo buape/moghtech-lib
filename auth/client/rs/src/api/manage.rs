@@ -535,6 +535,7 @@ fn update_external_login_provider() {}
 /// - The kind of the provider cannot be changed.
 /// - If the client secret is empty or the redacted value from
 ///   [ListExternalLoginProviders], the existing secret is kept.
+///   Pass `clear_client_secret` to remove it instead.
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -551,6 +552,13 @@ pub struct UpdateExternalLoginProvider {
   pub registration_disabled: bool,
   /// The kind specific provider configuration.
   pub config: ExternalLoginProviderConfig,
+  /// Remove the stored client secret, eg. to switch an OIDC
+  /// provider to a public client using PKCE. An empty client
+  /// secret on its own keeps the stored secret.
+  ///
+  /// Cannot be combined with a new client secret.
+  #[serde(default)]
+  pub clear_client_secret: bool,
 }
 
 #[typeshare]
@@ -985,6 +993,19 @@ mod tests {
     })
     .unwrap();
     assert_eq!(value, json!({ "provider_id": "oidc" }));
+  }
+
+  #[test]
+  fn test_update_external_login_provider_clear_secret_defaults_false()
+  {
+    let request: UpdateExternalLoginProvider =
+      serde_json::from_value(json!({
+        "id": "abc",
+        "name": "Github",
+        "config": { "kind": "Github", "params": {} },
+      }))
+      .unwrap();
+    assert!(!request.clear_client_secret);
   }
 
   #[test]

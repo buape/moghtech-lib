@@ -9,6 +9,7 @@ import { sanitizeQueryInner } from "./utils";
 
 export * from "./login";
 export * from "./profile";
+export * from "./providers";
 export * from "./utils";
 
 export let AUTH_URL: string;
@@ -30,6 +31,20 @@ export function useLoginOptions() {
   return useQuery({
     queryKey: ["GetLoginOptions"],
     queryFn: () => authClient().login("GetLoginOptions", {}),
+  });
+}
+
+/**
+ * List all the external login providers, including disabled ones.
+ * Only available to admin users.
+ */
+export function useExternalLoginProviders(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: ["ListExternalLoginProviders"],
+    queryFn: () => authClient().manage("ListExternalLoginProviders", {}),
+    enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
+    // A user who isn't an admin gets the same answer every time
+    retry: false,
   });
 }
 

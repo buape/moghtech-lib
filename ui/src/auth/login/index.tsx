@@ -1,10 +1,12 @@
 import {
   Button,
   Center,
+  Divider,
   Fieldset,
   Group,
   Loader,
   PasswordInput,
+  SimpleGrid,
   Text,
   TextInput,
 } from "@mantine/core";
@@ -14,6 +16,9 @@ import * as MoghAuth from "mogh_auth_client";
 import { AlertTriangle, KeyRound } from "lucide-react";
 import { useEffect, useState } from "react";
 import LoginHeader from "./header";
+import { LoginProviderButton, MAX_HEADER_LOGIN_PROVIDERS } from "./providers";
+
+export * from "./providers";
 import {
   authClient,
   BackButton,
@@ -59,15 +64,15 @@ export function LoginPage({
   const userId = useUserId({ enabled: _alreadyLoggedIn === undefined });
   const alreadyLoggedIn = _alreadyLoggedIn ?? !!userId.data?.id;
 
-  // Auto-redirect to OIDC provider if configured and disableAutoLogin is not set
+  // Auto-redirect to the configured provider if disableAutoLogin is not set
   useEffect(() => {
-    if (options?.oidc_auto_redirect && options?.oidc && !secondFactorPending) {
+    if (options?.auto_redirect && !secondFactorPending) {
       const params = new URLSearchParams(location.search);
       if (!params.has("disableAutoLogin")) {
-        authClient().externalLogin(MoghAuth.Types.ExternalLoginProvider.Oidc);
+        authClient().externalLogin(options.auto_redirect);
       }
     }
-  }, [options?.oidc_auto_redirect, options?.oidc, secondFactorPending]);
+  }, [options?.auto_redirect, secondFactorPending]);
 
   // If signing in another user, need to redirect away from /login manually
   const maybeNavigate = location.pathname.startsWith("/login")
@@ -133,9 +138,14 @@ export function LoginPage({
     },
   );
 
+  const providers = options?.providers ?? [];
+
+  // The header only has room for a few providers
+  const providersInForm =
+    providers.length > MAX_HEADER_LOGIN_PROVIDERS && !secondFactorPending;
+
   const noAuthConfigured =
-    options !== undefined &&
-    Object.values(options).every((value) => value === false);
+    options !== undefined && !options.local && providers.length === 0;
 
   const showSignUp = options !== undefined && !options.registration_disabled;
 
@@ -225,6 +235,24 @@ export function LoginPage({
                 </Button>
               </Group>
             </Group>
+          </>
+        )}
+
+        {providersInForm && (
+          <>
+            {options?.local && (
+              <Divider label="Or continue with" labelPosition="center" />
+            )}
+            <SimpleGrid cols={{ base: 1, xs: 2 }} spacing="sm">
+              {providers.map((provider) => (
+                <LoginProviderButton
+                  key={provider.id}
+                  provider={provider}
+                  variant="default"
+                  fullWidth
+                />
+              ))}
+            </SimpleGrid>
           </>
         )}
 
