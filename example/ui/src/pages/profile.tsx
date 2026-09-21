@@ -1,0 +1,363 @@
+import {
+  ActionIcon,
+  Badge,
+  Button,
+  Code,
+  Fieldset,
+  Group,
+  Modal,
+  PasswordInput,
+  SegmentedControl,
+  Stack,
+  Table,
+  Text,
+  Textarea,
+  TextInput,
+} from "@mantine/core";
+import { notifications } from "@mantine/notifications";
+import {
+  CopyButton,
+  EnableSwitch,
+  EnrollPasskey,
+  EnrollTotp,
+  LinkedLogins,
+  Page,
+  Section,
+  useManageAuth,
+} from "mogh_ui";
+import { KeyRound, Plus, Trash, User } from "lucide-react";
+import { useState } from "react";
+import {
+  useInvalidate,
+  useRead,
+  useUser,
+  useUserInvalidate,
+  useWrite,
+} from "@/lib/hooks";
+
+export default function Profile() {
+  const user = useUser().data;
+  const refetchUser = useUserInvalidate();
+  const { mutate: updateExternalSkip2fa } = useManageAuth(
+    "UpdateExternalSkip2fa",
+    { onSuccess: refetchUser },
+  );
+  if (!user) return null;
+  return (
+    <Page title="Profile" icon={User}>
+      <Credentials username={user.username} refetchUser={refetchUser} />
+
+      <LinkedLogins
+        refetchUser={refetchUser}
+        passwordSet={user.has_password}
+        linkedLogins={user.linked_logins}
+      />
+
+      <Fieldset legend={<Text size="lg">2FA</Text>}>
+        <Group>
+          <EnrollPasskey
+            userInvalidate={refetchUser}
+            passkeyEnrolled={user.passkey_enrolled}
+            totpEnrolled={user.totp_enrolled}
+          />
+          <EnrollTotp
+            userInvalidate={refetchUser}
+            passkeyEnrolled={user.passkey_enrolled}
+            totpEnrolled={user.totp_enrolled}
+          />
+          {(user.totp_enrolled || user.passkey_enrolled) && (
+            <EnableSwitch
+              label="Skip 2FA for external logins"
+              checked={user.external_skip_2fa}
+              onCheckedChange={(external_skip_2fa) =>
+                updateExternalSkip2fa({ external_skip_2fa })
+              }
+            />
+          )}
+        </Group>
+      </Fieldset>
+
+      <ApiKeys />
+
+      <CidrWhitelist
+        key={user.cidr_whitelist.join(",")}
+        current={user.cidr_whitelist}
+        refetchUser={refetchUser}
+      />
+    </Page>
+  );
+}
+
+function Credentials({
+  username: current,
+  refetchUser,
+}: {
+  username: string;
+  refetchUser: () => void;
+}) {
+  const [username, setUsername] = useState(current);
+  const [password, setPassword] = useState("");
+  const { mutate: updateUsername } = useManageAuth("UpdateUsername", {
+    onSuccess: () => {
+      notifications.show({ message: "Username updated.", color: "green" });
+      refetchUser();
+    },
+  });
+  const { mutate: updatePassword } = useManageAuth("UpdatePassword", {
+    onSuccess: () => {
+      notifications.show({ message: "Password updated.", color: "green" });
+      setPassword("");
+      refetchUser();
+    },
+  });
+  return (
+    <Section title="Credentials" titleFz="h3" withBorder>
+      <Group align="end">
+        <TextInput
+          label="Username"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <Button
+          variant="default"
+          disabled={!username || username === current}
+          onClick={() => updateUsername({ username })}
+        >
+          Update Username
+        </Button>
+      </Group>
+      <Group align="end">
+        <PasswordInput
+          label="New Password"
+          w={250}
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        <Button
+          variant="default"
+          disabled={!password}
+          onClick={() => updatePassword({ password })}
+        >
+          Update Password
+        </Button>
+      </Group>
+    </Section>
+  );
+}
+
+function ApiKeys() {
+  const keys = useRead("ListApiKeys", {});
+  const invalidate = useInvalidate();
+  const [open, setOpen] = useState(false);
+  const onDeleted = () => {
+    invalidate(["ListApiKeys"], ["GetStats"]);
+    notifications.show({ message: "Api key deleted.", color: "green" });
+  };
+  const { mutate: deleteKey } = useManageAuth("DeleteApiKey", {
+    onSuccess: onDeleted,
+  });
+  const { mutate: deleteKeyV2 } = useManageAuth("DeleteApiKeyV2", {
+    onSuccess: onDeleted,
+  });
+  return (
+    <Section
+      title="Api Keys"
+      titleFz="h3"
+      icon={<KeyRound size="1.2rem" />}
+      withBorder
+      actions={
+        <Button
+          leftSection={<Plus size="1rem" />}
+          onClick={() => setOpen(true)}
+        >
+          New Api Key
+        </Button>
+      }
+    >
+      {keys.data?.length === 0 && <Text c="dimmed">No api keys.</Text>}
+      <Table>
+        <Table.Tbody>
+          {keys.data?.map((key) => (
+            <Table.Tr key={key.key} data-testid="api-key-row">
+              <Table.Td>
+                <Text fw="bold">{key.name}</Text>
+              </Table.Td>
+              <Table.Td>
+                <Badge>{key.kind}</Badge>
+              </Table.Td>
+              <Table.Td>
+                <Code>{key.key.slice(0, 16)}...</Code>
+              </Table.Td>
+              <Table.Td>
+                <Text size="sm" c="dimmed">
+                  {key.expires
+                    ? `Expires ${new Date(key.expires).toLocaleString()}`
+                    : "Never expires"}
+                </Text>
+              </Table.Td>
+              <Table.Td>
+                <Group justify="end">
+                  <ActionIcon
+                    color="red"
+                    aria-label={`Delete api key ${key.name}`}
+                    onClick={() =>
+                      key.kind === "V1"
+                        ? deleteKey({ key: key.key })
+                        : deleteKeyV2({ public_key: key.key })
+                    }
+                  >
+                    <Trash size="1rem" />
+                  </ActionIcon>
+                </Group>
+              </Table.Td>
+            </Table.Tr>
+          ))}
+        </Table.Tbody>
+      </Table>
+      <NewApiKeyModal opened={open} onClose={() => setOpen(false)} />
+    </Section>
+  );
+}
+
+function NewApiKeyModal({
+  opened,
+  onClose,
+}: {
+  opened: boolean;
+  onClose: () => void;
+}) {
+  const invalidate = useInvalidate();
+  const [name, setName] = useState("");
+  const [kind, setKind] = useState<"V1" | "V2">("V1");
+  // Shown once, the server doesn't keep them.
+  const [created, setCreated] = useState<{ label: string; value: string }[]>();
+  const onSuccess = () => invalidate(["ListApiKeys"], ["GetStats"]);
+  const { mutate: create } = useManageAuth("CreateApiKey", {
+    onSuccess: ({ key, secret }) => {
+      onSuccess();
+      setCreated([
+        { label: "Key", value: key },
+        { label: "Secret", value: secret },
+      ]);
+    },
+  });
+  const { mutate: createV2 } = useManageAuth("CreateApiKeyV2", {
+    onSuccess: ({ private_key }) => {
+      onSuccess();
+      setCreated([{ label: "Private Key", value: private_key ?? "" }]);
+    },
+  });
+  const close = () => {
+    setCreated(undefined);
+    setName("");
+    onClose();
+  };
+  return (
+    <Modal opened={opened} onClose={close} title="New Api Key" size="lg">
+      {created ? (
+        <Stack>
+          <Text>Save these now, they can't be shown again.</Text>
+          {created.map(({ label, value }) => (
+            <Group key={label} wrap="nowrap">
+              <Text w={90}>{label}</Text>
+              <Code
+                data-testid={`api-key-${label.toLowerCase().replace(" ", "-")}`}
+                style={{ wordBreak: "break-all" }}
+              >
+                {value}
+              </Code>
+              <CopyButton content={value} />
+            </Group>
+          ))}
+          <Group justify="end">
+            <Button onClick={close}>Done</Button>
+          </Group>
+        </Stack>
+      ) : (
+        <Stack>
+          <TextInput
+            label="Name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            data-autofocus
+          />
+          <SegmentedControl
+            value={kind}
+            onChange={(kind) => setKind(kind as "V1" | "V2")}
+            data={[
+              { value: "V1", label: "Key + Secret" },
+              { value: "V2", label: "Signed requests (key pair)" },
+            ]}
+          />
+          <Group justify="end">
+            <Button
+              disabled={!name}
+              onClick={() =>
+                kind === "V1"
+                  ? create({ name, expires: 0, cidr_whitelist: [] })
+                  : createV2({
+                      name,
+                      expires: 0,
+                      cidr_whitelist: [],
+                      public_key: "",
+                    })
+              }
+            >
+              Create
+            </Button>
+          </Group>
+        </Stack>
+      )}
+    </Modal>
+  );
+}
+
+function CidrWhitelist({
+  current,
+  refetchUser,
+}: {
+  current: string[];
+  refetchUser: () => void;
+}) {
+  const [value, setValue] = useState(current.join("\n"));
+  const { mutate, isPending } = useWrite("UpdateCidrWhitelist", {
+    onSuccess: () => {
+      notifications.show({ message: "Whitelist updated.", color: "green" });
+      refetchUser();
+    },
+  });
+  return (
+    <Section
+      title="Ip Whitelist"
+      titleFz="h3"
+      description="CIDR ranges or ips you can log in / call the api from, one per line. Empty allows all. ⚠️ Leaving out your own ip locks you out."
+      withBorder
+    >
+      <Textarea
+        aria-label="Ip Whitelist"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="10.0.0.0/8"
+        autosize
+        minRows={2}
+        maw={400}
+      />
+      <Group>
+        <Button
+          variant="default"
+          loading={isPending}
+          onClick={() =>
+            mutate({
+              cidr_whitelist: value
+                .split("\n")
+                .map((line) => line.trim())
+                .filter(Boolean),
+            })
+          }
+        >
+          Save Whitelist
+        </Button>
+      </Group>
+    </Section>
+  );
+}

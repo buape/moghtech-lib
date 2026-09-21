@@ -76,9 +76,9 @@ impl<K: PartialEq + Eq + Hash, T: Clone> Default
   }
 }
 
-impl<K: PartialEq + Eq + Hash + std::fmt::Debug + Clone, T: Clone>
-  CloneCache<K, T>
-{
+// Note. No `Debug` bounds: cached values are often
+// secrets (tokens, provider configs) without a `Debug` impl.
+impl<K: PartialEq + Eq + Hash + Clone, T: Clone> CloneCache<K, T> {
   pub async fn get(&self, key: &K) -> Option<T> {
     self.0.read().await.get(key).cloned()
   }
@@ -100,8 +100,7 @@ impl<K: PartialEq + Eq + Hash + std::fmt::Debug + Clone, T: Clone>
 
   pub async fn insert<Key>(&self, key: Key, val: T) -> Option<T>
   where
-    T: std::fmt::Debug,
-    Key: Into<K> + std::fmt::Debug,
+    Key: Into<K>,
   {
     self.0.write().await.insert(key.into(), val)
   }
@@ -134,10 +133,8 @@ impl<K: PartialEq + Eq + Hash + std::fmt::Debug + Clone, T: Clone>
   }
 }
 
-impl<
-  K: PartialEq + Eq + Hash + std::fmt::Debug + Clone,
-  T: Clone + Default,
-> CloneCache<K, T>
+impl<K: PartialEq + Eq + Hash + Clone, T: Clone + Default>
+  CloneCache<K, T>
 {
   pub async fn get_or_insert_default(&self, key: &K) -> T {
     self.get_or_insert_with(key, T::default).await
@@ -242,6 +239,30 @@ mod tests {
   use std::sync::atomic::{AtomicUsize, Ordering};
 
   use super::*;
+
+  #[tokio::test]
+  async fn clone_cache_does_not_need_debug() {
+    // Eg. a secret, which deliberately has no Debug impl.
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct NoDebugKey(u8);
+    #[derive(Clone)]
+    struct NoDebugValue(&'static str);
+
+    let cache = CloneCache::<NoDebugKey, NoDebugValue>::default();
+    assert!(
+      cache
+        .insert(NoDebugKey(1), NoDebugValue("a"))
+        .await
+        .is_none()
+    );
+    assert_eq!(cache.get(&NoDebugKey(1)).await.unwrap().0, "a");
+    let value = cache
+      .get_or_insert_with(&NoDebugKey(2), || NoDebugValue("b"))
+      .await;
+    assert_eq!(value.0, "b");
+    assert_eq!(cache.get_keys().await.len(), 2);
+    assert_eq!(cache.remove(&NoDebugKey(1)).await.unwrap().0, "a");
+  }
 
   #[test]
   fn clone_anyhow_error_preserves_context_chain() {

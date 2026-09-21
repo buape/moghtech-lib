@@ -166,7 +166,7 @@ pub async fn external_login<I: AuthImpl>(
   Query(RedirectQuery { redirect }): Query<RedirectQuery>,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
-  async {
+  let res = async {
     let (provider, built) =
       load_enabled_provider(&auth, &provider_id).await?;
 
@@ -187,7 +187,8 @@ pub async fn external_login<I: AuthImpl>(
     provider_redirect(&provider, &begin.url)
   }
   .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
-  .await
+  .await;
+  error_redirect(&auth, ExternalFlow::Login, res)
 }
 
 pub async fn external_link<I: AuthImpl>(
@@ -196,7 +197,7 @@ pub async fn external_link<I: AuthImpl>(
   session: Session,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
-  async {
+  let res = async {
     let (provider, built) =
       load_enabled_provider(&auth, &provider_id).await?;
 
@@ -230,7 +231,50 @@ pub async fn external_link<I: AuthImpl>(
     provider_redirect(&provider, &begin.url)
   }
   .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
-  .await
+  .await;
+  error_redirect(&auth, ExternalFlow::Link, res)
+}
+
+/// Whether an external flow logs a user in, or links
+/// the provider to the user who is already logged in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExternalFlow {
+  Login,
+  Link,
+}
+
+/// External logins are browser navigations, so with
+/// [AuthImpl::external_login_error_redirect] configured a failure sends
+/// the user back to the app with the reason, rather than leaving them
+/// on a page showing the JSON error.
+fn error_redirect<I: AuthImpl>(
+  auth: &I,
+  flow: ExternalFlow,
+  res: mogh_error::Result<Redirect>,
+) -> mogh_error::Result<Redirect> {
+  let e = match res {
+    Ok(redirect) => return Ok(redirect),
+    Err(e) => e,
+  };
+  let Some(login_page) = auth.external_login_error_redirect() else {
+    return Err(e);
+  };
+  let (target, param) = match flow {
+    ExternalFlow::Login => (login_page, "login_error"),
+    ExternalFlow::Link => (auth.post_link_redirect(), "link_error"),
+  };
+  let message = if e.status.is_server_error() {
+    // The details are for the operator, not for the url bar.
+    error!("External login failed | {:#}", e.error);
+    String::from("Login failed, see the server logs for details")
+  } else {
+    format!("{:#}", e.error)
+  };
+  let splitter = if target.contains('?') { '&' } else { '?' };
+  Ok(Redirect::to(&format!(
+    "{target}{splitter}{param}={}",
+    urlencoding::encode(&message)
+  )))
 }
 
 /// Applies the OIDC 'redirect_host'
@@ -281,13 +325,19 @@ pub async fn external_callback<I: AuthImpl>(
   Query(query): Query<StandardCallbackQuery>,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
-  async {
+  // Known once the login which was started is read from the session.
+  let mut flow = ExternalFlow::Login;
+  let res = async {
     let (client_state, code) = query.open()?;
 
     let (provider, built) =
       load_enabled_provider(&auth, &provider_id).await?;
 
     let login = session.retrieve_external_login().await?;
+
+    if login.link_user_id.is_some() {
+      flow = ExternalFlow::Link;
+    }
 
     validate_callback(&login, &provider_id, &client_state)?;
 
@@ -311,7 +361,8 @@ pub async fn external_callback<I: AuthImpl>(
     }
   }
   .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
-  .await
+  .await;
+  error_redirect(&auth, flow, res)
 }
 
 /// The callback must be for the provider the login was started
@@ -436,7 +487,8 @@ async fn link_callback<I: AuthImpl>(
       return Ok(Redirect::to(auth.post_link_redirect()));
     } else {
       return Err(
-        anyhow!("Account already linked to another user.").into(),
+        anyhow!("Account already linked to another user.")
+          .status_code(StatusCode::CONFLICT),
       );
     }
   }
@@ -519,6 +571,7 @@ mod tests {
     no_users_exist: bool,
     sync_fails: bool,
     cidr_whitelist: Vec<String>,
+    error_redirect: Option<&'static str>,
     calls: Arc<std::sync::Mutex<Calls>>,
   }
 
@@ -547,6 +600,10 @@ mod tests {
 
     fn post_link_redirect(&self) -> &str {
       "https://example.com/profile"
+    }
+
+    fn external_login_error_redirect(&self) -> Option<&str> {
+      self.error_redirect
     }
 
     fn registration_disabled(&self) -> bool {
@@ -917,20 +974,96 @@ mod tests {
     assert_eq!(calls.synced[0].0, "linking-user");
   }
 
+  fn rejected() -> mogh_error::Result<Redirect> {
+    Err(
+      anyhow!("User registration is disabled & more")
+        .status_code(StatusCode::UNAUTHORIZED),
+    )
+  }
+
+  #[test]
+  fn test_error_redirect_is_opt_in() {
+    // By default the JSON error is the response, as before.
+    let auth = TestAuth::default();
+    let err = error_redirect(&auth, ExternalFlow::Login, rejected())
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    // Successful flows are never touched.
+    let auth = TestAuth {
+      error_redirect: Some("https://example.com/login"),
+      ..Default::default()
+    };
+    let ok = error_redirect(
+      &auth,
+      ExternalFlow::Login,
+      Ok(Redirect::to("https://idp.example.com/authorize")),
+    )
+    .unwrap();
+    assert_eq!(location(ok), "https://idp.example.com/authorize");
+  }
+
+  #[test]
+  fn test_error_redirect_sends_the_reason_to_the_app() {
+    let auth = TestAuth {
+      error_redirect: Some("https://example.com/login"),
+      ..Default::default()
+    };
+    let redirect =
+      error_redirect(&auth, ExternalFlow::Login, rejected()).unwrap();
+    assert_eq!(
+      location(redirect),
+      "https://example.com/login?login_error=User%20registration%20is%20disabled%20%26%20more"
+    );
+    // A failed link goes back to where links are managed.
+    let redirect =
+      error_redirect(&auth, ExternalFlow::Link, rejected()).unwrap();
+    assert!(
+      location(redirect)
+        .starts_with("https://example.com/profile?link_error=User")
+    );
+    // An existing query is kept.
+    let auth = TestAuth {
+      error_redirect: Some("https://example.com/login?theme=dark"),
+      ..Default::default()
+    };
+    let redirect =
+      error_redirect(&auth, ExternalFlow::Login, rejected()).unwrap();
+    assert!(location(redirect).starts_with(
+      "https://example.com/login?theme=dark&login_error=User"
+    ));
+  }
+
+  #[test]
+  fn test_error_redirect_hides_server_errors() {
+    let auth = TestAuth {
+      error_redirect: Some("https://example.com/login"),
+      ..Default::default()
+    };
+    let redirect = error_redirect(
+      &auth,
+      ExternalFlow::Login,
+      Err(anyhow!("connection refused to 10.0.0.5:5432").into()),
+    )
+    .unwrap();
+    let location = location(redirect);
+    assert!(location.contains("login_error=Login%20failed"));
+    assert!(!location.contains("10.0.0.5"), "{location}");
+  }
+
   #[tokio::test]
   async fn test_link_rejects_login_linked_to_another_user() {
     let provider = github("flow-a", true, "secret");
     let auth = TestAuth::default().with_login("flow-a", "42");
-    assert!(
-      link_callback(
-        &auth,
-        &provider,
-        "linking-user".to_string(),
-        completed(&provider, "42", None),
-      )
-      .await
-      .is_err()
-    );
+    let err = link_callback(
+      &auth,
+      &provider,
+      "linking-user".to_string(),
+      completed(&provider, "42", None),
+    )
+    .await
+    .unwrap_err();
+    // Not a server error, the login belongs to somebody else.
+    assert_eq!(err.status, StatusCode::CONFLICT);
     let calls = auth.calls.lock().unwrap();
     assert_eq!(calls.logins.len(), 1);
     assert!(calls.synced.is_empty());

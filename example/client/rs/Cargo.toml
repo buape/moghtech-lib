@@ -1,0 +1,21 @@
+[package]
+name = "example_client"
+description = "API types and client for the Mogh example app."
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# MOGH
+mogh_auth_client = { workspace = true, features = ["pki"] }
+mogh_resolver.workspace = true
+mogh_error.workspace = true
+# EXTERNAL
+serde_json.workspace = true
+typeshare.workspace = true
+reqwest = { workspace = true, features = ["cookies"] }
+anyhow.workspace = true
+serde.workspace = true
+strum.workspace = true

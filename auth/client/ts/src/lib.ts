@@ -11,6 +11,26 @@ export * as Passkey from "./passkey.js";
 export { LOGIN_TOKENS, extractUserIdFromJwt } from "./tokens.js";
 export type { LoginResponses, ManageResponses };
 
+/**
+ * The error message of a manage request refused with `403` because it
+ * needs a recent login starts with this. Requests which change how a user
+ * can log in (password, 2fa, linked logins, new api keys, ...) are only
+ * accepted with a token issued a short while ago. Send the user to
+ * log in again, and retry.
+ */
+export const REAUTHENTICATION_REQUIRED = "Reauthentication required";
+
+/** Whether a rejected request (`{ status, result }`) needs the user to log in again. */
+export function isReauthenticationRequired(e: unknown): boolean {
+  const { status, result } = (e ?? {}) as {
+    status?: number;
+    result?: { error?: string };
+  };
+  return (
+    status === 403 && !!result?.error?.startsWith(REAUTHENTICATION_REQUIRED)
+  );
+}
+
 /** RFC 8693 identifiers used by the token endpoint. */
 export const TOKEN_EXCHANGE = {
   GRANT_TYPE: "urn:ietf:params:oauth:grant-type:token-exchange",

@@ -28,6 +28,22 @@ export function authClient() {
   return MoghAuth.MoghAuthClient(AUTH_URL, MoghAuth.LOGIN_TOKENS!.jwt());
 }
 
+/**
+ * Called when a manage request is refused because it needs a recent login
+ * (`MoghAuth.isReauthenticationRequired`). By default the user is sent to
+ * `/login`, and comes back to the current page after logging in.
+ */
+let onReauthenticationRequired = () => {
+  const backto = encodeURIComponent(location.pathname + location.search);
+  // Leaves time to read the notification.
+  setTimeout(() => location.assign(`/login?backto=${backto}`), 2_000);
+};
+
+/** Replace what happens when a change needs the user to log in again. */
+export function setOnReauthenticationRequired(handler: () => void) {
+  onReauthenticationRequired = handler;
+}
+
 export function useLoginOptions() {
   return useQuery({
     queryKey: ["GetLoginOptions"],
@@ -73,11 +89,14 @@ export function useLogin<
   >,
 >(type: T, config?: C) {
   return useMutation({
+    // Spread first: a caller's `onError` extends the
+    // notification below instead of replacing it.
+    ...config,
     mutationKey: [type],
     mutationFn: (params: P) => authClient().login<T, R>(type, params),
-    onError: (e: { result: { error?: string; trace?: string[] } }, ...args) => {
+    onError: (e: { result?: { error?: string; trace?: string[] } }, ...args) => {
       console.log("Login error:", e);
-      const msg = e.result.error ?? "Unknown error. See console.";
+      const msg = e.result?.error ?? "Unknown error. See console.";
       const detail = e.result?.trace
         ?.map((msg) => msg[0].toUpperCase() + msg.slice(1))
         .join(" | ");
@@ -92,7 +111,6 @@ export function useLogin<
       });
       config?.onError && config.onError(e, ...args);
     },
-    ...config,
   });
 }
 
@@ -122,11 +140,27 @@ export function useManageAuth<
   >,
 >(type: T, config?: C) {
   return useMutation({
+    // Spread first: a caller's `onError` extends the
+    // notification below instead of replacing it.
+    ...config,
     mutationKey: [type],
     mutationFn: (params: P) => authClient().manage<T, R>(type, params),
-    onError: (e: { result: { error?: string; trace?: string[] } }, ...args) => {
+    onError: (e: { result?: { error?: string; trace?: string[] } }, ...args) => {
       console.log("Manage auth error:", e);
-      const msg = e.result.error ?? "Unknown error. See console.";
+      // Not a failure of the request itself: changes to how the
+      // user logs in are only accepted shortly after logging in.
+      if (MoghAuth.isReauthenticationRequired(e)) {
+        notifications.show({
+          title: "Log in again to continue",
+          message:
+            "For your security this change needs a recent login. Taking you to the login page...",
+          color: "yellow",
+        });
+        onReauthenticationRequired();
+        config?.onError && config.onError(e, ...args);
+        return;
+      }
+      const msg = e.result?.error ?? "Unknown error. See console.";
       const detail = e.result?.trace
         ?.map((msg) => msg[0].toUpperCase() + msg.slice(1))
         .join(" | ");
@@ -141,12 +175,12 @@ export function useManageAuth<
       });
       config?.onError && config.onError(e, ...args);
     },
-    ...config,
   });
 }
 
 let jwt_redeem_sent = false;
 let passkey_sent = false;
+let external_error_shown = false;
 
 /// returns whether to show login / loading screen depending on state of exchange token loop
 export function useAuthState() {
@@ -182,6 +216,29 @@ export function useAuthState() {
         });
       });
     passkey_sent = true;
+  }
+
+  // An external login / link which failed comes back with the reason
+  // (`AuthImpl::external_login_error_redirect` on the server).
+  const external_error =
+    search.get("login_error") ?? search.get("link_error");
+  if (external_error && !external_error_shown) {
+    external_error_shown = true;
+    notifications.show({
+      title: search.has("link_error") ? "Failed to link login" : "Login failed",
+      message: external_error,
+      color: "red",
+      autoClose: 10_000,
+    });
+    // Without a reload, which would drop the notification.
+    search.delete("login_error");
+    search.delete("link_error");
+    const query = search.toString();
+    history.replaceState(
+      history.state,
+      "",
+      `${location.pathname}${query.length ? "?" + query : ""}`,
+    );
   }
 
   const jwt_redeem_ready = search.get("redeem_ready") === "true";

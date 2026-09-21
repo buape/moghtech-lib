@@ -4,7 +4,7 @@ use mogh_auth_client::api::manage::{
   CreateApiKeyV2Response, DeleteApiKey, DeleteApiKeyResponse,
   DeleteApiKeyV2, DeleteApiKeyV2Response,
 };
-use mogh_error::AddStatusCodeError as _;
+use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use mogh_resolver::Resolve;
 use reqwest::StatusCode;
 use tracing::{info, instrument};
@@ -126,6 +126,19 @@ impl Resolve<ManageArgs> for DeleteApiKey {
 
 //
 
+/// The public key as the request handshake produces it (base64
+/// spki der), so a key given in another encoding (pem) is stored in
+/// the form requests are matched with. BAD_REQUEST if it isn't a
+/// public key.
+fn normalize_public_key(
+  public_key: &str,
+) -> mogh_error::Result<String> {
+  mogh_pki::SpkiPublicKey::from_maybe_pem(public_key.trim())
+    .map(mogh_pki::SpkiPublicKey::into_inner)
+    .context("Invalid public key")
+    .status_code(StatusCode::BAD_REQUEST)
+}
+
 pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
   auth: &I,
   user_id: String,
@@ -145,7 +158,7 @@ pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
       key_pair.public.into_inner(),
     )
   } else {
-    (None, public_key.to_string())
+    (None, normalize_public_key(public_key)?)
   };
 
   auth
@@ -192,11 +205,13 @@ pub async fn delete_api_key_v2<I: AuthImpl + ?Sized>(
   user_id: &str,
   public_key: String,
 ) -> mogh_error::Result<()> {
-  let expected_user_id = auth
-    .get_api_key_v2(public_key.clone())
-    .await?
-    .user_id()
-    .to_string();
+  // Keys stored before public keys were normalized
+  // may be in another encoding, so fall back to the key as given.
+  let public_key =
+    normalize_public_key(&public_key).unwrap_or(public_key);
+
+  let expected_user_id =
+    auth.get_api_key_v2_owner_id(public_key.clone()).await?;
 
   if user_id != expected_user_id {
     return Err(
@@ -268,6 +283,44 @@ mod tests {
       generate_api_key_parts(40, TEST_BCRYPT_COST).unwrap();
     assert_ne!(key_a, key_b);
     assert_ne!(secret_a, secret_b);
+  }
+
+  #[test]
+  fn test_normalize_public_key_encodings() {
+    let keys =
+      mogh_pki::EncodedKeyPair::generate(mogh_pki::PkiKind::OneWay)
+        .unwrap();
+    // The form the request handshake produces.
+    let canonical = keys.public().to_string();
+    assert_eq!(normalize_public_key(&canonical).unwrap(), canonical);
+    assert_eq!(
+      normalize_public_key(&format!("  {canonical}\n")).unwrap(),
+      canonical
+    );
+    // Pem (eg. the public key file) matches the same key.
+    assert_eq!(
+      normalize_public_key(&keys.public.as_pem()).unwrap(),
+      canonical
+    );
+  }
+
+  #[test]
+  fn test_normalize_public_key_rejects_invalid() {
+    let private =
+      mogh_pki::EncodedKeyPair::generate(mogh_pki::PkiKind::OneWay)
+        .unwrap()
+        .private()
+        .to_string();
+    for invalid in [
+      "not a key",
+      "AAAA",
+      "-----BEGIN PUBLIC KEY-----",
+      // A private key is not a public key.
+      private.as_str(),
+    ] {
+      let err = normalize_public_key(invalid).unwrap_err();
+      assert_eq!(err.status, StatusCode::BAD_REQUEST, "{invalid:?}");
+    }
   }
 
   #[test]

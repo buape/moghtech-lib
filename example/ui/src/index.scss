@@ -1,0 +1,9 @@
+// Set explicitly so the body color is right before
+// the mantine body variable is overridden with JS.
+body[data-mantine-color-scheme="light"] {
+  background-color: #f8f9fa;
+}
+
+body[data-mantine-color-scheme="dark"] {
+  background-color: #0f1115;
+}

@@ -22,6 +22,15 @@ use crate::{
 
 pub trait MoghAuthManageRequest: HasResponse {}
 
+/// The error message of a request refused with `403 Forbidden` because
+/// it needs a recent login starts with this. Requests which change how a
+/// user (or anyone, for the admin requests) can log in are only accepted
+/// with a token issued a short while ago, so a token which leaked isn't
+/// enough to take over the account. Clients should send the user to
+/// log in again, and retry.
+pub const REAUTHENTICATION_REQUIRED: &str =
+  "Reauthentication required";
+
 //
 
 #[allow(unused)]

@@ -1,0 +1,53 @@
+[package]
+name = "example_server"
+description = "Example app using the Mogh libraries, which the integration tests run against."
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "example_server"
+path = "src/main.rs"
+
+[dependencies]
+# LOCAL
+example_client = { path = "../client/rs" }
+# MOGH
+mogh_auth_client.workspace = true
+mogh_auth_server.workspace = true
+mogh_cache.workspace = true
+mogh_config.workspace = true
+mogh_encryption.workspace = true
+mogh_error = { workspace = true, features = ["axum"] }
+mogh_logger.workspace = true
+mogh_pki.workspace = true
+mogh_rate_limit.workspace = true
+mogh_request_ip.workspace = true
+mogh_resolver.workspace = true
+mogh_secret_file.workspace = true
+mogh_server.workspace = true
+mogh_validations.workspace = true
+# EXTERNAL
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "derive", "macros"] }
+serde_json.workspace = true
+typeshare.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+strum.workspace = true
+axum.workspace = true
+uuid.workspace = true
+envy = "0.4.2"
+
+[dev-dependencies]
+example_mock_idp = { path = "../mock_idp" }
+reqwest = { workspace = true, features = ["cookies"] }
+totp-rs.workspace = true
+tempfile = "3"
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"

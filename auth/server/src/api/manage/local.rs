@@ -5,7 +5,10 @@ use mogh_auth_client::api::{
 use mogh_resolver::Resolve;
 use tracing::instrument;
 
-use crate::{AuthImpl, api::manage::ManageArgs};
+use crate::{
+  AuthImpl,
+  api::{login::local::check_username_available, manage::ManageArgs},
+};
 
 pub async fn update_username<I: AuthImpl + ?Sized>(
   auth: &I,
@@ -15,6 +18,8 @@ pub async fn update_username<I: AuthImpl + ?Sized>(
 ) -> mogh_error::Result<()> {
   auth.check_username_locked(username)?;
   auth.validate_username(&new_username)?;
+  check_username_available(auth, &new_username, Some(&user_id))
+    .await?;
   auth.update_user_username(user_id, new_username).await?;
   Ok(())
 }

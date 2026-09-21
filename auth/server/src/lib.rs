@@ -252,6 +252,42 @@ pub trait AuthImpl: Send + Sync + 'static {
     &DISABLED_RATE_LIMITER
   }
 
+  /// Requests of the auth management API which change how a user (or
+  /// anyone, for the admin requests) can log in are only accepted with
+  /// a token issued at most this many seconds ago: passwords, usernames,
+  /// 2fa, linked logins, new api keys, login providers, trusted issuers.
+  /// A token which leaked is then not enough to take over the account
+  /// for good. `0` disables the check. Default: 15 minutes.
+  ///
+  /// - Older tokens get `403 Forbidden`, with a message starting with
+  ///   [REAUTHENTICATION_REQUIRED][mogh_auth_client::api::manage::REAUTHENTICATION_REQUIRED].
+  ///   The user has to log in again, which includes their second factor.
+  /// - Api keys have no login to be recent, and are refused for these
+  ///   requests while the check is enabled.
+  /// - The time is the `iat` of a token of [Self::jwt_provider]. Apps
+  ///   validating other tokens in [Self::get_user_id_from_request_authentication]
+  ///   should disable this, or those tokens are always refused.
+  fn reauthentication_window_secs(&self) -> u64 {
+    15 * 60
+  }
+
+  /// Where the browser is sent when an external login fails, usually
+  /// the login page of the app: `https://example.com/login`.
+  ///
+  /// External logins are browser navigations, not api calls. With the
+  /// default (`None`) a failure (registration disabled, not in an allowed
+  /// group, denied at the provider, ...) answers with the JSON error,
+  /// which leaves the user on a blank page showing it. With this set
+  /// they are redirected here instead, with the reason in the
+  /// `login_error` query parameter for the login page to show (the
+  /// `mogh_ui` login does). Failed links go to [Self::post_link_redirect]
+  /// with `link_error`.
+  ///
+  /// Server errors are logged and only reported as such.
+  fn external_login_error_redirect(&self) -> Option<&str> {
+    None
+  }
+
   /// Where to default redirect after linking an external login method.
   fn post_link_redirect(&self) -> &str {
     panic!(
@@ -871,6 +907,18 @@ pub trait AuthImpl: Send + Sync + 'static {
     None
   }
 
+  /// How far the `X-API-TIMESTAMP` of an api key v2 request may be
+  /// from the server time, in milliseconds. Default: 1 second.
+  ///
+  /// The signature covers the timestamp, so this is how long a
+  /// captured request can be replayed for, and at the same time how
+  /// much clock difference (plus latency) clients can have before
+  /// their requests are refused. Raise it for clients without
+  /// synchronized clocks, always use TLS either way.
+  fn api_key_v2_timestamp_tolerance_ms(&self) -> u64 {
+    1_000
+  }
+
   fn create_api_key_v2(
     &self,
     _user_id: String,
@@ -899,6 +947,19 @@ pub trait AuthImpl: Send + Sync + 'static {
         anyhow!("Must implement 'AuthImpl::get_api_key_v2'.").into(),
       )
     })
+  }
+
+  /// Get the user id which owns the api key (v2), without it
+  /// having to be usable. Used to check ownership before deletion.
+  ///
+  /// Defaults to [Self::get_api_key_v2]. Implement this if that
+  /// rejects keys which should still be deletable, eg. expired ones.
+  fn get_api_key_v2_owner_id(
+    &self,
+    public_key: String,
+  ) -> DynFuture<mogh_error::Result<String>> {
+    let api_key = self.get_api_key_v2(public_key);
+    Box::pin(async move { Ok(api_key.await?.user_id().to_string()) })
   }
 
   fn delete_api_key_v2(

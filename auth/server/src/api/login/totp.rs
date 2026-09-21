@@ -61,7 +61,7 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
     LoginArgs { auth, session, ip }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
     async {
-      let user_id = session.retrieve_totp_login_user_id().await?;
+      let user_id = session.begin_totp_login_attempt().await?;
 
       let user = auth.get_user(user_id.clone()).await?;
       let totp_secret = user
@@ -91,6 +91,8 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
         );
       }
 
+      session.complete_totp_login().await?;
+
       let res = auth.jwt_provider().encode_sub(&user_id)?;
 
       info!(
@@ -119,7 +121,7 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
     LoginArgs { auth, session, ip }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
     async {
-      let user_id = session.retrieve_totp_login_user_id().await?;
+      let user_id = session.begin_totp_login_attempt().await?;
 
       let user = auth.get_user(user_id.clone()).await?;
       if user.totp_secret().is_none() {
@@ -147,6 +149,8 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
       auth
         .remove_totp_recovery_code(user_id.clone(), hashed_code)
         .await?;
+
+      session.complete_totp_login().await?;
 
       let res = auth.jwt_provider().encode_sub(&user_id)?;
 

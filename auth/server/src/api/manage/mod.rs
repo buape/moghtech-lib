@@ -5,14 +5,15 @@ use mogh_auth_client::api::{NoData, manage::*};
 use mogh_error::{AddStatusCodeError as _, Json};
 use mogh_resolver::Resolve;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use strum::{Display, EnumDiscriminants};
 use tracing::debug;
 use typeshare::typeshare;
 use uuid::Uuid;
 
 use crate::{
-  AuthImpl, BoxAuthImpl, api::Variant, session::Session,
+  AuthImpl, BoxAuthImpl,
+  api::{Variant, parse_variant_request},
+  session::Session,
   user::BoxAuthUser,
 };
 
@@ -26,7 +27,7 @@ pub mod totp;
 
 mod middleware;
 
-use middleware::{UserExtractor, attach_user};
+use middleware::{AuthenticatedAt, UserExtractor, attach_user};
 
 pub struct ManageArgs {
   auth: BoxAuthImpl,
@@ -90,19 +91,18 @@ pub fn router<I: AuthImpl>() -> Router {
 async fn variant_handler<I: AuthImpl>(
   session: Session,
   user: UserExtractor,
+  authenticated_at: AuthenticatedAt,
   Path(Variant { variant }): Path<Variant>,
   Json(params): Json<serde_json::Value>,
 ) -> mogh_error::Result<axum::response::Response> {
-  let req: ManageRequest = serde_json::from_value(json!({
-    "type": variant,
-    "params": params,
-  }))?;
-  handler::<I>(session, user, Json(req)).await
+  let req: ManageRequest = parse_variant_request(variant, params)?;
+  handler::<I>(session, user, authenticated_at, Json(req)).await
 }
 
 async fn handler<I: AuthImpl>(
   session: Session,
   UserExtractor(user): UserExtractor,
+  AuthenticatedAt(authenticated_at): AuthenticatedAt,
   Json(request): Json<ManageRequest>,
 ) -> mogh_error::Result<axum::response::Response> {
   let req_id = Uuid::new_v4();
@@ -120,8 +120,16 @@ async fn handler<I: AuthImpl>(
 
   check_not_workload(user.as_ref().as_ref(), &request)?;
 
+  let auth = I::new();
+  check_recent_login(
+    auth.reauthentication_window_secs(),
+    authenticated_at,
+    unix_timestamp_secs(),
+    &request,
+  )?;
+
   let args = ManageArgs {
-    auth: Box::new(I::new()),
+    auth: Box::new(auth),
     user,
     session,
   };
@@ -161,6 +169,67 @@ fn check_not_workload(
     )
     .status_code(axum::http::StatusCode::FORBIDDEN),
   )
+}
+
+fn unix_timestamp_secs() -> u64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|duration| duration.as_secs())
+    .unwrap_or_default()
+}
+
+/// Whether the request changes how somebody can log in, see
+/// [AuthImpl::reauthentication_window_secs]. Everything does unless it
+/// is listed here, including any request added in the future.
+fn requires_recent_login(request: &ManageRequest) -> bool {
+  !matches!(
+    request,
+    ManageRequest::GetUserId(_)
+      | ManageRequest::ListExternalLoginProviders(_)
+      | ManageRequest::ListTrustedIssuers(_)
+      // Removing a credential never gives more access.
+      | ManageRequest::DeleteApiKey(_)
+      | ManageRequest::DeleteApiKeyV2(_)
+  )
+}
+
+/// `authenticated_at` is when the token was issued,
+/// or `None` for credentials without a login (api keys).
+fn check_recent_login(
+  window_secs: u64,
+  authenticated_at: Option<u64>,
+  now: u64,
+  request: &ManageRequest,
+) -> mogh_error::Result<()> {
+  if window_secs == 0 || !requires_recent_login(request) {
+    return Ok(());
+  }
+  let reason = match authenticated_at {
+    // A token from the future doesn't count as recent either,
+    // `saturating_sub` would make its age zero.
+    Some(at) if at <= now && now - at <= window_secs => {
+      return Ok(());
+    }
+    Some(_) => format!(
+      "log in again to continue, this needs a login within the last {}",
+      format_window(window_secs)
+    ),
+    None => String::from(
+      "this needs a recent login, api keys can't be used for it",
+    ),
+  };
+  Err(
+    anyhow::anyhow!("{REAUTHENTICATION_REQUIRED}: {reason}")
+      .status_code(axum::http::StatusCode::FORBIDDEN),
+  )
+}
+
+fn format_window(secs: u64) -> String {
+  if secs >= 120 && secs.is_multiple_of(60) {
+    format!("{} minutes", secs / 60)
+  } else {
+    format!("{secs} seconds")
+  }
 }
 
 impl Resolve<ManageArgs> for GetUserId {
@@ -271,6 +340,109 @@ mod tests {
       )
       .is_ok()
     );
+  }
+
+  const NOW: u64 = 1_800_000_000;
+  const WINDOW: u64 = 15 * 60;
+
+  /// Requests which can't change how anybody logs in.
+  fn harmless_requests() -> Vec<ManageRequest> {
+    vec![
+      ManageRequest::GetUserId(GetUserId {}),
+      ManageRequest::ListExternalLoginProviders(
+        ListExternalLoginProviders {},
+      ),
+      ManageRequest::ListTrustedIssuers(ListTrustedIssuers {}),
+      ManageRequest::DeleteApiKey(DeleteApiKey { key: "key".into() }),
+      ManageRequest::DeleteApiKeyV2(DeleteApiKeyV2 {
+        public_key: "key".into(),
+      }),
+    ]
+  }
+
+  fn sensitive_requests() -> Vec<ManageRequest> {
+    requests()
+      .into_iter()
+      .filter(requires_recent_login)
+      .chain([
+        ManageRequest::UpdateUsername(UpdateUsername {
+          username: "name".into(),
+        }),
+        ManageRequest::UnenrollTotp(UnenrollTotp {}),
+        ManageRequest::UnenrollPasskey(UnenrollPasskey {}),
+        ManageRequest::UnlinkLocalLogin(UnlinkLocalLogin {}),
+        ManageRequest::UpdateExternalSkip2fa(UpdateExternalSkip2fa {
+          external_skip_2fa: true,
+        }),
+        ManageRequest::CreateApiKeyV2(CreateApiKeyV2 {
+          name: "key".into(),
+          expires: 0,
+          cidr_whitelist: Vec::new(),
+          public_key: String::new(),
+        }),
+      ])
+      .collect()
+  }
+
+  #[test]
+  fn test_sensitive_requests_need_a_recent_login() {
+    let sensitive = sensitive_requests();
+    assert!(sensitive.len() > 10);
+    for request in sensitive {
+      let method: ManageRequestMethod = (&request).into();
+      // Just logged in, and at the end of the window.
+      for age in [0, 1, WINDOW] {
+        check_recent_login(WINDOW, Some(NOW - age), NOW, &request)
+          .unwrap_or_else(|_| panic!("{method} at {age}s"));
+      }
+      // Too old, from the future, or not a login at all (api key).
+      for authenticated_at in
+        [Some(NOW - WINDOW - 1), Some(0), Some(NOW + 60), None]
+      {
+        let err =
+          check_recent_login(WINDOW, authenticated_at, NOW, &request)
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{method}");
+        // Clients recognize the error by the start of its message.
+        assert!(
+          format!("{:#}", err.error)
+            .starts_with(REAUTHENTICATION_REQUIRED),
+          "{method}: {:#}",
+          err.error
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_harmless_requests_work_with_any_credentials() {
+    for request in harmless_requests() {
+      for authenticated_at in [Some(0), Some(NOW + 60), None] {
+        assert!(
+          check_recent_login(WINDOW, authenticated_at, NOW, &request)
+            .is_ok()
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_recent_login_check_can_be_disabled() {
+    for request in sensitive_requests() {
+      for authenticated_at in [Some(0), None] {
+        assert!(
+          check_recent_login(0, authenticated_at, NOW, &request)
+            .is_ok()
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_format_window() {
+    assert_eq!(format_window(900), "15 minutes");
+    assert_eq!(format_window(90), "90 seconds");
+    assert_eq!(format_window(1), "1 seconds");
   }
 
   #[test]

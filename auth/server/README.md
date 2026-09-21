@@ -522,6 +522,73 @@ axum::Router::new()
   .nest("/auth", mogh_auth_server::api::router::<AppAuthImpl>())
   .layer(mogh_server::session::memory_session_layer(MemorySessionConfig))
 ```
+### App tokens
+
+The tokens issued by `JwtProvider` are standard JWTs: `iat` / `exp` are unix
+timestamps in **seconds** (RFC 7519), validated with 10 seconds of clock skew
+tolerance. Tokens issued before 4.0 carried milliseconds and are rejected, so
+users have to log in once after upgrading.
+
+### Reauthentication
+
+Requests of the management API which change how a user can log in (username,
+password, 2FA, linked logins, new api keys), or how anybody can (login
+providers, trusted issuers), are only accepted with a token issued in the
+last 15 minutes, so a token which leaked is not enough to take the account over
+for good. Reading, `GetUserId` and deleting api keys are not affected.
+
+```rust
+/// Seconds. `0` disables the check.
+fn reauthentication_window_secs(&self) -> u64 {
+  15 * 60
+}
+```
+
+- Older tokens get `403 Forbidden` with a message starting with
+  `mogh_auth_client::api::manage::REAUTHENTICATION_REQUIRED`
+  (`isReauthenticationRequired(e)` in the typescript client). The user logs in
+  again, including their second factor, and retries. `mogh_ui` does this on
+  its own: it tells the user why and sends them to `/login?backto=<page>`
+  (`setOnReauthenticationRequired` to change that).
+- Api keys are not a login, and are refused for these requests while the check
+  is enabled. Disable it if the app provisions credentials with api keys.
+- The time is the `iat` of a `JwtProvider` token. Apps which validate other
+  tokens in `get_user_id_from_request_authentication` should disable the check.
+
+### Failed external logins
+
+External logins are browser navigations. By default a failure (registration
+disabled, not in an allowed group, denied at the provider, ...) answers with the
+JSON error, which the user sees as a blank page of JSON. Configure where to
+send them instead:
+
+```rust
+fn external_login_error_redirect(&self) -> Option<&str> {
+  // https://example.com/login
+  Some(&LOGIN_PAGE)
+}
+```
+
+Failed logins then redirect to `{login page}?login_error=<reason>`, failed links
+to `{post_link_redirect}?link_error=<reason>`. The `mogh_ui` `useAuthState` hook
+shows both as a notification. Server errors are logged and only reported as
+"Login failed".
+
+### Api keys (v2)
+
+Clients sign each request with their private key instead of sending a secret
+(`X-API-SIGNATURE` / `X-API-TIMESTAMP`). The rust client has the helpers behind
+its `pki` feature: `mogh_auth_client::signature::signed_request_headers`.
+
+- The signature is accepted for one second around the server time by default,
+  `AuthImpl::api_key_v2_timestamp_tolerance_ms` raises that for clients without
+  synchronized clocks. It is also how long a captured request can be replayed,
+  always use TLS.
+- A public key given to `CreateApiKeyV2` can be base64 or pem, anything else is
+  refused. Implement `get_api_key_v2_owner_id` if `get_api_key_v2` rejects keys
+  which should stay deletable (eg. expired ones).
+- Invalid signatures count against the general rate limiter.
+
 ### Token exchange (RFC 8693)
 
 A client which already holds a token for a user from one of the external
@@ -668,7 +735,8 @@ fn get_or_create_workload_user(
 ```
 
 - That user must report `AuthUserImpl::is_workload`, otherwise the exchange
-  is refused. Workload users are refused by the whole auth management API,
+  is refused. Workload users are refused by the whole auth management API
+  (all but `GetUserId`),
   so a workload can't create an api key (or password, 2fa, linked login,
   login provider, ...) which outlives its rule. ⚠️ Apps with their own ways to
   create credentials must refuse workload users there as well.

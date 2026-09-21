@@ -10,3 +10,32 @@ after = "install-auth-client"
 cmd = """
 node ./auth/client/ts/generate_types.mjs && \
 cd ./auth/client/ts && npm run build"""
+
+
+[example-server]
+alias = "es"
+description = "Runs the example app server (see example/README.md)"
+cmd = "cargo run -p example_server"
+
+[example-mock-idp]
+alias = "emi"
+description = "Runs the mock OIDC provider the example app can log in with"
+cmd = "cargo run -p example_mock_idp"
+
+[test-example]
+alias = "te"
+description = "Runs the api test suite against the example app"
+cmd = "cargo test -p example_server"
+
+[gen-example-client]
+alias = "gec"
+description = "Generates the example typescript types and builds the example ts client"
+cmd = """
+node ./example/client/ts/generate_types.mjs && \
+cd ./example/client/ts && npm install && npm run build"""
+
+[test-example-ui]
+alias = "teu"
+description = "Builds the example ui and runs the browser tests against the example app"
+after = "gen-example-client"
+cmd = "cd ./example/ui && npm install && npm run build && npx playwright test"

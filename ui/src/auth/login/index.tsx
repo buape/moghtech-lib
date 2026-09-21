@@ -104,12 +104,48 @@ export function LoginPage({
     onSuccess: secondFactorOnSuccess,
   });
 
+  // Entering a recovery code in place of the authenticator code.
+  const [useRecoveryCode, setUseRecoveryCode] = useState(false);
+
+  /** Back to the first factor, eg. to log in as somebody else. */
+  const cancelSecondFactor = () => {
+    setPasskeyPending(false);
+    setTotpPending(false);
+    setUseRecoveryCode(false);
+    // After an external login the second factor is asked for by the url.
+    const search = new URLSearchParams(location.search);
+    if (search.has("totp") || search.has("passkey")) {
+      sanitizeQuery();
+    }
+  };
+
+  // A mistyped code can be tried again. Once the server has ended the
+  // login (too many invalid codes, or the session expired) more codes
+  // can't succeed, so go back to the first factor.
+  const secondFactorOnError = (e: unknown) => {
+    const error =
+      (e as { result?: { error?: string } } | undefined)?.result?.error ?? "";
+    if (
+      error.includes("Too many invalid codes") ||
+      error.includes("has not been initiated")
+    ) {
+      cancelSecondFactor();
+    }
+  };
+
   const { mutate: completeTotpLogin, isPending: totpPending } = useLogin(
     "CompleteTotpLogin",
     {
       onSuccess: secondFactorOnSuccess,
+      onError: secondFactorOnError,
     },
   );
+
+  const { mutate: completeTotpRecoveryLogin, isPending: recoveryPending } =
+    useLogin("CompleteTotpRecoveryLogin", {
+      onSuccess: secondFactorOnSuccess,
+      onError: secondFactorOnError,
+    });
 
   const { mutate: login, isPending: loginPending } = useLogin(
     "LoginLocalUser",
@@ -173,6 +209,17 @@ export function LoginPage({
     },
   });
 
+  const recoveryForm = useForm({
+    mode: "uncontrolled",
+    initialValues: {
+      code: "",
+    },
+    validate: {
+      code: (code) =>
+        code.trim().length ? null : "Recovery code cannot be empty",
+    },
+  });
+
   return (
     <Center h="80vh">
       <Fieldset
@@ -185,7 +232,11 @@ export function LoginPage({
         component="form"
         onSubmit={
           totpIsPending
-            ? totpForm.onSubmit((form) => completeTotpLogin(form))
+            ? useRecoveryCode
+              ? recoveryForm.onSubmit(({ code }) =>
+                  completeTotpRecoveryLogin({ code: code.trim() }),
+                )
+              : totpForm.onSubmit((form) => completeTotpLogin(form))
             : (localForm.onSubmit((form) => login(form)) as any)
         }
         style={{ display: "flex", flexDirection: "column", gap: "1rem" }}
@@ -265,34 +316,74 @@ export function LoginPage({
         )}
 
         {passkeyIsPending && (
-          <Group justify="center" my="lg">
-            <KeyRound size="1.5rem" />
-            <Text size="lg">Provide your passkey to finish login...</Text>
-            <Loader />
-          </Group>
+          <>
+            <Group justify="center" my="lg">
+              <KeyRound size="1.5rem" />
+              <Text size="lg">Provide your passkey to finish login...</Text>
+              <Loader />
+            </Group>
+            <Group>
+              <Button variant="default" onClick={cancelSecondFactor}>
+                Cancel
+              </Button>
+            </Group>
+          </>
         )}
 
         {totpIsPending && (
           <>
-            <TextInput
-              {...totpForm.getInputProps("code")}
-              label={
-                <Group gap="sm">
-                  <KeyRound size="1rem" />
-                  2FA Code
-                </Group>
-              }
-              autoComplete="code"
-              autoCapitalize="none"
-              autoCorrect="off"
-              autoFocus
-            />
-            <Group justify="end">
+            {useRecoveryCode ? (
+              <TextInput
+                {...recoveryForm.getInputProps("code")}
+                key={recoveryForm.key("code")}
+                label={
+                  <Group gap="sm">
+                    <KeyRound size="1rem" />
+                    Recovery Code
+                  </Group>
+                }
+                description="One of the codes saved when 2FA was set up. Each works once."
+                autoComplete="off"
+                autoCapitalize="none"
+                autoCorrect="off"
+                autoFocus
+              />
+            ) : (
+              <TextInput
+                {...totpForm.getInputProps("code")}
+                key={totpForm.key("code")}
+                label={
+                  <Group gap="sm">
+                    <KeyRound size="1rem" />
+                    2FA Code
+                  </Group>
+                }
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                autoCapitalize="none"
+                autoCorrect="off"
+                autoFocus
+              />
+            )}
+            <Group justify="space-between">
+              <Group gap="xs">
+                <Button variant="default" onClick={cancelSecondFactor}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="subtle"
+                  onClick={() => setUseRecoveryCode((use) => !use)}
+                >
+                  {useRecoveryCode
+                    ? "Use authenticator code"
+                    : "Use a recovery code"}
+                </Button>
+              </Group>
               <Button
                 w={110}
                 variant="filled"
                 type="submit"
-                loading={totpPending}
+                loading={totpPending || recoveryPending}
               >
                 Log In
               </Button>

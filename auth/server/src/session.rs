@@ -1,6 +1,6 @@
 use anyhow::Context;
 use axum::extract::FromRequestParts;
-use mogh_error::AddStatusCode;
+use mogh_error::{AddStatusCode, AddStatusCodeError as _};
 use reqwest::StatusCode;
 use webauthn_rs::prelude::{
   PasskeyAuthentication, PasskeyRegistration,
@@ -137,6 +137,11 @@ impl Session {
   }
 
   const TOTP_LOGIN: &str = "totp-login";
+  const TOTP_LOGIN_ATTEMPTS: &str = "totp-login-attempts";
+
+  /// How many codes (TOTP or recovery) can be tried for one
+  /// first factor login, before it has to be started again.
+  pub const MAX_TOTP_LOGIN_ATTEMPTS: u32 = 5;
 
   /// Insert the user id which began totp login
   pub async fn insert_totp_login_user_id(
@@ -145,23 +150,66 @@ impl Session {
   ) -> mogh_error::Result<()> {
     self
       .0
+      .insert(Self::TOTP_LOGIN_ATTEMPTS, 0u32)
+      .await
+      .context("Failed to serialize session data")?;
+    self
+      .0
       .insert(Self::TOTP_LOGIN, user_id)
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
   }
 
-  /// Returns the user id which began totp login
-  pub async fn retrieve_totp_login_user_id(
+  /// Returns the user id which began totp login, and counts an attempt
+  /// at the second factor. The login stays on the session, so a
+  /// mistyped code can be tried again without logging in from the
+  /// start, up to [Self::MAX_TOTP_LOGIN_ATTEMPTS] times. Finish it
+  /// with [Self::complete_totp_login] once the code is accepted.
+  pub async fn begin_totp_login_attempt(
     &self,
   ) -> mogh_error::Result<String> {
-    self
+    let user_id = self
       .0
-      .remove(Self::TOTP_LOGIN)
+      .get::<String>(Self::TOTP_LOGIN)
       .await
       .context("Internal session type error")?
       .context("TOTP login has not been initiated for this session")
-      .status_code(StatusCode::UNAUTHORIZED)
+      .status_code(StatusCode::UNAUTHORIZED)?;
+    let attempts = self
+      .0
+      .get::<u32>(Self::TOTP_LOGIN_ATTEMPTS)
+      .await
+      .context("Internal session type error")?
+      .unwrap_or_default();
+    if attempts >= Self::MAX_TOTP_LOGIN_ATTEMPTS {
+      self.complete_totp_login().await?;
+      return Err(
+        anyhow::anyhow!("Too many invalid codes. Log in again.")
+          .status_code(StatusCode::UNAUTHORIZED),
+      );
+    }
+    self
+      .0
+      .insert(Self::TOTP_LOGIN_ATTEMPTS, attempts + 1)
+      .await
+      .context("Failed to serialize session data")?;
+    Ok(user_id)
+  }
+
+  /// Removes the totp login from the session, it can only be completed once.
+  pub async fn complete_totp_login(&self) -> mogh_error::Result<()> {
+    self
+      .0
+      .remove::<String>(Self::TOTP_LOGIN)
+      .await
+      .context("Internal session type error")?;
+    self
+      .0
+      .remove::<u32>(Self::TOTP_LOGIN_ATTEMPTS)
+      .await
+      .context("Internal session type error")?;
+    Ok(())
   }
 
   // ==================
@@ -258,5 +306,73 @@ impl Session {
         "External link has not been initiated for this session",
       )
       .status_code(StatusCode::UNAUTHORIZED)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use super::*;
+
+  fn session() -> Session {
+    Session(tower_sessions::Session::new(
+      None,
+      Arc::new(tower_sessions::MemoryStore::default()),
+      None,
+    ))
+  }
+
+  #[tokio::test]
+  async fn test_totp_login_requires_first_factor() {
+    let session = session();
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn test_totp_login_can_be_retried_up_to_the_limit() {
+    let session = session();
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    // A mistyped code doesn't end the login.
+    for _ in 0..Session::MAX_TOTP_LOGIN_ATTEMPTS {
+      assert_eq!(
+        session.begin_totp_login_attempt().await.unwrap(),
+        "user-1"
+      );
+    }
+    // Out of attempts, and the login is gone.
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("Too many"));
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert!(
+      format!("{:#}", err.error).contains("not been initiated")
+    );
+  }
+
+  #[tokio::test]
+  async fn test_totp_login_attempts_reset_by_new_first_factor() {
+    let session = session();
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    for _ in 0..Session::MAX_TOTP_LOGIN_ATTEMPTS {
+      session.begin_totp_login_attempt().await.unwrap();
+    }
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    assert_eq!(
+      session.begin_totp_login_attempt().await.unwrap(),
+      "user-1"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_totp_login_completes_once() {
+    let session = session();
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    session.begin_totp_login_attempt().await.unwrap();
+    session.complete_totp_login().await.unwrap();
+    // An accepted code ends the login, it can't be completed again.
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 }

@@ -103,6 +103,9 @@ pub trait LogConfig {
 
   /// Specify which module targets (eg the current binary) are included.
   ///
+  /// ⚠️ Everything else is filtered out, including the default: with
+  /// no targets (the default here) nothing is logged at all.
+  ///
   /// ```rust
   /// struct MyConfig;
   ///

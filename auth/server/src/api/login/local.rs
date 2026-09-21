@@ -38,6 +38,7 @@ pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
 
   auth.validate_username(&username)?;
   auth.validate_password(password)?;
+  check_username_available(auth, &username, None).await?;
 
   let hashed_password =
     bcrypt::hash(password.as_bytes(), auth.local_auth_bcrypt_cost())?;
@@ -53,6 +54,28 @@ pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
   info!(user_id, username, "New user registration (Local)");
 
   auth.jwt_provider().encode_sub(&user_id).map_err(Into::into)
+}
+
+/// Rejects a username another user already has with CONFLICT,
+/// rather than leaving it to the app storage to fail with whatever
+/// error (and status) a broken unique constraint produces.
+///
+/// `user_id` is the user taking the username, who may already have it.
+///
+/// Note. Two requests can still race past this check, so
+/// app storage must keep usernames unique as well.
+pub async fn check_username_available<I: AuthImpl + ?Sized>(
+  auth: &I,
+  username: &str,
+  user_id: Option<&str>,
+) -> mogh_error::Result<()> {
+  match auth.find_user_with_username(username.to_string()).await? {
+    Some(existing) if Some(existing.id()) != user_id => Err(
+      anyhow!("Username is already taken")
+        .status_code(StatusCode::CONFLICT),
+    ),
+    _ => Ok(()),
+  }
 }
 
 impl Resolve<LoginArgs> for SignUpLocalUser {
@@ -192,5 +215,133 @@ impl Resolve<LoginArgs> for LoginLocalUser {
       ip,
     )
     .await
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Mutex;
+
+  use crate::{
+    DynFuture, RequestAuthentication,
+    provider::jwt::JwtProvider,
+    user::{AuthUserImpl, BoxAuthUser},
+  };
+
+  use super::*;
+
+  struct TestUser {
+    id: String,
+    username: String,
+  }
+
+  impl AuthUserImpl for TestUser {
+    fn id(&self) -> &str {
+      &self.id
+    }
+    fn username(&self) -> &str {
+      &self.username
+    }
+  }
+
+  #[derive(Default)]
+  struct TestAuth {
+    /// (id, username)
+    users: Mutex<Vec<(String, String)>>,
+  }
+
+  impl AuthImpl for TestAuth {
+    fn new() -> Self {
+      Self::default()
+    }
+    fn get_user(
+      &self,
+      _user_id: String,
+    ) -> DynFuture<mogh_error::Result<BoxAuthUser>> {
+      Box::pin(async { Err(anyhow!("unimplemented").into()) })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: RequestAuthentication,
+      _ip: IpAddr,
+      _require_user_enabled: bool,
+      req: axum::extract::Request,
+    ) -> DynFuture<mogh_error::Result<axum::extract::Request>> {
+      Box::pin(async { Ok(req) })
+    }
+    fn jwt_provider(&self) -> &JwtProvider {
+      static PROVIDER: std::sync::LazyLock<JwtProvider> =
+        std::sync::LazyLock::new(|| {
+          JwtProvider::new(b"secret", 60_000)
+        });
+      &PROVIDER
+    }
+    fn local_auth_bcrypt_cost(&self) -> u32 {
+      4
+    }
+    fn find_user_with_username(
+      &self,
+      username: String,
+    ) -> DynFuture<mogh_error::Result<Option<BoxAuthUser>>> {
+      let user = self
+        .users
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, name)| name == &username)
+        .map(|(id, username)| {
+          Box::new(TestUser {
+            id: id.clone(),
+            username: username.clone(),
+          }) as BoxAuthUser
+        });
+      Box::pin(async { Ok(user) })
+    }
+    fn sign_up_local_user(
+      &self,
+      username: String,
+      _hashed_password: String,
+      _no_users_exist: bool,
+    ) -> DynFuture<mogh_error::Result<String>> {
+      let mut users = self.users.lock().unwrap();
+      let id = format!("id-{}", users.len());
+      users.push((id.clone(), username));
+      Box::pin(async { Ok(id) })
+    }
+  }
+
+  #[tokio::test]
+  async fn test_sign_up_rejects_taken_username_with_conflict() {
+    let auth = TestAuth::default();
+    sign_up_local_user(&auth, "user".into(), "password-1")
+      .await
+      .unwrap();
+    let err = sign_up_local_user(&auth, "user".into(), "password-2")
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    // The app storage was never asked to create the duplicate.
+    assert_eq!(auth.users.lock().unwrap().len(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_check_username_available() {
+    let auth = TestAuth::default();
+    sign_up_local_user(&auth, "user".into(), "password-1")
+      .await
+      .unwrap();
+    // Free
+    check_username_available(&auth, "other", None)
+      .await
+      .unwrap();
+    // The user already has it
+    check_username_available(&auth, "user", Some("id-0"))
+      .await
+      .unwrap();
+    // Somebody else has it
+    let err = check_username_available(&auth, "user", Some("id-1"))
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
   }
 }

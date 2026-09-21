@@ -26,3 +26,9 @@ Source: https://github.com/moghtech/lib
 - mogh_secret_file
 - mogh_server
 - mogh_validations
+
+### Example app
+
+[example](example) is a small app using all of the above (rust api, sqlite,
+React + react-query UI), with api and browser test suites which verify the
+libraries the way an app uses them. See its [README](example/README.md).

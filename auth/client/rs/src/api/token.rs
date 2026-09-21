@@ -77,6 +77,15 @@ impl TokenExchangeRequest {
       ..Default::default()
     }
   }
+
+  /// Exchange a signed token which is not an OIDC ID token, eg. the
+  /// one a CI platform or Kubernetes issues to a workload.
+  pub fn jwt(subject_token: impl Into<String>) -> Self {
+    Self {
+      subject_token_type: TOKEN_TYPE_JWT.to_string(),
+      ..Self::id_token(subject_token)
+    }
+  }
 }
 
 /// The tokens are redacted.
@@ -174,6 +183,17 @@ mod tests {
     let debug = format!("{response:?}");
     assert!(!debug.contains("secret.app.jwt"));
     assert!(debug.contains("3600"));
+  }
+
+  #[test]
+  fn test_request_constructors() {
+    let id_token = TokenExchangeRequest::id_token("token");
+    assert_eq!(id_token.grant_type, GRANT_TYPE_TOKEN_EXCHANGE);
+    assert_eq!(id_token.subject_token_type, TOKEN_TYPE_ID_TOKEN);
+    let jwt = TokenExchangeRequest::jwt("token");
+    assert_eq!(jwt.grant_type, GRANT_TYPE_TOKEN_EXCHANGE);
+    assert_eq!(jwt.subject_token_type, TOKEN_TYPE_JWT);
+    assert_eq!(jwt.subject_token, "token");
   }
 
   #[test]

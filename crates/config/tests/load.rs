@@ -476,3 +476,26 @@ fn errors_do_not_leak_config_values() {
   assert!(!message.contains("hunter2secret"), "{message}");
   assert!(message.contains("expected u16"), "{message}");
 }
+
+#[cfg(not(feature = "cicada"))]
+#[test]
+fn cicada_path_without_the_feature_is_an_error() {
+  // Skipping it would start the app with defaults.
+  let err = (ConfigLoader {
+    paths: &[std::path::Path::new(
+      "cicada://filesystem/config.yaml?env=prod",
+    )],
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  })
+  .load::<serde_json::Value>()
+  .unwrap_err();
+  assert!(
+    matches!(err, mogh_config::Error::CicadaFeatureDisabled { .. }),
+    "{err}"
+  );
+  assert!(err.to_string().contains("'cicada' feature"));
+}

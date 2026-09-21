@@ -1,0 +1,24 @@
+[package]
+name = "example_mock_idp"
+description = "Mock OIDC identity provider / token issuer for testing the Mogh example app. Never use this outside of tests."
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "example_mock_idp"
+path = "src/main.rs"
+
+[dependencies]
+openidconnect.workspace = true
+data-encoding.workspace = true
+jsonwebtoken.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+axum.workspace = true
+sha2.workspace = true
+uuid.workspace = true

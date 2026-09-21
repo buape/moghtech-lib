@@ -188,6 +188,20 @@ impl fmt::Display for Cipher {
   }
 }
 
+/// The separator of the text form of [EncryptedData] and
+/// [EnvelopeEncryptedData]. Outside of the base64url alphabet
+/// and the cipher marker, so it can't appear in a part.
+const TEXT_SEPARATOR: char = ':';
+
+/// Ciphertext with the nonce it was encrypted with.
+///
+/// To store it, either use the text form (`Display` / `FromStr`:
+/// `<nonce>:<data>`), or the `serde` feature for a structured one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct EncryptedData {
   /// ## data
   /// - encrypted using given key plus the below nonce
@@ -201,11 +215,96 @@ pub struct EncryptedData {
   pub nonce: String,
 }
 
+/// Data encrypted with its own key, which is encrypted with the master key.
+///
+/// To store it, either use the text form (`Display` / `FromStr`:
+/// `<key nonce>:<key data>:<nonce>:<data>`), or the `serde` feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct EnvelopeEncryptedData {
   /// Encrypted using master key
   pub key: EncryptedData,
   /// Encrypted using above key, decrypted.
   pub data: EncryptedData,
+}
+
+/// A part of the text form: not empty, and only characters which
+/// the encryption produces (base64url, and the `$cipher$` marker).
+fn check_text_part(part: &str) -> anyhow::Result<()> {
+  let valid = !part.is_empty()
+    && part.bytes().all(|byte| {
+      byte.is_ascii_alphanumeric()
+        || matches!(byte, b'-' | b'_' | b'=' | b'$')
+    });
+  if valid {
+    Ok(())
+  } else {
+    Err(anyhow::anyhow!("Encrypted data has the wrong format"))
+  }
+}
+
+/// `<nonce>:<data>`
+impl fmt::Display for EncryptedData {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}{TEXT_SEPARATOR}{}", self.nonce, self.data)
+  }
+}
+
+impl std::str::FromStr for EncryptedData {
+  type Err = anyhow::Error;
+
+  fn from_str(s: &str) -> anyhow::Result<Self> {
+    let mut parts = s.split(TEXT_SEPARATOR);
+    let (Some(nonce), Some(data), None) =
+      (parts.next(), parts.next(), parts.next())
+    else {
+      return Err(anyhow::anyhow!(
+        "Encrypted data has the wrong format"
+      ));
+    };
+    check_text_part(nonce)?;
+    check_text_part(data)?;
+    Ok(EncryptedData {
+      data: data.to_string(),
+      nonce: nonce.to_string(),
+    })
+  }
+}
+
+/// `<key nonce>:<key data>:<nonce>:<data>`
+impl fmt::Display for EnvelopeEncryptedData {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}{TEXT_SEPARATOR}{}", self.key, self.data)
+  }
+}
+
+impl std::str::FromStr for EnvelopeEncryptedData {
+  type Err = anyhow::Error;
+
+  fn from_str(s: &str) -> anyhow::Result<Self> {
+    let parts = s.split(TEXT_SEPARATOR).collect::<Vec<_>>();
+    let [key_nonce, key_data, nonce, data] = parts.as_slice() else {
+      return Err(anyhow::anyhow!(
+        "Envelope encrypted data has the wrong format"
+      ));
+    };
+    for part in [key_nonce, key_data, nonce, data] {
+      check_text_part(part)?;
+    }
+    Ok(EnvelopeEncryptedData {
+      key: EncryptedData {
+        data: key_data.to_string(),
+        nonce: key_nonce.to_string(),
+      },
+      data: EncryptedData {
+        data: data.to_string(),
+        nonce: nonce.to_string(),
+      },
+    })
+  }
 }
 
 //
@@ -244,9 +343,97 @@ impl AssociatedData for String {
   }
 }
 
+// Dev dependency only used by the `serde` feature test.
+#[cfg(all(test, not(feature = "serde")))]
+use serde_json as _;
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn text_form_round_trips_and_decrypts() {
+    let key = Key::generate();
+    for cipher in Cipher::ALL {
+      let encrypted =
+        aead::encrypt(b"secret", &key, &"aad", cipher).unwrap();
+      let text = encrypted.to_string();
+      assert_eq!(text.split(':').count(), 2);
+      let parsed: EncryptedData = text.parse().unwrap();
+      assert_eq!(parsed, encrypted);
+      assert_eq!(
+        aead::decrypt(&parsed, &key, &"aad").unwrap().as_slice(),
+        b"secret"
+      );
+
+      let envelope =
+        aead::envelope_encrypt(b"secret", &key, &"aad", cipher)
+          .unwrap();
+      let text = envelope.to_string();
+      assert_eq!(text.split(':').count(), 4);
+      let parsed: EnvelopeEncryptedData = text.parse().unwrap();
+      assert_eq!(parsed, envelope);
+      assert_eq!(
+        aead::envelope_decrypt(&parsed, &key, &"aad")
+          .unwrap()
+          .as_slice(),
+        b"secret"
+      );
+    }
+  }
+
+  #[test]
+  fn text_form_rejects_malformed_input() {
+    for invalid in [
+      "",
+      ":",
+      "nonce",
+      "nonce:",
+      ":data",
+      "a:b:c",
+      "a:b:c:d:e",
+      "no spaces:data",
+      "nonce:da\nta",
+      "€:data",
+    ] {
+      assert!(
+        invalid.parse::<EncryptedData>().is_err(),
+        "{invalid:?}"
+      );
+    }
+    for invalid in
+      ["", ":::", "a:b:c", "a:b:c:d:e", "a:b::d", "a:b:c:d e"]
+    {
+      assert!(
+        invalid.parse::<EnvelopeEncryptedData>().is_err(),
+        "{invalid:?}"
+      );
+    }
+    // Well formed, which says nothing about it decrypting.
+    assert!("a:b".parse::<EncryptedData>().is_ok());
+    assert!(
+      "a:b:c:$aes256gcm$d"
+        .parse::<EnvelopeEncryptedData>()
+        .is_ok()
+    );
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_round_trip() {
+    let key = Key::generate();
+    let envelope = aead::envelope_encrypt(
+      b"secret",
+      &key,
+      &"aad",
+      Cipher::default(),
+    )
+    .unwrap();
+    let json = serde_json::to_string(&envelope).unwrap();
+    let parsed: EnvelopeEncryptedData =
+      serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, envelope);
+  }
 
   #[test]
   fn key_round_trips_through_base64url_and_compares() {

@@ -137,6 +137,14 @@ pub enum Error {
 
   #[error("Parsed value is not object")]
   ValueIsNotObject,
+
+  /// A `cicada:` config path, without the `cicada` feature to load it.
+  /// An error rather than a skipped path: the app would start with
+  /// defaults where the operator expects their configuration.
+  #[error(
+    "Config path {path:?} is a cicada path, which needs the 'cicada' feature of mogh_config to be enabled"
+  )]
+  CicadaFeatureDisabled { path: PathBuf },
 }
 
 #[cfg(test)]

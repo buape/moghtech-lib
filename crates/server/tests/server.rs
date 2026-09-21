@@ -194,6 +194,56 @@ async fn static_ui_serves_files_and_index_fallback() {
   );
 }
 
+/// The headers of the index as served for `uri`.
+async fn index_headers(
+  service: &tower_http::services::ServeDir<
+    tower_http::set_status::SetStatus<Router>,
+  >,
+  uri: &str,
+) -> axum::http::HeaderMap {
+  let response = service
+    .clone()
+    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+  assert_eq!(response.status(), StatusCode::OK, "{uri}");
+  let headers = response.headers().clone();
+  assert_eq!(
+    body_string(Body::new(response.into_body())).await,
+    "<html>index</html>",
+    "{uri}"
+  );
+  headers
+}
+
+#[tokio::test]
+async fn static_ui_root_gets_the_same_cache_headers_as_routes() {
+  // `/` is what browsers request, it must not be served
+  // around the content hash ETag / no-cache handling.
+  let dir = UiDir::new("static_ui_root");
+  let service = serve_static_ui(dir.0.to_str().unwrap(), false);
+  let route = index_headers(&service, "/unknown/route").await;
+  let root = index_headers(&service, "/").await;
+  assert_eq!(root[header::ETAG], route[header::ETAG]);
+
+  let service = serve_static_ui(dir.0.to_str().unwrap(), true);
+  let root = index_headers(&service, "/").await;
+  assert_eq!(root[header::CACHE_CONTROL], "no-cache");
+}
+
+#[tokio::test]
+async fn static_ui_etag_follows_the_index_contents() {
+  let dir = UiDir::new("static_ui_etag");
+  let service = serve_static_ui(dir.0.to_str().unwrap(), false);
+  let before = index_headers(&service, "/").await;
+  // Same contents, same ETag (eg. after a restart).
+  let service = serve_static_ui(dir.0.to_str().unwrap(), false);
+  assert_eq!(
+    index_headers(&service, "/").await[header::ETAG],
+    before[header::ETAG]
+  );
+}
+
 #[tokio::test]
 async fn static_ui_force_no_cache_sets_cache_control() {
   let dir = UiDir::new("static_ui_no_cache");

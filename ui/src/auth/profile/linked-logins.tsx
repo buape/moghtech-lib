@@ -85,6 +85,12 @@ export function LinkedLogins({
     return methods.filter((method) => extraProviderFilter?.(method) ?? true);
   }, [passwordSet, linkedLogins, options]);
 
+  // Unlinking the only login which still works would lock the user
+  // out as soon as their current token expires.
+  const usableLogins = loginMethods.filter(
+    (method) => method.available && method.data,
+  ).length;
+
   const { mutateAsync: beginLink } = useManageAuth("BeginExternalLoginLink");
   const onUnlinked = () => {
     notifications.show({ message: "Unlinked login." });
@@ -165,6 +171,13 @@ export function LinkedLogins({
             cell: ({ row: { original: method } }) => {
               const providerId = method.provider_id;
               if (method.data) {
+                if (method.available && usableLogins <= 1) {
+                  return (
+                    <Text size="sm" c="dimmed">
+                      Your only login. Add another one to unlink it.
+                    </Text>
+                  );
+                }
                 return (
                   <ConfirmModal
                     icon={<Unlink size="1rem" />}

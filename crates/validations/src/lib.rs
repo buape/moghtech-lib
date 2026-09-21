@@ -105,7 +105,7 @@ pub enum StringValidatorMatches {
   /// - hyphens
   /// - dots
   /// - @
-  /// - No Object Ids
+  /// - No Object Ids (only checked with the `bson` feature)
   Username,
   /// - alphanumeric characters
   /// - underscores
@@ -175,8 +175,12 @@ impl StringValidatorMatches {
 fn validate_no_control_chars(input: &str) -> anyhow::Result<()> {
   for (index, char) in input.chars().enumerate() {
     if char.is_control() {
+      // The input is not echoed: it may be a secret (passwords are
+      // validated with this), and the message ends up in responses
+      // and logs, where raw control characters don't belong either.
       return Err(anyhow!(
-        "Control character at index {index}. Input: \"{input}\""
+        "Control character ({}) at index {index}",
+        char.escape_unicode()
       ));
     }
   }
@@ -229,6 +233,20 @@ mod tests {
     assert!(validator.validate("null\0byte").is_err());
     assert!(validator.validate("tab\there").is_err());
     validator.validate("plain text is fine").unwrap();
+  }
+
+  #[test]
+  fn control_char_error_does_not_echo_the_input() {
+    // Eg. a password, which must not reach responses or logs.
+    let err = StringValidator::default()
+      .validate("hunter2-secret\u{7}-password")
+      .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(!message.contains("hunter2"), "{message}");
+    assert!(!message.contains('\u{7}'), "{message}");
+    // Still says what and where.
+    assert!(message.contains("index 14"), "{message}");
+    assert!(message.contains("\\u{7}"), "{message}");
   }
 
   #[test]

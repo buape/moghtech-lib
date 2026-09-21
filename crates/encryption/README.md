@@ -25,3 +25,11 @@ let decrypted: Zeroizing<Vec<u8>> =
   aead::envelope_decrypt(&encrypted, &master_key, &aad)?;
 assert_eq!(decrypted.as_slice(), data);
 ```
+
+To store the result, use the text form (`Display` / `FromStr`), or
+enable the `serde` feature for `Serialize` / `Deserialize`:
+
+```rust
+let stored: String = encrypted.to_string();
+let encrypted: EnvelopeEncryptedData = stored.parse()?;
+```

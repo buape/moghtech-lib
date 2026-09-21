@@ -63,75 +63,76 @@ export const EnrollTotp = ({
 
   return (
     <>
+      {/* Not part of the 'not enrolled' branch below: confirming the
+          enrollment refreshes the user, and the recovery codes have to
+          stay on screen after the user counts as enrolled. */}
+      <Modal opened={open} onClose={() => onOpenChange(false)}>
+        {recovery && (
+          <Flex direction="column" gap="lg">
+            <Text size="lg">Save recovery keys</Text>
+            <Flex direction="column" gap="sm">
+              {recovery.map((code) => (
+                <TextInput key={code} w={200} value={code} disabled />
+              ))}
+            </Flex>
+            <CopyButton content={recovery.join("\n")} />
+          </Flex>
+        )}
+        {!recovery && submitted && (
+          <Flex direction="column" gap="lg">
+            <Text size="lg">
+              Scan this QR code with your authenticator app, and enter the 6
+              digit code below.
+            </Text>
+            <Center>
+              <img
+                width={250}
+                height={250}
+                src={"data:image/png;base64," + submitted.png}
+                alt="QRCode"
+              />
+            </Center>
+            <Flex align="center" justify="space-between" gap="sm">
+              URI
+              <TextInput w={250} value={submitted.uri} disabled />
+              <CopyButton content={submitted.uri} />
+            </Flex>
+            <Flex align="center" justify="space-between">
+              Confirm Code
+              <TextInput
+                w={250}
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+                autoFocus
+              />
+            </Flex>
+            <Flex justify="flex-end">
+              <Button
+                onClick={() => confirmEnrollment({ code: confirm })}
+                disabled={confirm.length !== 6 || confirmPending}
+                leftSection={<Check size="1rem" />}
+                loading={confirmPending}
+              >
+                Confirm
+              </Button>
+            </Flex>
+          </Flex>
+        )}
+        {!recovery && !submitted && (
+          <Center>
+            <Loader />
+          </Center>
+        )}
+      </Modal>
       {!totpEnrolled && !passkeyEnrolled && (
-        <>
-          <Modal opened={open} onClose={() => onOpenChange(false)}>
-            {recovery && (
-              <Flex direction="column" gap="lg">
-                <Text size="lg">Save recovery keys</Text>
-                <Flex direction="column" gap="sm">
-                  {recovery.map((code) => (
-                    <TextInput key={code} w={200} value={code} disabled />
-                  ))}
-                </Flex>
-                <CopyButton content={recovery.join("\n")} />
-              </Flex>
-            )}
-            {!recovery && submitted && (
-              <Flex direction="column" gap="lg">
-                <Text size="lg">
-                  Scan this QR code with your authenticator app, and enter the 6
-                  digit code below.
-                </Text>
-                <Center>
-                  <img
-                    width={250}
-                    height={250}
-                    src={"data:image/png;base64," + submitted.png}
-                    alt="QRCode"
-                  />
-                </Center>
-                <Flex align="center" justify="space-between" gap="sm">
-                  URI
-                  <TextInput w={250} value={submitted.uri} disabled />
-                  <CopyButton content={submitted.uri} />
-                </Flex>
-                <Flex align="center" justify="space-between">
-                  Confirm Code
-                  <TextInput
-                    w={250}
-                    value={confirm}
-                    onChange={(e) => setConfirm(e.target.value)}
-                    autoFocus
-                  />
-                </Flex>
-                <Flex justify="flex-end">
-                  <Button
-                    onClick={() => confirmEnrollment({ code: confirm })}
-                    disabled={confirm.length !== 6 || confirmPending}
-                    leftSection={<Check size="1rem" />}
-                    loading={confirmPending}
-                  >
-                    Confirm
-                  </Button>
-                </Flex>
-              </Flex>
-            )}
-            {!recovery && !submitted && (
-              <Center>
-                <Loader />
-              </Center>
-            )}
-          </Modal>
-          <Button
-            leftSection={<RotateCcwKey size="1rem" />}
-            variant="default"
-            onClick={() => onOpenChange(true)}
-            w={220}
-          >
-            Enroll TOTP 2FA
-          </Button>
-        </>
+        <Button
+          leftSection={<RotateCcwKey size="1rem" />}
+          variant="default"
+          onClick={() => onOpenChange(true)}
+          w={220}
+        >
+          Enroll TOTP 2FA
+        </Button>
       )}
       {totpEnrolled && (
         <ConfirmModal

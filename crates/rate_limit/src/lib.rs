@@ -183,28 +183,50 @@ impl RateLimiter {
 /// "empty" attempts array, and will be cleared off when this runs.
 /// The impact on performance should be negligible until very large scale.
 fn spawn_cleanup_task(limiter: Arc<RateLimiter>) {
-  const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+  const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
   tokio::spawn(async move {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    // The first tick of a plain `interval` completes
+    // immediately, there is nothing to clean up yet.
+    let mut interval = tokio::time::interval_at(
+      tokio::time::Instant::now() + CLEANUP_INTERVAL,
+      CLEANUP_INTERVAL,
+    );
     loop {
       interval.tick().await;
-      limiter
-        .attempts
-        .retain(|_, attempts| {
-          let Ok(attempts) = attempts.try_read() else {
-            // Retain any locked attempts, they are being actively used and not stale.
-            return true;
-          };
-          let Some(last) = attempts.last() else {
-            // Remove any empty attempts arrays
-            return false;
-          };
-          // `elapsed` saturates to zero rather than panicking.
-          last.elapsed() < STALE_AFTER
-        })
-        .await;
+      limiter.cleanup().await;
     }
   });
+}
+
+impl RateLimiter {
+  /// Removes the best guess of stale entries, see [spawn_cleanup_task].
+  async fn cleanup(&self) {
+    const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+    self
+      .attempts
+      .retain(|_, attempts| {
+        // An in flight request holds its own reference to the
+        // attempts while its future runs, and records a failure on
+        // it afterwards. Removing the entry now would lose that
+        // failure (it would be pushed to attempts no longer on the
+        // map), giving the ip a free attempt. New requests can't
+        // take a reference meanwhile, this holds the map lock.
+        if Arc::strong_count(attempts) > 1 {
+          return true;
+        }
+        let Ok(attempts) = attempts.try_read() else {
+          // Retain any locked attempts, they are being actively used and not stale.
+          return true;
+        };
+        let Some(last) = attempts.last() else {
+          // Remove any empty attempts arrays
+          return false;
+        };
+        // `elapsed` saturates to zero rather than panicking.
+        last.elapsed() < STALE_AFTER
+      })
+      .await;
+  }
 }
 
 #[cfg(test)]
@@ -251,6 +273,78 @@ mod tests {
     assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(format!("{:#}", err.error).contains("Too many attempts"));
     assert_eq!(executions.load(Ordering::SeqCst), 3);
+  }
+
+  /// Fails after giving other tasks (the cleanup) time to run.
+  async fn failing_slowly() -> mogh_error::Result<()> {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Err(anyhow!("bad credentials").into())
+  }
+
+  fn remaining(err: &mogh_error::Error) -> String {
+    let msg = format!("{:#}", err.error);
+    msg
+      .split("You have ")
+      .nth(1)
+      .unwrap_or_else(|| panic!("unexpected message: {msg}"))
+      .to_string()
+  }
+
+  #[tokio::test]
+  async fn first_failure_after_creation_is_counted() {
+    // Limiters are usually created lazily by the first request using
+    // them. The cleanup task must not drop the (still empty) entry
+    // of that request while it is in flight.
+    let limiter = RateLimiter::new(false, 3, Duration::from_secs(60));
+    let err = failing_slowly()
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+    assert_eq!(remaining(&err), "2 attempts remaining");
+    let err = failing_slowly()
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+    assert_eq!(remaining(&err), "1 attempts remaining");
+  }
+
+  #[tokio::test]
+  async fn cleanup_keeps_entries_of_in_flight_requests() {
+    let limiter = RateLimiter::new(false, 3, Duration::from_secs(60));
+    let in_flight = tokio::spawn({
+      let limiter = limiter.clone();
+      async move {
+        failing_slowly()
+          .with_failure_rate_limit_using_ip(&limiter, &IP)
+          .await
+          .unwrap_err()
+      }
+    });
+    // Runs while the request is in flight, with empty attempts.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    limiter.cleanup().await;
+    let err = in_flight.await.unwrap();
+    assert_eq!(remaining(&err), "2 attempts remaining");
+
+    // The failure was recorded on the entry which is still on the map.
+    let executions = AtomicUsize::new(0);
+    let err = failing(&executions)
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+    assert_eq!(remaining(&err), "1 attempts remaining");
+  }
+
+  #[tokio::test]
+  async fn cleanup_removes_entries_without_attempts() {
+    let limiter = RateLimiter::new(false, 3, Duration::from_secs(60));
+    let res: mogh_error::Result<()> = async { Ok(()) }
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await;
+    res.unwrap();
+    assert_eq!(limiter.attempts.get_keys().await.len(), 1);
+    limiter.cleanup().await;
+    assert!(limiter.attempts.get_keys().await.is_empty());
   }
 
   #[tokio::test]

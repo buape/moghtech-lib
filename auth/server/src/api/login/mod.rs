@@ -9,14 +9,14 @@ use mogh_rate_limit::WithFailureRateLimit;
 use mogh_request_ip::RequestIp;
 use mogh_resolver::Resolve;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use strum::{Display, EnumDiscriminants};
 use tracing::{debug, instrument};
 use typeshare::typeshare;
 use uuid::Uuid;
 
 use crate::{
-  AuthImpl, BoxAuthImpl, api::Variant,
+  AuthImpl, BoxAuthImpl,
+  api::{Variant, parse_variant_request},
   middleware::check_user_cidr_whitelist,
   provider::external::list_external_providers_lossy,
   session::Session,
@@ -66,10 +66,7 @@ async fn variant_handler<I: AuthImpl>(
   Path(Variant { variant }): Path<Variant>,
   Json(params): Json<serde_json::Value>,
 ) -> mogh_error::Result<axum::response::Response> {
-  let req: LoginRequest = serde_json::from_value(json!({
-    "type": variant,
-    "params": params,
-  }))?;
+  let req: LoginRequest = parse_variant_request(variant, params)?;
   handler::<I>(ip, session, Json(req)).await
 }
 

@@ -35,14 +35,14 @@ pub async fn authenticate_request<
 ) -> mogh_error::Result<Response> {
   let auth = I::new();
 
-  let req_auth = extract_request_authentication(
+  let req_auth = extract_request_authentication_rate_limited(
     &auth,
+    ip,
     req.method(),
     &uri,
     req.headers(),
-  )?
-  .context("Invalid client credentials")
-  .status_code(StatusCode::UNAUTHORIZED)?;
+  )
+  .await?;
 
   let req = auth
     .handle_request_authentication(
@@ -58,6 +58,34 @@ pub async fn authenticate_request<
     .await?;
 
   Ok(next.run(req).await)
+}
+
+/// [extract_request_authentication] for middleware: requests without
+/// credentials are UNAUTHORIZED, and credentials which are presented
+/// but unusable count against [AuthImpl::general_rate_limiter] for the
+/// `ip`. That is most of all an invalid api key (v2) signature, which
+/// costs the server a key exchange to find out about, so it shouldn't
+/// be free to send them in a loop.
+///
+/// Requests without any credentials are not counted: a UI which isn't
+/// logged in yet sends those, and would lock its own login out.
+pub async fn extract_request_authentication_rate_limited<
+  I: AuthImpl,
+>(
+  auth: &I,
+  ip: IpAddr,
+  method: &Method,
+  uri: &Uri,
+  headers: &HeaderMap,
+) -> mogh_error::Result<RequestAuthentication> {
+  async { extract_request_authentication(auth, method, uri, headers) }
+    .with_failure_rate_limit_using_ip(
+      auth.general_rate_limiter(),
+      &ip,
+    )
+    .await?
+    .context("Invalid client credentials")
+    .status_code(StatusCode::UNAUTHORIZED)
 }
 
 /// Maps the request credential headers to [RequestAuthentication],
@@ -106,7 +134,8 @@ pub fn extract_request_jwt(
   };
   let maybe_bearer = authorization
     .to_str()
-    .context("AUTHORIZATION is not valid UTF-8")?
+    .context("AUTHORIZATION is not valid UTF-8")
+    .status_code(StatusCode::UNAUTHORIZED)?
     .trim();
   let jwt =
     maybe_bearer.strip_prefix("Bearer ").unwrap_or(maybe_bearer);
@@ -126,16 +155,19 @@ pub fn extract_request_api_key(
   };
   let key = key
     .to_str()
-    .context("X-API-KEY is not valid UTF-8")?
+    .context("X-API-KEY is not valid UTF-8")
+    .status_code(StatusCode::UNAUTHORIZED)?
     .trim()
     .to_string();
   let secret = headers
     .get("x-api-secret")
     .context(
       "Request headers have X-API-KEY but missing X-API-SECRET",
-    )?
+    )
+    .status_code(StatusCode::UNAUTHORIZED)?
     .to_str()
-    .context("X-API-SECRET is not valid UTF-8")?
+    .context("X-API-SECRET is not valid UTF-8")
+    .status_code(StatusCode::UNAUTHORIZED)?
     .trim()
     .to_string();
   Ok(Some((key, secret)))
@@ -144,7 +176,8 @@ pub fn extract_request_api_key(
 /// Extracts the client public key from the
 /// X-API-SIGNATURE / X-API-TIMESTAMP headers.
 ///
-/// The timestamp must be ~now, and the signature must complete a
+/// The timestamp must be ~now
+/// ([AuthImpl::api_key_v2_timestamp_tolerance_ms]), and the signature must complete a
 /// noise handshake against the server private key over a prologue
 /// binding method, uri, and timestamp. This proves the client holds
 /// the private key for the returned public key, nothing more.
@@ -161,24 +194,39 @@ pub fn extract_request_public_key<I: AuthImpl>(
   };
   let signature = signature
     .to_str()
-    .context("X-API-SIGNATURE is not valid UTF-8")?;
+    .context("X-API-SIGNATURE is not valid UTF-8")
+    .status_code(StatusCode::UNAUTHORIZED)?;
   let timestamp = headers
     .get("x-api-timestamp")
-    .context("Request headers have X-API-SIGNATURE but missing X-API-TIMESTAMP")?
+    .context("Request headers have X-API-SIGNATURE but missing X-API-TIMESTAMP")
+    .status_code(StatusCode::UNAUTHORIZED)?
     .to_str()
-    .context("X-API-TIMESTAMP is not valid UTF-8")?
-    .parse::<i64>()?;
+    .context("X-API-TIMESTAMP is not valid UTF-8")
+    .status_code(StatusCode::UNAUTHORIZED)?
+    .trim()
+    .parse::<i64>()
+    .context("X-API-TIMESTAMP is not a unix timestamp in milliseconds")
+    .status_code(StatusCode::UNAUTHORIZED)?;
 
   let now =
     SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
-  // Ensure timestamp is ~now
-  if (now - timestamp).abs() > 1_000 {
-    return Err(anyhow!("Invalid client credentials").into());
+  // Ensure timestamp is ~now. The subtraction saturates,
+  // the timestamp is untrusted and can be anything.
+  let tolerance =
+    i64::try_from(auth.api_key_v2_timestamp_tolerance_ms())
+      .unwrap_or(i64::MAX);
+  if now.saturating_sub(timestamp).saturating_abs() > tolerance {
+    return Err(
+      anyhow!("Invalid client credentials")
+        .status_code(StatusCode::UNAUTHORIZED),
+    );
   }
 
   let prologue = pki_auth_prologue(method, uri, timestamp);
 
+  // Without a server private key the server is misconfigured
+  // for these credentials, which is not the clients fault.
   let mut handshake = OneWayNoiseHandshake::new_responder(
     &Pkcs8PrivateKey::maybe_raw_bytes(
       auth
@@ -190,8 +238,15 @@ pub fn extract_request_public_key<I: AuthImpl>(
     prologue.as_bytes(),
   )?;
 
-  let public_key =
-    handshake.validate_signature(signature)?.into_inner();
+  // Fails for anything which wasn't signed for this exact
+  // request (method, uri, timestamp) and this server.
+  let public_key = handshake
+    .validate_signature(signature)
+    .map_err(|_| {
+      anyhow!("Invalid client credentials")
+        .status_code(StatusCode::UNAUTHORIZED)
+    })?
+    .into_inner();
 
   Ok(Some(public_key))
 }
@@ -284,12 +339,18 @@ pub fn verify_api_key_secret<I: AuthImpl>(
   }
 }
 
+/// What a request signature covers, shared with the client:
+/// [mogh_auth_client::signature::pki_auth_prologue].
 pub fn pki_auth_prologue(
   method: &Method,
   uri: &Uri,
   timestamp: i64,
 ) -> String {
-  format!("{method}|{uri}|{timestamp}")
+  mogh_auth_client::signature::pki_auth_prologue(
+    method.as_str(),
+    &uri.to_string(),
+    timestamp,
+  )
 }
 
 #[cfg(test)]
@@ -358,7 +419,31 @@ mod tests {
   fn test_extract_api_key_missing_secret_errors() {
     let mut headers = HeaderMap::new();
     headers.insert("x-api-key", HeaderValue::from_static("K_abc_K"));
-    assert!(extract_request_api_key(&headers).is_err());
+    let err = extract_request_api_key(&headers).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[test]
+  fn test_extract_malformed_headers_are_unauthorized() {
+    // Header values are bytes, not necessarily UTF-8.
+    let not_utf8 = HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", not_utf8.clone());
+    let err = extract_request_jwt(&headers).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", not_utf8.clone());
+    headers.insert("x-api-secret", HeaderValue::from_static("S"));
+    let err = extract_request_api_key(&headers).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", HeaderValue::from_static("K"));
+    headers.insert("x-api-secret", not_utf8);
+    let err = extract_request_api_key(&headers).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 
   #[test]
@@ -463,6 +548,369 @@ mod tests {
     let err =
       verify_api_key_secret(&TestAuth, "S_def_S", None).unwrap_err();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  /// [TestAuth] with a server private key, so signatures are checked.
+  struct KeyedAuth {
+    timestamp_tolerance_ms: u64,
+  }
+
+  const KEYED: KeyedAuth = KeyedAuth {
+    timestamp_tolerance_ms: 1_000,
+  };
+
+  fn server_keys() -> &'static mogh_pki::RotatableKeyPair {
+    static KEYS: std::sync::LazyLock<mogh_pki::RotatableKeyPair> =
+      std::sync::LazyLock::new(|| {
+        let keys = mogh_pki::EncodedKeyPair::generate(
+          mogh_pki::PkiKind::OneWay,
+        )
+        .unwrap();
+        mogh_pki::RotatableKeyPair::from_private_key_spec(
+          mogh_pki::PkiKind::OneWay,
+          keys.private(),
+        )
+        .unwrap()
+      });
+    &KEYS
+  }
+
+  impl AuthImpl for KeyedAuth {
+    fn new() -> Self {
+      KEYED
+    }
+    fn api_key_v2_timestamp_tolerance_ms(&self) -> u64 {
+      self.timestamp_tolerance_ms
+    }
+    fn general_rate_limiter(&self) -> &mogh_rate_limit::RateLimiter {
+      static LIMITER: std::sync::LazyLock<
+        std::sync::Arc<mogh_rate_limit::RateLimiter>,
+      > = std::sync::LazyLock::new(|| {
+        mogh_rate_limit::RateLimiter::new(
+          false,
+          2,
+          std::time::Duration::from_secs(60),
+        )
+      });
+      &LIMITER
+    }
+    fn get_user(
+      &self,
+      user_id: String,
+    ) -> DynFuture<mogh_error::Result<crate::user::BoxAuthUser>> {
+      TestAuth.get_user(user_id)
+    }
+    fn handle_request_authentication(
+      &self,
+      auth: RequestAuthentication,
+      ip: IpAddr,
+      require_user_enabled: bool,
+      req: Request,
+    ) -> DynFuture<mogh_error::Result<Request>> {
+      TestAuth.handle_request_authentication(
+        auth,
+        ip,
+        require_user_enabled,
+        req,
+      )
+    }
+    fn jwt_provider(&self) -> &JwtProvider {
+      TestAuth.jwt_provider()
+    }
+    fn server_private_key(
+      &self,
+    ) -> Option<&mogh_pki::RotatableKeyPair> {
+      Some(server_keys())
+    }
+  }
+
+  fn now_ms() -> i64 {
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_millis() as i64
+  }
+
+  fn signature_headers(
+    signature: &str,
+    timestamp: &str,
+  ) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      "x-api-signature",
+      HeaderValue::from_str(signature).unwrap(),
+    );
+    headers.insert(
+      "x-api-timestamp",
+      HeaderValue::from_str(timestamp).unwrap(),
+    );
+    headers
+  }
+
+  /// A client key pair and its signature for the request.
+  fn sign(
+    method: &Method,
+    uri: &Uri,
+    timestamp: i64,
+  ) -> (String, String) {
+    let client =
+      mogh_pki::EncodedKeyPair::generate(mogh_pki::PkiKind::OneWay)
+        .unwrap();
+    let signature = OneWayNoiseHandshake::new_initiator(
+      &Pkcs8PrivateKey::maybe_raw_bytes(client.private()).unwrap(),
+      &mogh_pki::SpkiPublicKey::maybe_pem_to_raw_bytes(
+        server_keys().load().public(),
+      )
+      .unwrap(),
+      pki_auth_prologue(method, uri, timestamp).as_bytes(),
+    )
+    .unwrap()
+    .generate_signature()
+    .unwrap();
+    (client.public().to_string(), signature)
+  }
+
+  #[test]
+  fn test_extract_public_key_round_trip() {
+    let uri = Uri::from_static("/read");
+    let now = now_ms();
+    let (public_key, signature) = sign(&Method::POST, &uri, now);
+    let extracted = extract_request_public_key(
+      &KEYED,
+      &Method::POST,
+      &uri,
+      &signature_headers(&signature, &now.to_string()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(extracted, public_key);
+  }
+
+  #[test]
+  fn test_extract_public_key_rejections_are_unauthorized() {
+    let uri = Uri::from_static("/read");
+    let now = now_ms();
+    let (_, signature) = sign(&Method::POST, &uri, now);
+    let stale = now - 60_000;
+    let (_, stale_signature) = sign(&Method::POST, &uri, stale);
+
+    let cases = [
+      // Signed for another uri / method
+      (
+        Method::POST,
+        Uri::from_static("/write"),
+        signature.clone(),
+        now.to_string(),
+      ),
+      (Method::GET, uri.clone(), signature.clone(), now.to_string()),
+      // The timestamp doesn't match the signed one
+      (
+        Method::POST,
+        uri.clone(),
+        signature.clone(),
+        (now + 1).to_string(),
+      ),
+      // A correctly signed, but old request (replay)
+      (
+        Method::POST,
+        uri.clone(),
+        stale_signature,
+        stale.to_string(),
+      ),
+      // Garbage
+      (
+        Method::POST,
+        uri.clone(),
+        "not-base64!".to_string(),
+        now.to_string(),
+      ),
+      (
+        Method::POST,
+        uri.clone(),
+        "AAAA".to_string(),
+        now.to_string(),
+      ),
+      (
+        Method::POST,
+        uri.clone(),
+        signature.clone(),
+        "soon".to_string(),
+      ),
+      (Method::POST, uri.clone(), signature.clone(), String::new()),
+      // Must not overflow
+      (
+        Method::POST,
+        uri.clone(),
+        signature.clone(),
+        i64::MIN.to_string(),
+      ),
+      (
+        Method::POST,
+        uri.clone(),
+        signature.clone(),
+        i64::MAX.to_string(),
+      ),
+    ];
+    for (method, uri, signature, timestamp) in cases {
+      let err = extract_request_public_key(
+        &KEYED,
+        &method,
+        &uri,
+        &signature_headers(&signature, &timestamp),
+      )
+      .unwrap_err();
+      assert_eq!(
+        err.status,
+        StatusCode::UNAUTHORIZED,
+        "{method} {uri} {timestamp:?}"
+      );
+    }
+
+    // Missing timestamp
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      "x-api-signature",
+      HeaderValue::from_str(&signature).unwrap(),
+    );
+    let err = extract_request_public_key(
+      &KEYED,
+      &Method::POST,
+      &uri,
+      &headers,
+    )
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[test]
+  fn test_extract_public_key_timestamp_tolerance_is_configurable() {
+    let uri = Uri::from_static("/read");
+    // Eg. a client whose clock is 20 seconds behind.
+    let timestamp = now_ms() - 20_000;
+    let (public_key, signature) =
+      sign(&Method::POST, &uri, timestamp);
+    let headers =
+      signature_headers(&signature, &timestamp.to_string());
+    let err = extract_request_public_key(
+      &KEYED,
+      &Method::POST,
+      &uri,
+      &headers,
+    )
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+    let tolerant = KeyedAuth {
+      timestamp_tolerance_ms: 30_000,
+    };
+    let extracted = extract_request_public_key(
+      &tolerant,
+      &Method::POST,
+      &uri,
+      &headers,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(extracted, public_key);
+    // Still bounded.
+    let timestamp = now_ms() - 40_000;
+    let (_, signature) = sign(&Method::POST, &uri, timestamp);
+    assert!(
+      extract_request_public_key(
+        &tolerant,
+        &Method::POST,
+        &uri,
+        &signature_headers(&signature, &timestamp.to_string()),
+      )
+      .is_err()
+    );
+  }
+
+  #[tokio::test]
+  async fn test_unusable_credentials_are_rate_limited() {
+    let uri = Uri::from_static("/read");
+    let ip: IpAddr = "203.0.113.50".parse().unwrap();
+    let invalid = signature_headers("AAAA", &now_ms().to_string());
+    // The limiter of KeyedAuth allows 2 failures.
+    for _ in 0..2 {
+      let err = extract_request_authentication_rate_limited(
+        &KEYED,
+        ip,
+        &Method::POST,
+        &uri,
+        &invalid,
+      )
+      .await
+      .err()
+      .unwrap();
+      assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+    // Now even a valid signature isn't looked at.
+    let now = now_ms();
+    let (_, signature) = sign(&Method::POST, &uri, now);
+    let err = extract_request_authentication_rate_limited(
+      &KEYED,
+      ip,
+      &Method::POST,
+      &uri,
+      &signature_headers(&signature, &now.to_string()),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+  }
+
+  #[tokio::test]
+  async fn test_missing_credentials_are_not_rate_limited() {
+    let uri = Uri::from_static("/read");
+    let ip: IpAddr = "203.0.113.51".parse().unwrap();
+    // Eg. a UI which isn't logged in yet.
+    for _ in 0..10 {
+      let err = extract_request_authentication_rate_limited(
+        &KEYED,
+        ip,
+        &Method::POST,
+        &uri,
+        &HeaderMap::new(),
+      )
+      .await
+      .err()
+      .unwrap();
+      assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+    let now = now_ms();
+    let (public_key, signature) = sign(&Method::POST, &uri, now);
+    let extracted = extract_request_authentication_rate_limited(
+      &KEYED,
+      ip,
+      &Method::POST,
+      &uri,
+      &signature_headers(&signature, &now.to_string()),
+    )
+    .await
+    .ok()
+    .unwrap();
+    assert!(matches!(
+      extracted,
+      RequestAuthentication::PublicKey(key) if key == public_key
+    ));
+  }
+
+  #[test]
+  fn test_extract_public_key_without_server_key_is_server_error() {
+    let uri = Uri::from_static("/read");
+    let now = now_ms();
+    let (_, signature) = sign(&Method::POST, &uri, now);
+    // TestAuth has no server private key.
+    let err = extract_request_public_key(
+      &TestAuth,
+      &Method::POST,
+      &uri,
+      &signature_headers(&signature, &now.to_string()),
+    )
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
   }
 
   #[test]

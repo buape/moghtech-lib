@@ -39,7 +39,13 @@ export function CreateModal({
   ...targetProps
 }: CreateModalProps) {
   const [opened, { open, close }] = useDisclosure();
-  useEffect(() => onOpenChange?.(opened), [opened]);
+  useEffect(() => {
+    // In braces: whatever the callback returns must not become the
+    // effect cleanup. React calls anything but `undefined` as a
+    // function, so eg. `(opened) => opened && reset()` (false when
+    // closed) would crash the page the moment the modal opens.
+    onOpenChange?.(opened);
+  }, [opened]);
   useShiftKeyListener(
     openShiftKeyListener ?? "___",
     () => openShiftKeyListener && !opened && open(),

@@ -123,6 +123,13 @@ impl ConfigLoader<'_, '_> {
         continue;
       }
 
+      #[cfg(not(feature = "cicada"))]
+      if path.to_string_lossy().starts_with("cicada:") {
+        return Err(Error::CicadaFeatureDisabled {
+          path: path.to_path_buf(),
+        });
+      }
+
       let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(e) => {

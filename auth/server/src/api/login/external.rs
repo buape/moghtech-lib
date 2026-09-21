@@ -313,7 +313,7 @@ mod tests {
       assert_eq!(auth.jwt.decode_sub(&jwt.jwt).unwrap(), "user-id");
       assert_eq!(auth.synced.lock().unwrap().len(), 1);
       // Nothing is left pending on the session
-      assert!(session.retrieve_totp_login_user_id().await.is_err());
+      assert!(session.begin_totp_login_attempt().await.is_err());
     }
   }
 
@@ -331,7 +331,7 @@ mod tests {
     assert!(matches!(res, JwtOrTwoFactor::Totp {}));
     // The user to complete 'CompleteTotpLogin' for is on the session
     assert_eq!(
-      session.retrieve_totp_login_user_id().await.unwrap(),
+      session.begin_totp_login_attempt().await.unwrap(),
       "user-id"
     );
     // The session is not authenticated by the exchange alone
@@ -364,6 +364,6 @@ mod tests {
     let err = run(&auth, &session, &token()).await.err().unwrap();
     assert_eq!(err.status, StatusCode::FORBIDDEN);
     assert!(auth.synced.lock().unwrap().is_empty());
-    assert!(session.retrieve_totp_login_user_id().await.is_err());
+    assert!(session.begin_totp_login_attempt().await.is_err());
   }
 }

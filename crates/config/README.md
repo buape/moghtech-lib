@@ -32,3 +32,11 @@ let config = (ConfigLoader {
 .load::<Config>()
 .expect("Failed to parse config from path");
 ```
+
+## Features
+
+- `cicada` (off by default since 3.0): load config from [Cicada](https://github.com/moghtech/cicada)
+  with `cicada:` paths, eg. `cicada://filesystem/config.yaml?env=prod`. It pulls
+  the Cicada client into the build, so it is opt in:
+  `mogh_config = { version = "3", features = ["cicada"] }`.
+  Without it a `cicada:` path is an error, not a skipped path.

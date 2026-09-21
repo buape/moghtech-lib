@@ -1,0 +1,19 @@
+{
+  "name": "example_client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Typescript client for the Mogh example app",
+  "main": "dist/lib.js",
+  "types": "dist/lib.d.ts",
+  "type": "module",
+  "license": "MPL-2.0",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "mogh_auth_client": "file:../../../auth/client/ts"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

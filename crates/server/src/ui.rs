@@ -23,6 +23,14 @@ fn with_index_fallback(
   index: Router,
 ) -> ServeDir<SetStatus<Router>> {
   ServeDir::new(directory)
+    // Otherwise `/` (what browsers actually request) is answered by
+    // ServeDir itself with the plain `index.html` file, skipping the
+    // index router below and with it the content hash ETag /
+    // `no-cache` header. The file ETag is built from mtime and size,
+    // which can be identical between two builds of a UI (fixed image
+    // timestamps, same length hashed asset names), leaving browsers
+    // on a stale index after an upgrade.
+    .append_index_html_on_directories(false)
     .fallback(SetStatus::new(index, StatusCode::OK))
 }
 

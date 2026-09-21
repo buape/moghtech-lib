@@ -5,6 +5,7 @@ pub mod config;
 pub mod event;
 pub mod passkey;
 pub mod request;
+pub mod signature;
 
 #[allow(unused)]
 #[cfg(feature = "utoipa")]

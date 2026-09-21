@@ -260,9 +260,11 @@ impl OidcProvider {
       })
     };
 
+    // The login can't be trusted, which is not a server error.
     let claims = id_token
       .claims(&verifier, nonce)
-      .context("Failed to verify token claims. This issue may be temporary (60 seconds max).")?;
+      .context("Failed to verify token claims. This issue may be temporary (60 seconds max).")
+      .status_code(StatusCode::UNAUTHORIZED)?;
 
     // Verify the access token hash to ensure that the access token hasn't been substituted for
     // another user's.

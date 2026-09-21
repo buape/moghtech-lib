@@ -37,6 +37,21 @@ struct Variant {
   variant: String,
 }
 
+/// Builds the tagged request (`{ type, params }`) of the
+/// `/{variant}` routes. An unknown variant or invalid params
+/// is the clients fault (BAD_REQUEST), not a server error.
+fn parse_variant_request<R: serde::de::DeserializeOwned>(
+  variant: String,
+  params: serde_json::Value,
+) -> mogh_error::Result<R> {
+  serde_json::from_value(serde_json::json!({
+    "type": variant,
+    "params": params,
+  }))
+  .context("Invalid request")
+  .status_code(StatusCode::BAD_REQUEST)
+}
+
 #[derive(serde::Deserialize)]
 pub struct RedirectQuery {
   redirect: Option<String>,
@@ -299,6 +314,52 @@ mod tests {
         external_login_requires_two_factor(&user),
         required,
         "skip: {external_skip_2fa}, totp: {totp}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_parse_variant_request() {
+    use mogh_auth_client::api::login::{
+      LoginLocalUser, SignUpLocalUser,
+    };
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", content = "params")]
+    enum TestRequest {
+      LoginLocalUser(LoginLocalUser),
+      #[allow(unused)]
+      SignUpLocalUser(SignUpLocalUser),
+    }
+
+    let req: TestRequest = parse_variant_request(
+      "LoginLocalUser".into(),
+      serde_json::json!({ "username": "user", "password": "pass" }),
+    )
+    .unwrap();
+    assert!(matches!(
+      req,
+      TestRequest::LoginLocalUser(LoginLocalUser { username, .. })
+        if username == "user"
+    ));
+
+    // The client sent these, so they aren't server errors.
+    for (variant, params) in [
+      ("Unknown", serde_json::json!({})),
+      ("LoginLocalUser", serde_json::json!({})),
+      ("LoginLocalUser", serde_json::json!({ "username": 1 })),
+      ("LoginLocalUser", serde_json::json!(null)),
+    ] {
+      let err = parse_variant_request::<TestRequest>(
+        variant.into(),
+        params.clone(),
+      )
+      .err()
+      .unwrap();
+      assert_eq!(
+        err.status,
+        StatusCode::BAD_REQUEST,
+        "{variant} {params}"
       );
     }
   }

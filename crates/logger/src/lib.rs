@@ -24,6 +24,17 @@ pub fn init(config: impl config::LogConfig) -> anyhow::Result<()> {
   let mut filter_targets =
     Targets::new().with_default(LevelFilter::OFF);
 
+  // Only the configured targets are logged, so without any the app
+  // is silent. The logger isn't up yet, this has to go to stderr.
+  if config.targets().is_empty()
+    && (config.stdio() != StdioLogMode::None
+      || !config.otlp_endpoint().is_empty())
+  {
+    eprintln!(
+      "WARN: mogh_logger: 'LogConfig::targets' is empty, nothing will be logged. Add the targets to include, eg. the name of the binary."
+    );
+  }
+
   for target in config.targets() {
     filter_targets =
       filter_targets.with_target(target, config.level());
