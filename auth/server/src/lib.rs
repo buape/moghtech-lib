@@ -488,7 +488,8 @@ pub trait AuthImpl: Send + Sync + 'static {
   }
 
   /// Called on every successful external authentication of a user:
-  /// login, directly after signup, and directly after linking.
+  /// login, directly after signup, directly after linking,
+  /// and token exchange (`POST /token`, RFC 8693).
   /// Use this to sync the users groups (`info.groups`) and
   /// admin status (`info.admin`) from the provider.
   /// Both are `None` when no information is available,

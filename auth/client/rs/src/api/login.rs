@@ -182,6 +182,62 @@ pub type SignUpLocalUserResponse = JwtResponse;
 #[cfg(feature = "utoipa")]
 #[utoipa::path(
   post,
+  path = "/login/ExchangeExternalForJwt",
+  description = "Exchange a token issued by an external login provider for a JWT, without sending the user through the browser.",
+  request_body(content = ExchangeExternalForJwt),
+  responses(
+    (status = 200, description = "JWT auth token or 2 factor login continuation", body = ExchangeExternalForJwtResponse),
+    (status = 400, description = "The token was rejected", body = mogh_error::Serror),
+    (status = 401, description = "Unauthorized", body = mogh_error::Serror),
+    (status = 500, description = "Request failed", body = mogh_error::Serror)
+  ),
+)]
+fn exchange_external_for_jwt() {}
+
+/// Exchange a token issued by an external login provider for a JWT,
+/// without sending the user through the browser.
+/// Response: [ExchangeExternalForJwtResponse].
+///
+/// This is the token exchange of the `/token` endpoint (RFC 8693) as
+/// part of the login api, with the same rules: the provider must have
+/// token exchange enabled, the token must be signed by the provider
+/// (ID token / JWT) for an accepted audience, and the user must
+/// already exist.
+///
+/// Unlike `/token`, users requiring a second factor for external logins
+/// can continue with [CompleteTotpLogin] / [CompletePasskeyLogin].
+/// This uses the session, so the client has to keep cookies
+/// between the requests.
+#[typeshare]
+#[derive(Serialize, Deserialize, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(MoghAuthLoginRequest)]
+#[response(ExchangeExternalForJwtResponse)]
+#[error(mogh_error::Error)]
+pub struct ExchangeExternalForJwt {
+  /// The token issued by the external login provider.
+  pub token: String,
+}
+
+/// The token is redacted.
+impl std::fmt::Debug for ExchangeExternalForJwt {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ExchangeExternalForJwt")
+      .field("token", &"##############")
+      .finish()
+  }
+}
+
+/// The response for [ExchangeExternalForJwt]
+#[typeshare]
+pub type ExchangeExternalForJwtResponse = JwtOrTwoFactor;
+
+//
+
+#[allow(unused)]
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
   path = "/login/LoginLocalUser",
   description = "Login as a local user.",
   request_body(content = LoginLocalUser),
@@ -418,6 +474,22 @@ mod tests {
         }],
         "auto_redirect": null,
       })
+    );
+  }
+
+  #[test]
+  fn test_exchange_external_for_jwt_redacts_token() {
+    let request = ExchangeExternalForJwt {
+      token: "secret.id.token".into(),
+    };
+    assert!(!format!("{request:?}").contains("secret.id.token"));
+    assert_eq!(
+      serde_json::to_value(&request).unwrap(),
+      json!({ "token": "secret.id.token" })
+    );
+    assert_eq!(
+      ExchangeExternalForJwt::req_type(),
+      "ExchangeExternalForJwt"
     );
   }
 

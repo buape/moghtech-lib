@@ -112,6 +112,16 @@ async fn load_enabled_provider<I: AuthImpl>(
     );
   }
 
+  let built = load_provider_client(auth, &provider).await?;
+
+  Ok((provider, built))
+}
+
+/// Loads the client of an already resolved provider.
+pub(crate) async fn load_provider_client<I: AuthImpl + ?Sized>(
+  auth: &I,
+  provider: &ExternalLoginProvider,
+) -> mogh_error::Result<Arc<BuiltProvider>> {
   // The app name is the user agent for provider discovery,
   // only require apps to implement it for the kinds using it.
   let app_user_agent = match provider.kind() {
@@ -127,7 +137,7 @@ async fn load_enabled_provider<I: AuthImpl>(
     app_user_agent,
     auth.host(),
     auth.path(),
-    &provider,
+    provider,
   )
   .await
   .map_err(|e| {
@@ -139,7 +149,7 @@ async fn load_enabled_provider<I: AuthImpl>(
     anyhow!("Login provider '{}' is not available", provider.name)
   })?;
 
-  Ok((provider, built))
+  Ok(built)
 }
 
 pub async fn external_login<I: AuthImpl>(
@@ -661,6 +671,7 @@ mod tests {
       id: id.to_string(),
       name: "Github".to_string(),
       registration_disabled: false,
+      token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(
         mogh_auth_client::config::NamedOauthConfig {
           enabled,

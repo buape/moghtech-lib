@@ -245,12 +245,14 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
         id: ExternalLoginKind::Oidc.reserved_id().to_string(),
         name: String::from("OIDC"),
         registration_disabled: false,
+        token_exchange: Default::default(),
         config: ExternalLoginProviderConfig::Oidc(config.oidc.clone()),
       },
       ExternalLoginProvider {
         id: ExternalLoginKind::Github.reserved_id().to_string(),
         name: String::from("Github"),
         registration_disabled: false,
+        token_exchange: Default::default(),
         config: ExternalLoginProviderConfig::Github(
           config.github_oauth.clone(),
         ),
@@ -520,3 +522,67 @@ axum::Router::new()
   .nest("/auth", mogh_auth_server::api::router::<AppAuthImpl>())
   .layer(mogh_server::session::memory_session_layer(MemorySessionConfig))
 ```
+### Token exchange (RFC 8693)
+
+A client which already holds a token for a user from one of the external
+login providers (eg. a CLI, a script, or another app) can exchange it for
+an app token at `POST {path}/token`, without sending the user through the browser.
+
+It is off by default, and enabled per provider (OIDC and Google):
+
+```rust
+ExternalLoginProvider {
+  id: String::from("oidc"),
+  name: String::from("OIDC"),
+  registration_disabled: false,
+  token_exchange: TokenExchangeConfig {
+    enabled: true,
+    // Accept tokens the provider issued to these apps,
+    // in addition to the client id of the provider.
+    audiences: vec![String::from("my-cli-client-id")],
+    // Only accept tokens issued in the last 5 minutes (0 = until they expire).
+    max_token_age_secs: 300,
+  },
+  config: ExternalLoginProviderConfig::Oidc(config.oidc.clone()),
+}
+```
+
+```sh
+curl https://app.example.com/auth/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  -d subject_token=$ID_TOKEN
+# {"access_token":"<app jwt>","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":86400}
+
+curl https://app.example.com/api/... -H "Authorization: Bearer <app jwt>"
+```
+
+Or with the rust client: `mogh_auth_client::request::token_exchange`.
+
+The same exchange is part of the login api as `ExchangeExternalForJwt { token }`,
+for clients already using it (`authClient().login("ExchangeExternalForJwt", { token })`).
+It responds like `LoginLocalUser`: either the JWT, or the second factor to
+complete with `CompleteTotpLogin` / `CompletePasskeyLogin` on the same session,
+so the client has to keep cookies between the requests. `/token` has no way to
+continue, and rejects users who need a second factor for external logins.
+
+- Only tokens **signed by the provider** are accepted (ID tokens / JWTs),
+  verified against the keys it publishes. The provider is selected by the
+  `iss` claim of the token. Opaque access tokens are rejected, they can't
+  be tied to an audience.
+- The token must be issued to the client id of the provider, or one of
+  `audiences`. ⚠️ Tokens the provider issues to every app listed there
+  can be used to log in to this app.
+- The user must already exist and be linked to the provider.
+  The endpoint never signs up users. If several providers share the
+  issuer, the first which accepts the token and knows the user decides.
+- A captured token can be exchanged by anyone until it expires, and some
+  providers issue tokens valid for hours. `max_token_age_secs` limits this
+  to the time since the token was issued. Clients should exchange a token
+  right after receiving it, and keep the app token.
+- 'allowed_groups' and the user cidr whitelist apply like for a login,
+  and `AuthImpl::sync_external_user` is called. Groups can only come
+  from the token itself here, there is no user info request.
+- Users who need a second factor for external logins are rejected
+  by `/token`, and continue with it using `ExchangeExternalForJwt`.
+- Errors use the OAuth format: `{"error":"invalid_grant","error_description":"..."}`.

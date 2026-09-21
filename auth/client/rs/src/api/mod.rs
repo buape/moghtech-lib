@@ -3,6 +3,7 @@ use typeshare::typeshare;
 
 pub mod login;
 pub mod manage;
+pub mod token;
 
 #[allow(unused)]
 #[cfg(feature = "utoipa")]

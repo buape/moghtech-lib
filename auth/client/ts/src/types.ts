@@ -31,6 +31,46 @@ export type CompleteTotpRecoveryLoginResponse = JwtResponse;
 /** Response for [ConfirmPasskeyEnrollment]. */
 export type ConfirmPasskeyEnrollmentResponse = NoData;
 
+export type U64 = number;
+
+/**
+ * Settings to exchange tokens issued by an [ExternalLoginProvider]
+ * for an app token at the token endpoint (RFC 8693 Token Exchange).
+ * 
+ * Only signed ID tokens / JWTs are accepted, which excludes
+ * Github. The user the token belongs to must already exist.
+ * 
+ * ⚠️ Whoever holds a valid token of a user can log in as that user
+ * without any interaction, only enable this where it is needed.
+ */
+export interface TokenExchangeConfig {
+	/** Whether tokens of this provider can be exchanged. */
+	enabled?: boolean;
+	/**
+	 * Audiences (`aud`) accepted on exchanged tokens in
+	 * addition to the client id of the provider. These are the client
+	 * ids of other apps (eg. a CLI) registered at the same provider.
+	 * 
+	 * ⚠️ Tokens the provider issues to every app listed
+	 * here can be used to log in to this app.
+	 * 
+	 * Note. Users are found by the subject (`sub`) of the token. A
+	 * provider using pairwise subject identifiers gives the same user
+	 * a different subject per app, so their tokens won't match a user.
+	 */
+	audiences?: string[];
+	/**
+	 * Only accept tokens issued (`iat`) at most this many seconds
+	 * ago. `0` (default) accepts tokens until they expire.
+	 * 
+	 * A captured token can be exchanged by anyone until then, and some
+	 * providers issue tokens which are valid for hours. Clients are
+	 * expected to exchange a token right after receiving it and keep
+	 * the app token, so a few minutes is enough.
+	 */
+	max_token_age_secs?: U64;
+}
+
 /** The kind specific configuration of an [ExternalLoginProvider]. */
 export type ExternalLoginProviderConfig = 
 	| { kind: "Oidc", params: OidcConfig }
@@ -55,6 +95,11 @@ export interface ExternalLoginProvider {
 	name: string;
 	/** Disable new user registration using this provider. */
 	registration_disabled?: boolean;
+	/**
+	 * Allow tokens issued by this provider to be
+	 * exchanged for an app token (RFC 8693). Disabled by default.
+	 */
+	token_exchange?: TokenExchangeConfig;
 	/** The kind specific provider configuration. */
 	config: ExternalLoginProviderConfig;
 }
@@ -85,19 +130,22 @@ export type DeleteApiKeyV2Response = NoData;
 
 export type DeleteExternalLoginProviderResponse = NoData;
 
-/** Response for [ExchangeForJwt]. */
-export type ExchangeForJwtResponse = JwtResponse;
-
-export type JsonValue = any;
-
-export type ListExternalLoginProvidersResponse = ExternalLoginProviderListItem[];
-
 /** JSON containing either an authentication token or the required 2fa auth check. */
 export type JwtOrTwoFactor = 
 	| { type: "Jwt", data: JwtResponse }
 	| { type: "Passkey", data: RequestChallengeResponse }
 	| { type: "Totp", data: {
 }};
+
+/** The response for [ExchangeExternalForJwt] */
+export type ExchangeExternalForJwtResponse = JwtOrTwoFactor;
+
+/** Response for [ExchangeForJwt]. */
+export type ExchangeForJwtResponse = JwtResponse;
+
+export type JsonValue = any;
+
+export type ListExternalLoginProvidersResponse = ExternalLoginProviderListItem[];
 
 /** The response for [LoginLocalUser] */
 export type LoginLocalUserResponse = JwtOrTwoFactor;
@@ -112,8 +160,6 @@ export type RequestChallengeResponse = any;
 
 /** Response for [SignUpLocalUser]. */
 export type SignUpLocalUserResponse = JwtResponse;
-
-export type U64 = number;
 
 /** Response for [UnenrollPasskey]. */
 export type UnenrollPasskeyResponse = NoData;
@@ -299,6 +345,11 @@ export interface CreateExternalLoginProvider {
 	name: string;
 	/** Disable new user registration using this provider. */
 	registration_disabled?: boolean;
+	/**
+	 * Allow tokens issued by this provider to be
+	 * exchanged for an app token (RFC 8693).
+	 */
+	token_exchange?: TokenExchangeConfig;
 	/** The kind specific provider configuration. */
 	config: ExternalLoginProviderConfig;
 }
@@ -330,6 +381,27 @@ export interface DeleteApiKeyV2 {
 export interface DeleteExternalLoginProvider {
 	/** The id of the provider to delete. */
 	id: string;
+}
+
+/**
+ * Exchange a token issued by an external login provider for a JWT,
+ * without sending the user through the browser.
+ * Response: [ExchangeExternalForJwtResponse].
+ * 
+ * This is the token exchange of the `/token` endpoint (RFC 8693) as
+ * part of the login api, with the same rules: the provider must have
+ * token exchange enabled, the token must be signed by the provider
+ * (ID token / JWT) for an accepted audience, and the user must
+ * already exist.
+ * 
+ * Unlike `/token`, users requiring a second factor for external logins
+ * can continue with [CompleteTotpLogin] / [CompletePasskeyLogin].
+ * This uses the session, so the client has to keep cookies
+ * between the requests.
+ */
+export interface ExchangeExternalForJwt {
+	/** The token issued by the external login provider. */
+	token: string;
 }
 
 /**
@@ -536,6 +608,52 @@ export interface SignUpLocalUser {
 	password: string;
 }
 
+/** A failed token exchange (RFC 6749 section 5.2). */
+export interface TokenExchangeError {
+	/**
+	 * The OAuth error code:
+	 * - `invalid_request`: The request is malformed or uses unsupported parameters.
+	 * - `unsupported_grant_type`: `grant_type` is not token exchange.
+	 * - `invalid_grant`: The subject token was rejected.
+	 * - `temporarily_unavailable`: Too many failed requests.
+	 * - `server_error`
+	 */
+	error: string;
+	/** Human readable details. */
+	error_description?: string;
+}
+
+/**
+ * The form parameters of a token exchange request (RFC 8693 section 2.1).
+ * `resource`, `audience` and `scope` are accepted but have no effect.
+ */
+export interface TokenExchangeRequest {
+	/** Must be [GRANT_TYPE_TOKEN_EXCHANGE]. */
+	grant_type: string;
+	/** The token issued by the external login provider. */
+	subject_token: string;
+	/** [TOKEN_TYPE_ID_TOKEN] or [TOKEN_TYPE_JWT]. */
+	subject_token_type: string;
+	/** Optional. [TOKEN_TYPE_ACCESS_TOKEN] (default) or [TOKEN_TYPE_JWT]. */
+	requested_token_type?: string;
+	/** Not supported (delegation), requests including it are rejected. */
+	actor_token?: string;
+	/** Not supported (delegation). */
+	actor_token_type?: string;
+}
+
+/** A successful token exchange (RFC 8693 section 2.2.1). */
+export interface TokenExchangeResponse {
+	/** The app token (JWT), sent as `Authorization: Bearer <token>`. */
+	access_token: string;
+	/** The `requested_token_type`, or [TOKEN_TYPE_ACCESS_TOKEN]. */
+	issued_token_type: string;
+	/** Always `Bearer`. */
+	token_type: string;
+	/** Seconds until the app token expires. */
+	expires_in: U64;
+}
+
 /**
  * Unenrolls user in Passkey 2FA.
  * Response: [NoData]
@@ -583,6 +701,11 @@ export interface UpdateExternalLoginProvider {
 	name: string;
 	/** Disable new user registration using this provider. */
 	registration_disabled?: boolean;
+	/**
+	 * Allow tokens issued by this provider to be
+	 * exchanged for an app token (RFC 8693).
+	 */
+	token_exchange?: TokenExchangeConfig;
 	/** The kind specific provider configuration. */
 	config: ExternalLoginProviderConfig;
 	/**
@@ -623,6 +746,7 @@ export interface UpdateUsername {
 export type LoginRequest = 
 	| { type: "GetLoginOptions", params: GetLoginOptions }
 	| { type: "ExchangeForJwt", params: ExchangeForJwt }
+	| { type: "ExchangeExternalForJwt", params: ExchangeExternalForJwt }
 	| { type: "SignUpLocalUser", params: SignUpLocalUser }
 	| { type: "LoginLocalUser", params: LoginLocalUser }
 	| { type: "CompletePasskeyLogin", params: CompletePasskeyLogin }

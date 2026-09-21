@@ -3,6 +3,8 @@ use strum::{Display, EnumString};
 use typeshare::typeshare;
 use zeroize::Zeroize;
 
+use crate::U64;
+
 /// Replaces secrets in sanitized configs.
 pub const REDACTED: &str = "##############";
 
@@ -69,8 +71,52 @@ pub struct ExternalLoginProvider {
   /// Disable new user registration using this provider.
   #[serde(default)]
   pub registration_disabled: bool,
+  /// Allow tokens issued by this provider to be
+  /// exchanged for an app token (RFC 8693). Disabled by default.
+  #[serde(default)]
+  pub token_exchange: TokenExchangeConfig,
   /// The kind specific provider configuration.
   pub config: ExternalLoginProviderConfig,
+}
+
+/// Settings to exchange tokens issued by an [ExternalLoginProvider]
+/// for an app token at the token endpoint (RFC 8693 Token Exchange).
+///
+/// Only signed ID tokens / JWTs are accepted, which excludes
+/// Github. The user the token belongs to must already exist.
+///
+/// ⚠️ Whoever holds a valid token of a user can log in as that user
+/// without any interaction, only enable this where it is needed.
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Hash, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct TokenExchangeConfig {
+  /// Whether tokens of this provider can be exchanged.
+  #[serde(default)]
+  pub enabled: bool,
+  /// Audiences (`aud`) accepted on exchanged tokens in
+  /// addition to the client id of the provider. These are the client
+  /// ids of other apps (eg. a CLI) registered at the same provider.
+  ///
+  /// ⚠️ Tokens the provider issues to every app listed
+  /// here can be used to log in to this app.
+  ///
+  /// Note. Users are found by the subject (`sub`) of the token. A
+  /// provider using pairwise subject identifiers gives the same user
+  /// a different subject per app, so their tokens won't match a user.
+  #[serde(default)]
+  pub audiences: Vec<String>,
+  /// Only accept tokens issued (`iat`) at most this many seconds
+  /// ago. `0` (default) accepts tokens until they expire.
+  ///
+  /// A captured token can be exchanged by anyone until then, and some
+  /// providers issue tokens which are valid for hours. Clients are
+  /// expected to exchange a token right after receiving it and keep
+  /// the app token, so a few minutes is enough.
+  #[serde(default)]
+  pub max_token_age_secs: U64,
 }
 
 impl ExternalLoginProvider {
@@ -358,6 +404,7 @@ mod tests {
       id: id.to_string(),
       name: "Github".to_string(),
       registration_disabled: false,
+      token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
         enabled: true,
         client_id: "client-id".into(),
@@ -418,6 +465,21 @@ mod tests {
     let roundtrip: ExternalLoginProvider =
       serde_json::from_value(value).unwrap();
     assert_eq!(roundtrip, provider);
+  }
+
+  #[test]
+  fn test_token_exchange_disabled_by_default() {
+    // Providers stored before token exchange existed
+    let provider: ExternalLoginProvider =
+      serde_json::from_value(serde_json::json!({
+        "id": "github",
+        "name": "Github",
+        "config": { "kind": "Github", "params": {} },
+      }))
+      .unwrap();
+    assert!(!provider.token_exchange.enabled);
+    assert!(provider.token_exchange.audiences.is_empty());
+    assert_eq!(provider.token_exchange.max_token_age_secs, 0);
   }
 
   #[test]

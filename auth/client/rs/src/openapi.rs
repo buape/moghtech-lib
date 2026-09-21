@@ -2,7 +2,7 @@ use serde::Serialize;
 use utoipa::OpenApi;
 
 mod auth {
-  pub use crate::api::{external::*, login::*, manage::*};
+  pub use crate::api::{external::*, login::*, manage::*, token::*};
 }
 
 #[derive(OpenApi)]
@@ -13,6 +13,8 @@ mod auth {
     // =========
     auth::get_login_options,
     auth::exchange_for_jwt,
+    auth::exchange_external_for_jwt,
+    auth::token_exchange,
     auth::complete_passkey_login,
     auth::complete_totp_login,
     // ==========

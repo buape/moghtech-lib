@@ -3,7 +3,9 @@ use std::net::IpAddr;
 use anyhow::{Context as _, anyhow};
 use axum::{Router, response::Redirect, routing::get};
 use data_encoding::BASE64URL;
-use mogh_auth_client::api::login::UserIdOrTwoFactor;
+use mogh_auth_client::{
+  api::login::UserIdOrTwoFactor, passkey::RequestChallengeResponse,
+};
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -18,6 +20,7 @@ use crate::{
 pub mod external;
 pub mod login;
 pub mod manage;
+pub mod token;
 
 /// This router should be nested without any additional middleware
 pub fn router<I: AuthImpl>() -> Router {
@@ -26,6 +29,7 @@ pub fn router<I: AuthImpl>() -> Router {
     .nest("/login", login::router::<I>())
     .nest("/manage", manage::router::<I>())
     .merge(external::router::<I>())
+    .merge(token::router::<I>())
 }
 
 #[derive(serde::Deserialize)]
@@ -131,35 +135,37 @@ async fn unique_username<I: AuthImpl>(
   Ok(username)
 }
 
-/// Logs in an existing user found by an external provider,
-/// initiating 2FA if required. Enforces the user cidr whitelist.
-async fn get_user_id_or_two_factor<I: AuthImpl>(
+/// Whether an external login of the user has to be completed with a
+/// second factor, matching [get_user_id_or_two_factor].
+pub(crate) fn external_login_requires_two_factor(
+  user: &dyn crate::user::AuthUserImpl,
+) -> bool {
+  !user.external_skip_2fa()
+    && (user.passkey().is_some() || user.totp_secret().is_some())
+}
+
+/// The second factor an external login has to be completed with.
+pub(crate) enum ExternalTwoFactor {
+  Passkey(RequestChallengeResponse),
+  Totp,
+}
+
+/// Begins the second factor of an external login on the session if the
+/// user requires one ([external_login_requires_two_factor]). It is
+/// completed with `CompletePasskeyLogin` / `CompleteTotpLogin`.
+pub(crate) async fn begin_external_two_factor<
+  I: AuthImpl + ?Sized,
+>(
   auth: &I,
   session: &Session,
-  user: &BoxAuthUser,
-  ip: IpAddr,
-) -> mogh_error::Result<UserIdOrTwoFactor> {
-  check_user_cidr_whitelist(user.as_ref(), ip)?;
-
-  let res = match (
-    user.external_skip_2fa(),
-    user.passkey(),
-    user.totp_secret(),
-  ) {
-    // Skip / No 2FA
-    (true, _, _) | (false, None, None) => {
-      session.insert_authenticated_user_id(user.id()).await?;
-
-      info!(
-        user_id = user.id(),
-        username = user.username(),
-        "User logged in"
-      );
-
-      UserIdOrTwoFactor::UserId(user.id().to_string())
-    }
+  user: &dyn crate::user::AuthUserImpl,
+) -> mogh_error::Result<Option<ExternalTwoFactor>> {
+  if !external_login_requires_two_factor(user) {
+    return Ok(None);
+  }
+  match (user.passkey(), user.totp_secret()) {
     // WebAuthn Passkey 2FA
-    (false, Some(passkey), _) => {
+    (Some(passkey), _) => {
       let provider = auth.passkey_provider().context(
         "No passkey provider available, possibly invalid 'host' config.",
       )?;
@@ -174,10 +180,10 @@ async fn get_user_id_or_two_factor<I: AuthImpl>(
         "Passkey 2FA flow initiated"
       );
 
-      UserIdOrTwoFactor::Passkey(response)
+      Ok(Some(ExternalTwoFactor::Passkey(response)))
     }
     // TOTP 2FA
-    (false, None, Some(_)) => {
+    (None, Some(_)) => {
       session.insert_totp_login_user_id(user.id()).await?;
 
       info!(
@@ -186,9 +192,43 @@ async fn get_user_id_or_two_factor<I: AuthImpl>(
         "TOTP 2FA flow initiated"
       );
 
-      UserIdOrTwoFactor::Totp {}
+      Ok(Some(ExternalTwoFactor::Totp))
     }
-  };
+    (None, None) => Ok(None),
+  }
+}
+
+/// Logs in an existing user found by an external provider,
+/// initiating 2FA if required. Enforces the user cidr whitelist.
+async fn get_user_id_or_two_factor<I: AuthImpl>(
+  auth: &I,
+  session: &Session,
+  user: &BoxAuthUser,
+  ip: IpAddr,
+) -> mogh_error::Result<UserIdOrTwoFactor> {
+  check_user_cidr_whitelist(user.as_ref(), ip)?;
+
+  let res =
+    match begin_external_two_factor(auth, session, user.as_ref())
+      .await?
+    {
+      // Skip / No 2FA
+      None => {
+        session.insert_authenticated_user_id(user.id()).await?;
+
+        info!(
+          user_id = user.id(),
+          username = user.username(),
+          "User logged in"
+        );
+
+        UserIdOrTwoFactor::UserId(user.id().to_string())
+      }
+      Some(ExternalTwoFactor::Passkey(response)) => {
+        UserIdOrTwoFactor::Passkey(response)
+      }
+      Some(ExternalTwoFactor::Totp) => UserIdOrTwoFactor::Totp {},
+    };
   Ok(res)
 }
 
@@ -222,6 +262,46 @@ mod tests {
   use axum::response::IntoResponse;
 
   use super::*;
+
+  struct TwoFactorUser {
+    external_skip_2fa: bool,
+    totp: bool,
+  }
+
+  impl crate::user::AuthUserImpl for TwoFactorUser {
+    fn id(&self) -> &str {
+      "id"
+    }
+    fn username(&self) -> &str {
+      "user"
+    }
+    fn external_skip_2fa(&self) -> bool {
+      self.external_skip_2fa
+    }
+    fn totp_secret(&self) -> Option<&str> {
+      self.totp.then_some("secret")
+    }
+  }
+
+  #[test]
+  fn test_external_login_requires_two_factor() {
+    for (external_skip_2fa, totp, required) in [
+      (true, true, false),
+      (true, false, false),
+      (false, false, false),
+      (false, true, true),
+    ] {
+      let user = TwoFactorUser {
+        external_skip_2fa,
+        totp,
+      };
+      assert_eq!(
+        external_login_requires_two_factor(&user),
+        required,
+        "skip: {external_skip_2fa}, totp: {totp}"
+      );
+    }
+  }
 
   fn location(redirect: Redirect) -> String {
     redirect

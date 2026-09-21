@@ -14,7 +14,7 @@ use mogh_auth_client::config::{
   ExternalLoginKind, ExternalLoginProvider,
   ExternalLoginProviderConfig,
 };
-use mogh_error::AddStatusCode as _;
+use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use openidconnect::{
   CsrfToken, Nonce, PkceCodeChallenge, PkceCodeVerifier,
 };
@@ -256,6 +256,63 @@ impl BuiltProvider {
           pkce_verifier: None,
         }
       }
+    }
+  }
+
+  /// Verifies a token presented for RFC 8693 token exchange and
+  /// returns the identity it belongs to. The token must be signed by
+  /// the provider and issued to an accepted audience, see
+  /// [TokenExchangeConfig][mogh_auth_client::config::TokenExchangeConfig].
+  /// For OIDC, this enforces 'allowed_groups'.
+  pub fn verify_exchange_token(
+    &self,
+    provider: &ExternalLoginProvider,
+    token: &str,
+  ) -> mogh_error::Result<ExternalLoginInfo> {
+    let base_info = |external_id: String| ExternalLoginInfo {
+      provider_id: provider.id.clone(),
+      kind: provider.kind(),
+      external_id,
+      avatar_url: None,
+      groups: None,
+      admin: None,
+    };
+    let exchange = &provider.token_exchange;
+    match (self, &provider.config) {
+      (
+        BuiltProvider::Oidc(oidc),
+        ExternalLoginProviderConfig::Oidc(config),
+      ) => {
+        let info =
+          oidc.verify_exchange_token(config, exchange, token)?;
+        Ok(ExternalLoginInfo {
+          groups: info.groups,
+          admin: info.admin,
+          ..base_info(info.subject.to_string())
+        })
+      }
+      (
+        BuiltProvider::Google(google),
+        ExternalLoginProviderConfig::Google(_),
+      ) => {
+        let user = google
+          .verify_exchange_token(exchange, token)
+          .status_code(StatusCode::BAD_REQUEST)?;
+        Ok(ExternalLoginInfo {
+          avatar_url: Some(user.picture),
+          ..base_info(user.id)
+        })
+      }
+      (BuiltProvider::Github(_), _) => Err(
+        anyhow!(
+          "Github does not issue tokens which can be exchanged"
+        )
+        .status_code(StatusCode::BAD_REQUEST),
+      ),
+      _ => Err(
+        anyhow!("Built provider does not match the provider kind")
+          .into(),
+      ),
     }
   }
 
@@ -679,6 +736,7 @@ mod tests {
       id: id.to_string(),
       name: format!("Github {id}"),
       registration_disabled: false,
+      token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
         enabled: true,
         client_id: "client-id".to_string(),

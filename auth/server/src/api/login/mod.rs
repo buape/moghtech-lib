@@ -22,6 +22,7 @@ use crate::{
   session::Session,
 };
 
+pub mod external;
 pub mod local;
 pub mod passkey;
 pub mod totp;
@@ -45,6 +46,7 @@ pub struct LoginArgs {
 pub enum LoginRequest {
   GetLoginOptions(GetLoginOptions),
   ExchangeForJwt(ExchangeForJwt),
+  ExchangeExternalForJwt(ExchangeExternalForJwt),
   SignUpLocalUser(SignUpLocalUser),
   LoginLocalUser(LoginLocalUser),
   CompletePasskeyLogin(CompletePasskeyLogin),
@@ -279,6 +281,7 @@ mod tests {
       id: id.to_string(),
       name: format!("OIDC {id}"),
       registration_disabled: false,
+      token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Oidc(OidcConfig {
         enabled,
         provider: "https://idp.example.com".into(),
@@ -297,6 +300,7 @@ mod tests {
       id: id.to_string(),
       name: format!("Github {id}"),
       registration_disabled,
+      token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
         enabled: true,
         client_id: "test-id".into(),

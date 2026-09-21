@@ -1,10 +1,23 @@
 import { LoginResponses, ManageResponses } from "./responses.js";
-import type { LoginRequest, ManageRequest } from "./types.js";
+import type {
+  LoginRequest,
+  ManageRequest,
+  TokenExchangeError,
+  TokenExchangeResponse,
+} from "./types.js";
 
 export * as Types from "./types.js";
 export * as Passkey from "./passkey.js";
 export { LOGIN_TOKENS, extractUserIdFromJwt } from "./tokens.js";
 export type { LoginResponses, ManageResponses };
+
+/** RFC 8693 identifiers used by the token endpoint. */
+export const TOKEN_EXCHANGE = {
+  GRANT_TYPE: "urn:ietf:params:oauth:grant-type:token-exchange",
+  ID_TOKEN: "urn:ietf:params:oauth:token-type:id_token",
+  JWT: "urn:ietf:params:oauth:token-type:jwt",
+  ACCESS_TOKEN: "urn:ietf:params:oauth:token-type:access_token",
+} as const;
 
 export function MoghAuthClient(url: string, jwt?: string) {
   const request = <Params, Res>(
@@ -112,9 +125,64 @@ export function MoghAuthClient(url: string, jwt?: string) {
     location.replace(externalLinkUrl(providerId));
   };
 
+  /**
+   * RFC 8693 Token Exchange: exchange a token issued by an external
+   * login provider (an ID token / JWT) for an app token, without
+   * sending the user through the browser.
+   *
+   * The provider must have token exchange enabled,
+   * and the user must already exist.
+   *
+   * Rejects with `{ status, result }`, where `result` is the
+   * OAuth error: `{ error, error_description }`.
+   *
+   * @param subjectToken The token issued by the provider.
+   * @param subjectTokenType `TOKEN_EXCHANGE.ID_TOKEN` (default) or `TOKEN_EXCHANGE.JWT`.
+   */
+  const tokenExchange = (
+    subjectToken: string,
+    subjectTokenType:
+      | typeof TOKEN_EXCHANGE.ID_TOKEN
+      | typeof TOKEN_EXCHANGE.JWT = TOKEN_EXCHANGE.ID_TOKEN
+  ): Promise<TokenExchangeResponse> =>
+    new Promise(async (res, rej) => {
+      try {
+        // The RFC requires a form, not json.
+        const response = await fetch(`${url}/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: TOKEN_EXCHANGE.GRANT_TYPE,
+            subject_token: subjectToken,
+            subject_token_type: subjectTokenType,
+          }),
+        });
+        if (response.status === 200) {
+          res(await response.json());
+        } else {
+          let result: TokenExchangeError;
+          try {
+            result = await response.json();
+          } catch {
+            result = { error: "server_error" };
+          }
+          rej({ status: response.status, result });
+        }
+      } catch (error) {
+        rej({
+          status: 1,
+          result: {
+            error: "server_error",
+            error_description: "Request failed with error",
+          } satisfies TokenExchangeError,
+          error,
+        });
+      }
+    });
+
   return {
     login,
     manage,
+    tokenExchange,
     externalLogin,
     externalLinkUrl,
     externalLink,

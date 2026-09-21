@@ -184,6 +184,11 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
                       No sign up
                     </Badge>
                   )}
+                  {item.provider.token_exchange?.enabled && (
+                    <Badge color="yellow" title="Token exchange enabled">
+                      Token exchange
+                    </Badge>
+                  )}
                 </Group>
               );
             },

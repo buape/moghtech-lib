@@ -4,6 +4,7 @@ import {
   Divider,
   Group,
   Modal,
+  NumberInput,
   PasswordInput,
   Stack,
   Switch,
@@ -30,6 +31,11 @@ interface ProviderFormValues {
   client_secret: string;
   /** Remove the stored secret. Not part of the provider config. */
   clear_client_secret: boolean;
+  // Token exchange
+  token_exchange_enabled: boolean;
+  token_exchange_audiences: string[];
+  /** 0 for no limit */
+  token_exchange_max_age_secs: number;
   // OIDC
   provider: string;
   redirect_host: string;
@@ -54,6 +60,10 @@ function formValues(item: ListItem): ProviderFormValues {
     // Left empty, the existing secret is kept.
     client_secret: "",
     clear_client_secret: false,
+    token_exchange_enabled: item.provider.token_exchange?.enabled ?? false,
+    token_exchange_audiences: item.provider.token_exchange?.audiences ?? [],
+    token_exchange_max_age_secs:
+      item.provider.token_exchange?.max_token_age_secs ?? 0,
     provider: oidc?.provider ?? "",
     redirect_host: oidc?.redirect_host ?? "",
     use_full_email: oidc?.use_full_email ?? false,
@@ -195,6 +205,10 @@ export function LoginProviderForm({
         }
         return null;
       },
+      token_exchange_max_age_secs: (age) =>
+        typeof age === "number" && Number.isInteger(age) && age >= 0
+          ? null
+          : "Must be a whole number of seconds, 0 for no limit",
       clear_client_secret: (clear, values) =>
         clear && kind !== "Oidc" && values.enabled
           ? "Disable the provider to remove its secret, it can't work without one"
@@ -226,6 +240,12 @@ export function LoginProviderForm({
           id: item.provider.id,
           name: values.name.trim(),
           registration_disabled: values.registration_disabled,
+          // Github has no signed tokens to exchange
+          token_exchange: {
+            enabled: kind !== "Github" && values.token_exchange_enabled,
+            audiences: values.token_exchange_audiences,
+            max_token_age_secs: values.token_exchange_max_age_secs,
+          },
           config: providerConfig(kind, values),
           clear_client_secret: values.clear_client_secret,
         }),
@@ -425,6 +445,58 @@ export function LoginProviderForm({
               description="Send users straight to this provider instead of showing the login page. Add ?disableAutoLogin to the login URL to get the page back."
               disabled={readOnly}
             />
+          </>
+        )}
+
+        {kind !== "Github" && (
+          <>
+            <Divider label="Token Exchange" labelPosition="left" />
+
+            <Switch
+              {...form.getInputProps("token_exchange_enabled", {
+                type: "checkbox",
+              })}
+              label="Allow token exchange"
+              description="Lets a client which already holds a token of a user from this provider (eg. a CLI or script) swap it for an app token at the token endpoint, without a browser login. Only for users who already exist."
+              disabled={readOnly}
+            />
+
+            {values.token_exchange_enabled && (
+              <>
+                <TagsInput
+                  {...form.getInputProps("token_exchange_audiences")}
+                  label="Accepted Audiences"
+                  description="Client ids of other apps at this provider whose tokens are accepted, in addition to the Client ID above"
+                  placeholder="Add client id"
+                  // The server accepts at most 16
+                  maxTags={16}
+                  disabled={readOnly}
+                />
+
+                <NumberInput
+                  {...form.getInputProps("token_exchange_max_age_secs")}
+                  label="Maximum Token Age"
+                  description="Only accept tokens issued at most this many seconds ago. 0 accepts them until they expire, which can be hours. Clients should exchange a token right after receiving it, so a few minutes (eg. 300) is enough."
+                  suffix=" seconds"
+                  min={0}
+                  allowDecimal={false}
+                  allowNegative={false}
+                  disabled={readOnly}
+                />
+
+                {!readOnly && (
+                  <Alert icon={<ShieldAlert size="1rem" />} color="yellow">
+                    Anyone holding a valid token of a user can log in as them
+                    without interaction
+                    {values.token_exchange_audiences.length > 0
+                      ? ", including tokens issued to every app listed above."
+                      : "."}{" "}
+                    Users who need a second factor for external logins can't
+                    use it.
+                  </Alert>
+                )}
+              </>
+            )}
           </>
         )}
 

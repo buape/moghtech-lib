@@ -2,8 +2,8 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use anyhow::{Context, anyhow};
 use axum::http::StatusCode;
-use mogh_auth_client::config::OidcConfig;
-use mogh_error::AddStatusCodeError;
+use mogh_auth_client::config::{OidcConfig, TokenExchangeConfig};
+use mogh_error::{AddStatusCode as _, AddStatusCodeError};
 use openidconnect::{
   AccessTokenHash, AdditionalClaims, AuthorizationCode, Client,
   ClientId, ClientSecret, CsrfToken, EmptyExtraTokenFields,
@@ -16,6 +16,8 @@ use openidconnect::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::provider::token_exchange::TokenVerificationKeys;
 
 pub use openidconnect::SubjectIdentifier;
 
@@ -79,6 +81,8 @@ pub struct OidcProvider {
   client: InnerOidcProvider,
   use_full_email: bool,
   additional_scopes: Vec<String>,
+  /// To verify tokens presented for token exchange
+  verification_keys: TokenVerificationKeys,
 }
 
 impl OidcProvider {
@@ -104,6 +108,24 @@ impl OidcProvider {
     .context(
       "Failed to get OIDC /.well-known/openid-configuration",
     )?;
+
+    Self::from_metadata(
+      app_user_agent,
+      redirect_uri,
+      config,
+      provider_metadata,
+    )
+  }
+
+  /// Initialize the provider from already discovered metadata.
+  pub fn from_metadata(
+    app_user_agent: &'static str,
+    redirect_uri: String,
+    config: &OidcConfig,
+    provider_metadata: CoreProviderMetadata,
+  ) -> anyhow::Result<OidcProvider> {
+    let verification_keys =
+      TokenVerificationKeys::from_metadata(&provider_metadata);
 
     let additional_scopes = additional_scopes(
       config,
@@ -131,7 +153,44 @@ impl OidcProvider {
       app_user_agent,
       use_full_email: config.use_full_email,
       additional_scopes,
+      verification_keys,
     })
+  }
+
+  /// Verifies a token presented for RFC 8693 token exchange, which
+  /// must be signed by the provider and issued to the client id or one
+  /// of the exchange audiences. Enforces 'allowed_groups'.
+  ///
+  /// Groups can only come from the token itself here,
+  /// there is no access token to get the networked user info with.
+  pub fn verify_exchange_token(
+    &self,
+    config: &OidcConfig,
+    exchange: &TokenExchangeConfig,
+    token: &str,
+  ) -> mogh_error::Result<OidcLoginInfo> {
+    let mut audiences = vec![config.client_id.clone()];
+    audiences.extend(exchange.audiences.iter().cloned());
+
+    let claims = self
+      .verification_keys
+      .verify::<UsernameAdditionalClaims>(
+        token,
+        &audiences,
+        &config.additional_audiences,
+        exchange.max_token_age_secs,
+      )
+      .status_code(StatusCode::BAD_REQUEST)?;
+
+    let groups = config.groups_claim().and_then(|claim| {
+      extract_groups(&claims.additional_claims().extra, claim)
+    });
+
+    let info =
+      OidcLoginInfo::new(config, claims.subject().clone(), groups);
+    info.check_allowed_groups(config)?;
+
+    Ok(info)
   }
 
   pub fn authorize_url(
@@ -653,6 +712,145 @@ mod tests {
       groups
         .map(|groups| groups.iter().map(|g| g.to_string()).collect()),
     )
+  }
+
+  fn exchange_provider(config: &OidcConfig) -> OidcProvider {
+    use crate::provider::token_exchange::test_tokens::metadata;
+    OidcProvider::from_metadata(
+      "test",
+      "https://app.example.com/auth/oidc/callback".to_string(),
+      config,
+      metadata(),
+    )
+    .unwrap()
+  }
+
+  fn exchange_token(
+    groups: Option<&[&str]>,
+  ) -> crate::provider::token_exchange::test_tokens::TestToken<
+    UsernameAdditionalClaims,
+  > {
+    let mut extra = HashMap::new();
+    if let Some(groups) = groups {
+      extra.insert("groups".to_string(), json!(groups));
+    }
+    crate::provider::token_exchange::test_tokens::TestToken::new(
+      UsernameAdditionalClaims {
+        username: None,
+        extra,
+      },
+    )
+  }
+
+  fn exchange_config(allowed: &[&str], admin: &[&str]) -> OidcConfig {
+    use crate::provider::token_exchange::test_tokens::{
+      CLIENT_ID, ISSUER,
+    };
+    OidcConfig {
+      enabled: true,
+      provider: ISSUER.to_string(),
+      client_id: CLIENT_ID.to_string(),
+      // Present, but never used to verify exchanged tokens
+      client_secret: "client-secret".to_string(),
+      ..config(allowed, admin)
+    }
+  }
+
+  #[test]
+  fn test_exchange_token_subject_groups_and_admin() {
+    let config = exchange_config(&[], &["admins"]);
+    let provider = exchange_provider(&config);
+    let info = provider
+      .verify_exchange_token(
+        &config,
+        &Default::default(),
+        &exchange_token(Some(&["users", "admins"])).mint(),
+      )
+      .unwrap();
+    assert_eq!(info.subject.as_str(), "subject-123");
+    assert_eq!(
+      info.groups,
+      Some(vec!["admins".to_string(), "users".to_string()])
+    );
+    assert_eq!(info.admin, Some(true));
+  }
+
+  #[test]
+  fn test_exchange_token_enforces_allowed_groups() {
+    let config = exchange_config(&["users"], &[]);
+    let provider = exchange_provider(&config);
+    assert!(
+      provider
+        .verify_exchange_token(
+          &config,
+          &Default::default(),
+          &exchange_token(Some(&["users"])).mint()
+        )
+        .is_ok()
+    );
+    // Not a member, and no group information at all (fails closed)
+    for groups in [Some(&["other"][..]), None] {
+      let err = provider
+        .verify_exchange_token(
+          &config,
+          &Default::default(),
+          &exchange_token(groups).mint(),
+        )
+        .unwrap_err();
+      assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+  }
+
+  #[test]
+  fn test_exchange_token_audiences() {
+    let config = exchange_config(&[], &[]);
+    let provider = exchange_provider(&config);
+    let cli_token = || {
+      let mut token = exchange_token(None);
+      token.audiences = vec!["cli-client".to_string()];
+      token.mint()
+    };
+    // Only the providers own client id by default
+    let err = provider
+      .verify_exchange_token(
+        &config,
+        &Default::default(),
+        &cli_token(),
+      )
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(
+      provider
+        .verify_exchange_token(
+          &config,
+          &TokenExchangeConfig {
+            audiences: vec!["cli-client".to_string()],
+            ..Default::default()
+          },
+          &cli_token()
+        )
+        .is_ok()
+    );
+  }
+
+  /// A confidential client would normally accept HS256 tokens signed
+  /// with the client secret, exchanged tokens never do.
+  #[test]
+  fn test_exchange_token_rejects_client_secret_signature() {
+    use crate::provider::token_exchange::test_tokens::Signer;
+    let config = exchange_config(&[], &[]);
+    let provider = exchange_provider(&config);
+    let mut token = exchange_token(None);
+    token.signer = Signer::Hmac("client-secret");
+    assert!(
+      provider
+        .verify_exchange_token(
+          &config,
+          &Default::default(),
+          &token.mint()
+        )
+        .is_err()
+    );
   }
 
   #[test]

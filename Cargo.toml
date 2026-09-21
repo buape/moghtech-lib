@@ -59,7 +59,7 @@ url = "2.5.8"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 data-encoding = "2.11.1"
-rand = "0.10.2"
+rand = "0.10.3"
 zeroize = { version = "1.9.0", features = ["derive"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
@@ -67,6 +67,8 @@ subtle = "2.6.1"
 # AUTH
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 openidconnect = { version = "4.0.1", features = ["accept-rfc3339-timestamps"] }
+# Only to mint test tokens, openidconnect uses it for token timestamps.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 totp-rs = { version = "6.0.0", features = ["qr", "serde"] }
 bcrypt = "0.19.3"
@@ -86,11 +88,12 @@ anyhow = "1.0.104"
 thiserror = "2.0.20"
 
 # LOGGING
+# tracing-opentelemetry 0.33 is tied to opentelemetry 0.32
+tracing-opentelemetry = "0.33.0"
 opentelemetry-otlp = { version = "0.32.0", features = ["tls-roots", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
 opentelemetry-semantic-conventions = "0.32.1"
-tracing-opentelemetry = "0.33.0"
 opentelemetry = "0.32.0"
 tracing = "0.1.44"
 

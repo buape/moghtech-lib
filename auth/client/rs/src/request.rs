@@ -5,7 +5,11 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 
 use crate::api::{
-  login::MoghAuthLoginRequest, manage::MoghAuthManageRequest,
+  login::MoghAuthLoginRequest,
+  manage::MoghAuthManageRequest,
+  token::{
+    TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse,
+  },
 };
 
 #[cfg(not(feature = "blocking"))]
@@ -58,6 +62,66 @@ where
   T::Response: DeserializeOwned,
 {
   post(reqwest, address, "/manage", request_body(&request))
+}
+
+/// RFC 8693 Token Exchange: exchange a token issued by an external
+/// login provider for an app token at the `/token` endpoint.
+#[cfg(not(feature = "blocking"))]
+pub async fn token_exchange(
+  reqwest: &reqwest::Client,
+  address: &str,
+  request: &TokenExchangeRequest,
+) -> anyhow::Result<TokenExchangeResponse> {
+  let res = reqwest
+    .post(request_url(address, "/token"))
+    .form(request)
+    .send()
+    .await
+    .context("failed to reach Mogh Auth API")?;
+  let status = res.status();
+  match res.text().await {
+    Ok(body) => parse_token_response(status, body),
+    Err(e) => Err(anyhow!("{e:?}").context(status)),
+  }
+}
+
+/// RFC 8693 Token Exchange: exchange a token issued by an external
+/// login provider for an app token at the `/token` endpoint.
+#[cfg(feature = "blocking")]
+pub fn token_exchange(
+  reqwest: &reqwest::blocking::Client,
+  address: &str,
+  request: &TokenExchangeRequest,
+) -> anyhow::Result<TokenExchangeResponse> {
+  let res = reqwest
+    .post(request_url(address, "/token"))
+    .form(request)
+    .send()
+    .context("failed to reach Mogh Auth API")?;
+  let status = res.status();
+  match res.text() {
+    Ok(body) => parse_token_response(status, body),
+    Err(e) => Err(anyhow!("{e:?}").context(status)),
+  }
+}
+
+/// The token endpoint uses the OAuth error format,
+/// the returned error can be downcast to [TokenExchangeError].
+fn parse_token_response(
+  status: reqwest::StatusCode,
+  body: String,
+) -> anyhow::Result<TokenExchangeResponse> {
+  if status.is_success() {
+    return serde_json::from_str(&body).map_err(|e| {
+      anyhow!("{e:#?}")
+        .context("failed to deserialize token response")
+        .context(status)
+    });
+  }
+  match serde_json::from_str::<TokenExchangeError>(&body) {
+    Ok(error) => Err(anyhow::Error::new(error).context(status)),
+    Err(_) => Err(anyhow!("{body}").context(status)),
+  }
 }
 
 /// Builds the tagged request body expected by the auth server:
@@ -233,5 +297,37 @@ mod tests {
     let msg = format!("{err:#}");
     assert!(msg.contains("invalid token"));
     assert!(msg.contains("401"));
+  }
+
+  #[test]
+  fn test_parse_token_response_error_is_downcastable() {
+    let err = parse_token_response(
+      reqwest::StatusCode::BAD_REQUEST,
+      r#"{"error":"invalid_grant","error_description":"expired"}"#
+        .to_string(),
+    )
+    .unwrap_err();
+    let error = err.downcast_ref::<TokenExchangeError>().unwrap();
+    assert_eq!(error.error, "invalid_grant");
+    assert_eq!(error.error_description.as_deref(), Some("expired"));
+    // Does not include the successful response on a parse failure
+    assert!(
+      parse_token_response(
+        reqwest::StatusCode::OK,
+        "not json".to_string()
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn test_parse_token_response_success() {
+    let response = parse_token_response(
+      reqwest::StatusCode::OK,
+      r#"{"access_token":"jwt","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":3600}"#.to_string(),
+    )
+    .unwrap();
+    assert_eq!(response.access_token, "jwt");
+    assert_eq!(response.expires_in, 3600);
   }
 }

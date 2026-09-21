@@ -12,6 +12,7 @@ use mogh_auth_client::{
   },
   config::{
     ExternalLoginProvider, ExternalLoginProviderConfig, REDACTED,
+    TokenExchangeConfig,
   },
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
@@ -31,6 +32,8 @@ use crate::{
 };
 
 const MAX_PROVIDER_NAME_LENGTH: usize = 100;
+const MAX_TOKEN_EXCHANGE_AUDIENCES: usize = 16;
+const MAX_AUDIENCE_LENGTH: usize = 256;
 
 fn check_admin(user: &dyn AuthUserImpl) -> mogh_error::Result<()> {
   if user.is_admin() {
@@ -125,6 +128,51 @@ fn validate_config(
   Ok(())
 }
 
+/// Token exchange needs tokens signed by the provider,
+/// which Github doesn't issue for user logins.
+fn validate_token_exchange(
+  mut token_exchange: TokenExchangeConfig,
+  config: &ExternalLoginProviderConfig,
+) -> mogh_error::Result<TokenExchangeConfig> {
+  if token_exchange.enabled
+    && matches!(config, ExternalLoginProviderConfig::Github(_))
+  {
+    return Err(
+      anyhow!("Token exchange is not available for Github providers")
+        .status_code(StatusCode::BAD_REQUEST),
+    );
+  }
+  let mut audiences = Vec::<String>::new();
+  for audience in &token_exchange.audiences {
+    let audience = audience.trim();
+    if audience.is_empty()
+      || audiences.iter().any(|existing| existing == audience)
+    {
+      continue;
+    }
+    if audience.len() > MAX_AUDIENCE_LENGTH {
+      return Err(
+        anyhow!(
+          "Token exchange audiences cannot be longer than {MAX_AUDIENCE_LENGTH} characters"
+        )
+        .status_code(StatusCode::BAD_REQUEST),
+      );
+    }
+    audiences.push(audience.to_string());
+  }
+  // Every audience is another signature check on each exchange.
+  if audiences.len() > MAX_TOKEN_EXCHANGE_AUDIENCES {
+    return Err(
+      anyhow!(
+        "Token exchange accepts at most {MAX_TOKEN_EXCHANGE_AUDIENCES} audiences"
+      )
+      .status_code(StatusCode::BAD_REQUEST),
+    );
+  }
+  token_exchange.audiences = audiences;
+  Ok(token_exchange)
+}
+
 /// An empty or redacted client secret keeps the existing one,
 /// unless it is explicitly cleared.
 ///
@@ -216,6 +264,10 @@ pub async fn create_provider<I: AuthImpl + ?Sized>(
     id: random_string(PROVIDER_ID_LENGTH),
     name: validate_name(&request.name)?,
     registration_disabled: request.registration_disabled,
+    token_exchange: validate_token_exchange(
+      request.token_exchange,
+      &request.config,
+    )?,
     config: request.config,
   };
 
@@ -298,6 +350,10 @@ pub async fn update_provider<I: AuthImpl + ?Sized>(
   check_admin(user)?;
 
   let name = validate_name(&request.name)?;
+  let token_exchange = validate_token_exchange(
+    std::mem::take(&mut request.token_exchange),
+    &request.config,
+  )?;
 
   let mut existing =
     resolve_managed_provider(auth, &request.id).await?;
@@ -318,6 +374,7 @@ pub async fn update_provider<I: AuthImpl + ?Sized>(
     id: existing.id,
     name,
     registration_disabled: request.registration_disabled,
+    token_exchange,
     config: request.config,
   };
 
@@ -535,6 +592,7 @@ mod tests {
     CreateExternalLoginProvider {
       name: "  Github  ".into(),
       registration_disabled: false,
+      token_exchange: Default::default(),
       config: github_config(secret),
     }
   }
@@ -547,6 +605,7 @@ mod tests {
       id: id.into(),
       name: "Renamed".into(),
       registration_disabled: true,
+      token_exchange: Default::default(),
       config,
       clear_client_secret: false,
     }
@@ -702,6 +761,7 @@ mod tests {
       CreateExternalLoginProvider {
         name: "OIDC".into(),
         registration_disabled: false,
+        token_exchange: Default::default(),
         config: oidc_config("https://idp.example.com", "secret"),
       },
     )
@@ -750,6 +810,85 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_token_exchange_settings() {
+    let auth = TestAuth::default();
+    let exchange = |audiences: &[&str]| TokenExchangeConfig {
+      enabled: true,
+      audiences: audiences.iter().map(|a| a.to_string()).collect(),
+      max_token_age_secs: 300,
+    };
+
+    // Github has no signed tokens to exchange
+    let err = create_provider(
+      &auth,
+      &ADMIN,
+      CreateExternalLoginProvider {
+        token_exchange: exchange(&[]),
+        ..create_request("secret")
+      },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+
+    let item = create_provider(
+      &auth,
+      &ADMIN,
+      CreateExternalLoginProvider {
+        name: "OIDC".into(),
+        registration_disabled: false,
+        token_exchange: exchange(&[" cli ", "", "other", "cli"]),
+        config: oidc_config("https://idp.example.com", "secret"),
+      },
+    )
+    .await
+    .unwrap();
+    assert!(item.provider.token_exchange.enabled);
+    // Trimmed, without empty entries or duplicates
+    assert_eq!(
+      item.provider.token_exchange.audiences,
+      ["cli", "other"]
+    );
+    assert_eq!(item.provider.token_exchange.max_token_age_secs, 300);
+
+    let too_many = (0..=MAX_TOKEN_EXCHANGE_AUDIENCES)
+      .map(|i| format!("client-{i}"))
+      .collect::<Vec<_>>();
+    let too_long = "a".repeat(MAX_AUDIENCE_LENGTH + 1);
+    for audiences in [
+      too_many.iter().map(String::as_str).collect::<Vec<_>>(),
+      vec![too_long.as_str()],
+    ] {
+      let err = create_provider(
+        &auth,
+        &ADMIN,
+        CreateExternalLoginProvider {
+          name: "OIDC".into(),
+          registration_disabled: false,
+          token_exchange: exchange(&audiences),
+          config: oidc_config("https://idp.example.com", "secret"),
+        },
+      )
+      .await
+      .unwrap_err();
+      assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // Updates replace the settings, leaving it out disables it
+    let item = update_provider(
+      &auth,
+      &ADMIN,
+      update_request(
+        &item.provider.id,
+        oidc_config("https://idp.example.com", ""),
+      ),
+    )
+    .await
+    .unwrap();
+    assert!(!item.provider.token_exchange.enabled);
+  }
+
+  #[tokio::test]
   async fn test_update_clear_secret() {
     let auth = TestAuth::default();
     let id = create_provider(
@@ -758,6 +897,7 @@ mod tests {
       CreateExternalLoginProvider {
         name: "OIDC".into(),
         registration_disabled: false,
+        token_exchange: Default::default(),
         config: oidc_config("https://idp.example.com", "secret"),
       },
     )
@@ -888,6 +1028,7 @@ mod tests {
         id: "github".into(),
         name: "Github".into(),
         registration_disabled: false,
+        token_exchange: Default::default(),
         config: github_config("static-secret"),
       }],
       ..Default::default()

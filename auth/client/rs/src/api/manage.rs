@@ -11,7 +11,10 @@ use typeshare::typeshare;
 use crate::{
   U64,
   api::NoData,
-  config::{ExternalLoginProvider, ExternalLoginProviderConfig},
+  config::{
+    ExternalLoginProvider, ExternalLoginProviderConfig,
+    TokenExchangeConfig,
+  },
   passkey::{CreationChallengeResponse, RegisterPublicKeyCredential},
 };
 
@@ -502,6 +505,10 @@ pub struct CreateExternalLoginProvider {
   /// Disable new user registration using this provider.
   #[serde(default)]
   pub registration_disabled: bool,
+  /// Allow tokens issued by this provider to be
+  /// exchanged for an app token (RFC 8693).
+  #[serde(default)]
+  pub token_exchange: TokenExchangeConfig,
   /// The kind specific provider configuration.
   pub config: ExternalLoginProviderConfig,
 }
@@ -550,6 +557,10 @@ pub struct UpdateExternalLoginProvider {
   /// Disable new user registration using this provider.
   #[serde(default)]
   pub registration_disabled: bool,
+  /// Allow tokens issued by this provider to be
+  /// exchanged for an app token (RFC 8693).
+  #[serde(default)]
+  pub token_exchange: TokenExchangeConfig,
   /// The kind specific provider configuration.
   pub config: ExternalLoginProviderConfig,
   /// Remove the stored client secret, eg. to switch an OIDC

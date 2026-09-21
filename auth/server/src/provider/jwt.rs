@@ -111,6 +111,11 @@ impl JwtProvider {
     self
   }
 
+  /// How long encoded tokens are valid for, in milliseconds.
+  pub fn ttl_ms(&self) -> u128 {
+    self.ttl_ms
+  }
+
   pub fn header(&self) -> &Header {
     self.header.as_ref().unwrap_or(&DEFAULT_HEADER)
   }
