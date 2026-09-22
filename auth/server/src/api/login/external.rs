@@ -16,11 +16,12 @@ use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
 use crate::{
-  AuthImpl,
+  AuthImpl, Login,
   api::{
     ExternalTwoFactor, begin_external_two_factor,
     external::load_provider_client,
     login::LoginArgs,
+    provider_login,
     token::{VerifiedExchange, verify_exchange},
   },
   middleware::check_user_cidr_whitelist,
@@ -59,30 +60,40 @@ where
   // Sync before anything is issued, like for a login.
   auth.sync_external_user(user.id().to_string(), info).await?;
 
-  let res =
-    match begin_external_two_factor(auth, session, user.as_ref())
-      .await?
-    {
-      None => {
-        info!(
-          user_id = user.id(),
-          username = user.username(),
-          provider_id = provider.id,
-          provider = provider.name,
-          "User logged in (token exchange)"
-        );
+  let res = match begin_external_two_factor(
+    auth,
+    session,
+    user.as_ref(),
+    &provider,
+  )
+  .await?
+  {
+    None => {
+      auth
+        .record_login(Login::of(
+          user.as_ref(),
+          provider_login(&provider),
+          None,
+        ))
+        .await?;
 
-        JwtOrTwoFactor::Jwt(
-          auth.jwt_provider().encode_sub(user.id())?,
-        )
-      }
-      // The JWT is only issued once the second factor
-      // is completed on the same session.
-      Some(ExternalTwoFactor::Passkey(response)) => {
-        JwtOrTwoFactor::Passkey(response)
-      }
-      Some(ExternalTwoFactor::Totp) => JwtOrTwoFactor::Totp {},
-    };
+      info!(
+        user_id = user.id(),
+        username = user.username(),
+        provider_id = provider.id,
+        provider = provider.name,
+        "User logged in (token exchange)"
+      );
+
+      JwtOrTwoFactor::Jwt(auth.jwt_provider().encode_sub(user.id())?)
+    }
+    // The JWT is only issued once the second factor
+    // is completed on the same session.
+    Some(ExternalTwoFactor::Passkey(response)) => {
+      JwtOrTwoFactor::Passkey(response)
+    }
+    Some(ExternalTwoFactor::Totp) => JwtOrTwoFactor::Totp {},
+  };
 
   Ok(res)
 }

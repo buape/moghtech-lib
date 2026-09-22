@@ -576,6 +576,28 @@ to `{post_link_redirect}?link_error=<reason>`. The `mogh_ui` `useAuthState` hook
 shows both as a notification. Server errors are logged and only reported as
 "Login failed".
 
+### Login records
+
+The server logs every login. For the app's own audit trail, implement
+`record_login`: it is called once per login, at the step which grants it (a
+local login once the password, and any second factor, is verified; an external
+login at the provider's callback, or once its second factor is complete; a token
+exchange when the token is issued), after the hooks the login needed
+(`sync_external_user`, `get_or_create_workload_user`) and before the session or
+token is issued. An error fails the login.
+
+```rust
+fn record_login(&self, login: Login) -> DynFuture<mogh_error::Result<()>> {
+  // login.user_id, login.username, login.second_factor, and
+  // login.kind: Local | Provider { provider_id, provider_name }
+  //   | Workload { issuer_id, issuer_name, rule_id, rule_name }
+  Box::pin(async move { audit(login).await })
+}
+```
+
+Refused logins (a wrong password, a token no provider accepts) are not
+reported: the server rate limits and logs them.
+
 ### Api keys (v2)
 
 Clients sign each request with their private key instead of sending a secret

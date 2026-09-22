@@ -39,10 +39,10 @@ use mogh_request_ip::RequestIp;
 use tracing::{error, info, instrument};
 
 use crate::{
-  AuthImpl,
+  AuthImpl, Login, LoginKind,
   api::{
     external::load_provider_client,
-    external_login_requires_two_factor,
+    external_login_requires_two_factor, provider_login,
   },
   middleware::check_user_cidr_whitelist,
   provider::{
@@ -805,6 +805,19 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     ));
   }
 
+  auth
+    .record_login(Login::of(
+      user.as_ref(),
+      LoginKind::Workload {
+        issuer_id: issuer.id.clone(),
+        issuer_name: issuer.name.clone(),
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+      },
+      None,
+    ))
+    .await?;
+
   let default_ttl_ms = auth.jwt_provider().ttl_ms();
   let ttl_ms = match u128::from(rule.token_ttl_secs) * 1000 {
     0 => default_ttl_ms,
@@ -867,6 +880,14 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
 
   // Sync before the token is issued, like for a login.
   auth.sync_external_user(user.id().to_string(), info).await?;
+
+  auth
+    .record_login(Login::of(
+      user.as_ref(),
+      provider_login(&provider),
+      None,
+    ))
+    .await?;
 
   let jwt = auth.jwt_provider().encode_sub(user.id())?;
 
@@ -970,6 +991,7 @@ mod tests {
     user: Option<TestUser>,
     sync_fails: bool,
     synced: Arc<Mutex<Vec<ExternalLoginInfo>>>,
+    logins: Arc<Mutex<Vec<Login>>>,
     jwt: JwtProvider,
   }
 
@@ -986,6 +1008,7 @@ mod tests {
         user,
         sync_fails: false,
         synced: Default::default(),
+        logins: Default::default(),
         jwt: JwtProvider::new(b"test-jwt-secret", JWT_TTL_MS),
       }
     }
@@ -1034,6 +1057,14 @@ mod tests {
 
     fn static_trusted_issuers(&self) -> Vec<TrustedIssuer> {
       self.issuers.clone()
+    }
+
+    fn record_login(
+      &self,
+      login: Login,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      self.logins.lock().unwrap().push(login);
+      Box::pin(async { Ok(()) })
     }
 
     fn get_or_create_workload_user(
@@ -1263,6 +1294,19 @@ mod tests {
     assert_eq!(workloads[0].claims["repository_id"], 12345);
     // Login provider hooks are not involved
     assert!(auth.synced.lock().unwrap().is_empty());
+    // The exchange is the rule user's login
+    let logins = auth.logins.lock().unwrap();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0].user_id, "user-id");
+    assert_eq!(
+      logins[0].kind,
+      LoginKind::Workload {
+        issuer_id: "ci".into(),
+        issuer_name: "CI".into(),
+        rule_id: "deploy".into(),
+        rule_name: "Deploy".into(),
+      }
+    );
   }
 
   #[tokio::test]
@@ -1512,6 +1556,15 @@ mod tests {
     assert_eq!(synced.len(), 1);
     assert_eq!(synced[0].provider_id, "oidc");
     assert_eq!(synced[0].external_id, "subject-123");
+    // The exchange is a login through the provider
+    let logins = auth.logins.lock().unwrap();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0].user_id, "user-id");
+    assert!(logins[0].second_factor.is_none());
+    assert!(matches!(
+      &logins[0].kind,
+      LoginKind::Provider { provider_id, .. } if provider_id == "oidc"
+    ));
   }
 
   #[tokio::test]

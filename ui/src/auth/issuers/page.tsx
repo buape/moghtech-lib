@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, ReactNode } from "react";
 import {
   ActionIcon,
   Alert,
@@ -66,6 +66,7 @@ export function TrustedIssuerPage({
   backTo,
   groupOptions,
   onDeleted,
+  children,
 }: {
   /** The issuer id (`TrustedIssuer.id`). */
   id: string;
@@ -75,6 +76,9 @@ export function TrustedIssuerPage({
   groupOptions?: string[];
   /** Called after the issuer was deleted, before navigating back. */
   onDeleted?: () => void;
+  /** Rendered below the configuration: what the app knows about the
+   * issuer, eg. its own audit logs of the logins through it. */
+  children?: ReactNode;
 }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -232,6 +236,8 @@ export function TrustedIssuerPage({
               await update({ issuer: trustedIssuer(item.issuer.id, values) });
             }}
           />
+
+          {children}
         </EntityPage>
       )}
     </PageGuard>

@@ -37,6 +37,7 @@ use crate::{
   session::Session,
   validations::constant_time_eq,
 };
+use crate::{Login, api::provider_login};
 
 /// The urls name the provider by its slug (its id for a provider
 /// without one), see `ExternalLoginProvider::slug`.
@@ -416,7 +417,8 @@ async fn login_callback<I: AuthImpl>(
       // Sync before the session is authenticated,
       // so a failed sync does not leave a logged in session.
       auth.sync_external_user(user.id().to_string(), info).await?;
-      get_user_id_or_two_factor(auth, session, &user, ip).await?
+      get_user_id_or_two_factor(auth, session, &user, ip, provider)
+        .await?
     }
     // Sign up user
     None => {
@@ -454,6 +456,14 @@ async fn login_callback<I: AuthImpl>(
 
       auth.sync_external_user(user_id.clone(), info).await?;
 
+      auth
+        .record_login(Login {
+          user_id: user_id.clone(),
+          username: username.clone(),
+          kind: provider_login(provider),
+          second_factor: None,
+        })
+        .await?;
       session.insert_authenticated_user_id(&user_id).await?;
 
       UserIdOrTwoFactor::UserId(user_id)
@@ -516,7 +526,7 @@ mod tests {
   use axum::response::IntoResponse;
 
   use super::*;
-  use crate::provider::external::ExternalLoginInfo;
+  use crate::{LoginKind, provider::external::ExternalLoginInfo};
 
   fn location(redirect: Redirect) -> String {
     redirect
@@ -564,6 +574,7 @@ mod tests {
     logins: Vec<((String, String), String)>,
     synced: Vec<(String, ExternalLoginInfo)>,
     signed_up: Vec<String>,
+    recorded: Vec<Login>,
   }
 
   #[derive(Default)]
@@ -632,6 +643,14 @@ mod tests {
       mogh_error::Result<Option<crate::user::BoxAuthUser>>,
     > {
       Box::pin(async { Ok(None) })
+    }
+
+    fn record_login(
+      &self,
+      login: Login,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      self.calls.lock().unwrap().recorded.push(login);
+      Box::pin(async { Ok(()) })
     }
 
     fn find_user_with_external_login(
@@ -861,6 +880,17 @@ mod tests {
       assert_eq!(calls.synced[0].0, "existing-user");
       assert_eq!(calls.synced[0].1.provider_id, "flow-a");
       assert_eq!(calls.synced[0].1.admin, Some(true));
+      // The login is recorded as one through the provider
+      assert_eq!(calls.recorded.len(), 1);
+      assert_eq!(calls.recorded[0].user_id, "existing-user");
+      assert!(calls.recorded[0].second_factor.is_none());
+      assert_eq!(
+        calls.recorded[0].kind,
+        LoginKind::Provider {
+          provider_id: "flow-a".into(),
+          provider_name: provider.name.clone(),
+        }
+      );
     }
     assert_eq!(
       session.retrieve_authenticated_user_id().await.unwrap(),

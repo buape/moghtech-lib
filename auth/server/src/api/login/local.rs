@@ -11,7 +11,7 @@ use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
 use crate::{
-  AuthImpl, api::login::LoginArgs,
+  AuthImpl, Login, LoginKind, api::login::LoginArgs,
   middleware::check_user_cidr_whitelist, session::Session,
 };
 
@@ -156,6 +156,7 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
         .start_passkey_authentication(passkey)
         .context("Failed to start passkey authentication flow")?;
       session.insert_passkey_login(user.id(), &state).await?;
+      session.insert_login_kind(&LoginKind::Local).await?;
 
       info!(
         user_id = user.id(),
@@ -168,6 +169,7 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
     // TOTP 2FA
     (None, Some(_)) => {
       session.insert_totp_login_user_id(user.id()).await?;
+      session.insert_login_kind(&LoginKind::Local).await?;
 
       info!(
         user_id = user.id(),
@@ -178,6 +180,14 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
       JwtOrTwoFactor::Totp {}
     }
     (None, None) => {
+      auth
+        .record_login(Login::of(
+          user.as_ref(),
+          LoginKind::Local,
+          None,
+        ))
+        .await?;
+
       info!(
         user_id = user.id(),
         username = user.username(),
@@ -233,6 +243,7 @@ mod tests {
   struct TestUser {
     id: String,
     username: String,
+    hashed_password: Option<String>,
   }
 
   impl AuthUserImpl for TestUser {
@@ -242,12 +253,26 @@ mod tests {
     fn username(&self) -> &str {
       &self.username
     }
+    fn hashed_password(&self) -> Option<&str> {
+      self.hashed_password.as_deref()
+    }
   }
 
   #[derive(Default)]
   struct TestAuth {
     /// (id, username)
     users: Mutex<Vec<(String, String)>>,
+    /// user id -> hashed password
+    hashes: Mutex<std::collections::HashMap<String, String>>,
+    logins: Mutex<Vec<Login>>,
+  }
+
+  fn session() -> Session {
+    Session(tower_sessions::Session::new(
+      None,
+      std::sync::Arc::new(tower_sessions::MemoryStore::default()),
+      None,
+    ))
   }
 
   impl AuthImpl for TestAuth {
@@ -293,6 +318,12 @@ mod tests {
           Box::new(TestUser {
             id: id.clone(),
             username: username.clone(),
+            hashed_password: self
+              .hashes
+              .lock()
+              .unwrap()
+              .get(id)
+              .cloned(),
           }) as BoxAuthUser
         });
       Box::pin(async { Ok(user) })
@@ -300,14 +331,66 @@ mod tests {
     fn sign_up_local_user(
       &self,
       username: String,
-      _hashed_password: String,
+      hashed_password: String,
       _no_users_exist: bool,
     ) -> DynFuture<mogh_error::Result<String>> {
       let mut users = self.users.lock().unwrap();
       let id = format!("id-{}", users.len());
       users.push((id.clone(), username));
+      self
+        .hashes
+        .lock()
+        .unwrap()
+        .insert(id.clone(), hashed_password);
       Box::pin(async { Ok(id) })
     }
+    fn record_login(
+      &self,
+      login: Login,
+    ) -> DynFuture<mogh_error::Result<()>> {
+      self.logins.lock().unwrap().push(login);
+      Box::pin(async { Ok(()) })
+    }
+  }
+
+  /// A verified password is a login the app hears about, a
+  /// refused one is not.
+  #[tokio::test]
+  async fn test_login_is_recorded() {
+    let auth = TestAuth::default();
+    sign_up_local_user(&auth, "user".into(), "password-1")
+      .await
+      .unwrap();
+    let ip = IpAddr::from([127, 0, 0, 1]);
+    let res = login_local_user(
+      &auth,
+      &session(),
+      ip,
+      "user".into(),
+      "password-1",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(res, JwtOrTwoFactor::Jwt(_)));
+    {
+      let logins = auth.logins.lock().unwrap();
+      assert_eq!(logins.len(), 1);
+      assert_eq!(logins[0].user_id, "id-0");
+      assert_eq!(logins[0].username, "user");
+      assert_eq!(logins[0].kind, LoginKind::Local);
+      assert!(logins[0].second_factor.is_none());
+    }
+    let err = login_local_user(
+      &auth,
+      &session(),
+      ip,
+      "user".into(),
+      "wrong-password",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(auth.logins.lock().unwrap().len(), 1);
   }
 
   #[tokio::test]

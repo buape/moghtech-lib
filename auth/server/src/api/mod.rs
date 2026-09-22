@@ -4,7 +4,8 @@ use anyhow::{Context as _, anyhow};
 use axum::{Router, response::Redirect, routing::get};
 use data_encoding::BASE64URL;
 use mogh_auth_client::{
-  api::login::UserIdOrTwoFactor, passkey::RequestChallengeResponse,
+  api::login::UserIdOrTwoFactor, config::ExternalLoginProvider,
+  passkey::RequestChallengeResponse,
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use reqwest::StatusCode;
@@ -13,8 +14,8 @@ use tracing::info;
 use utoipa::ToSchema;
 
 use crate::{
-  AuthImpl, middleware::check_user_cidr_whitelist, session::Session,
-  user::BoxAuthUser,
+  AuthImpl, Login, LoginKind, middleware::check_user_cidr_whitelist,
+  session::Session, user::BoxAuthUser,
 };
 
 pub mod external;
@@ -159,6 +160,16 @@ pub(crate) fn external_login_requires_two_factor(
     && (user.passkey().is_some() || user.totp_secret().is_some())
 }
 
+/// The kind of a login through `provider`, for its record.
+pub(crate) fn provider_login(
+  provider: &ExternalLoginProvider,
+) -> LoginKind {
+  LoginKind::Provider {
+    provider_id: provider.id.clone(),
+    provider_name: provider.name.clone(),
+  }
+}
+
 /// The second factor an external login has to be completed with.
 pub(crate) enum ExternalTwoFactor {
   Passkey(RequestChallengeResponse),
@@ -167,13 +178,15 @@ pub(crate) enum ExternalTwoFactor {
 
 /// Begins the second factor of an external login on the session if the
 /// user requires one ([external_login_requires_two_factor]). It is
-/// completed with `CompletePasskeyLogin` / `CompleteTotpLogin`.
+/// completed with `CompletePasskeyLogin` / `CompleteTotpLogin`, which
+/// record the login as one through `provider`.
 pub(crate) async fn begin_external_two_factor<
   I: AuthImpl + ?Sized,
 >(
   auth: &I,
   session: &Session,
   user: &dyn crate::user::AuthUserImpl,
+  provider: &ExternalLoginProvider,
 ) -> mogh_error::Result<Option<ExternalTwoFactor>> {
   if !external_login_requires_two_factor(user) {
     return Ok(None);
@@ -181,13 +194,14 @@ pub(crate) async fn begin_external_two_factor<
   match (user.passkey(), user.totp_secret()) {
     // WebAuthn Passkey 2FA
     (Some(passkey), _) => {
-      let provider = auth.passkey_provider().context(
+      let passkeys = auth.passkey_provider().context(
         "No passkey provider available, possibly invalid 'host' config.",
       )?;
-      let (response, state) = provider
+      let (response, state) = passkeys
         .start_passkey_authentication(passkey)
         .context("Failed to start passkey authentication flow")?;
       session.insert_passkey_login(user.id(), &state).await?;
+      session.insert_login_kind(&provider_login(provider)).await?;
 
       info!(
         user_id = user.id(),
@@ -200,6 +214,7 @@ pub(crate) async fn begin_external_two_factor<
     // TOTP 2FA
     (None, Some(_)) => {
       session.insert_totp_login_user_id(user.id()).await?;
+      session.insert_login_kind(&provider_login(provider)).await?;
 
       info!(
         user_id = user.id(),
@@ -220,30 +235,42 @@ async fn get_user_id_or_two_factor<I: AuthImpl>(
   session: &Session,
   user: &BoxAuthUser,
   ip: IpAddr,
+  provider: &ExternalLoginProvider,
 ) -> mogh_error::Result<UserIdOrTwoFactor> {
   check_user_cidr_whitelist(user.as_ref(), ip)?;
 
-  let res =
-    match begin_external_two_factor(auth, session, user.as_ref())
-      .await?
-    {
-      // Skip / No 2FA
-      None => {
-        session.insert_authenticated_user_id(user.id()).await?;
+  let res = match begin_external_two_factor(
+    auth,
+    session,
+    user.as_ref(),
+    provider,
+  )
+  .await?
+  {
+    // Skip / No 2FA
+    None => {
+      auth
+        .record_login(Login::of(
+          user.as_ref(),
+          provider_login(provider),
+          None,
+        ))
+        .await?;
+      session.insert_authenticated_user_id(user.id()).await?;
 
-        info!(
-          user_id = user.id(),
-          username = user.username(),
-          "User logged in"
-        );
+      info!(
+        user_id = user.id(),
+        username = user.username(),
+        "User logged in"
+      );
 
-        UserIdOrTwoFactor::UserId(user.id().to_string())
-      }
-      Some(ExternalTwoFactor::Passkey(response)) => {
-        UserIdOrTwoFactor::Passkey(response)
-      }
-      Some(ExternalTwoFactor::Totp) => UserIdOrTwoFactor::Totp {},
-    };
+      UserIdOrTwoFactor::UserId(user.id().to_string())
+    }
+    Some(ExternalTwoFactor::Passkey(response)) => {
+      UserIdOrTwoFactor::Passkey(response)
+    }
+    Some(ExternalTwoFactor::Totp) => UserIdOrTwoFactor::Totp {},
+  };
   Ok(res)
 }
 

@@ -1,4 +1,4 @@
-import { JSX, useState } from "react";
+import { JSX, useState, ReactNode } from "react";
 import {
   Alert,
   Badge,
@@ -45,15 +45,9 @@ const KIND_ICONS: Record<
   LoginProviderKind,
   (props: { size?: string | number }) => JSX.Element
 > = {
-  Oidc: ({ size }) => (
-    <LoginProviderIcon kind="Oidc" size={size} />
-  ),
-  Github: ({ size }) => (
-    <LoginProviderIcon kind="Github" size={size} />
-  ),
-  Google: ({ size }) => (
-    <LoginProviderIcon kind="Google" size={size} />
-  ),
+  Oidc: ({ size }) => <LoginProviderIcon kind="Oidc" size={size} />,
+  Github: ({ size }) => <LoginProviderIcon kind="Github" size={size} />,
+  Google: ({ size }) => <LoginProviderIcon kind="Google" size={size} />,
 };
 
 /**
@@ -70,6 +64,7 @@ export function LoginProviderPage({
   id,
   backTo,
   onDeleted,
+  children,
 }: {
   /** The provider id (`ExternalLoginProvider.id`). */
   id: string;
@@ -77,6 +72,9 @@ export function LoginProviderPage({
   backTo: string;
   /** Called after the provider was deleted, before navigating back. */
   onDeleted?: () => void;
+  /** Rendered below the configuration: what the app knows about the
+   * provider, eg. its own audit logs of the logins through it. */
+  children?: ReactNode;
 }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -250,6 +248,8 @@ export function LoginProviderPage({
               await update(providerUpdate(item, values));
             }}
           />
+
+          {children}
         </EntityPage>
       )}
     </PageGuard>

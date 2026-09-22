@@ -15,7 +15,8 @@ use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
 use crate::{
-  api::login::LoginArgs, middleware::check_user_cidr_whitelist,
+  Login, SecondFactor, api::login::LoginArgs,
+  middleware::check_user_cidr_whitelist,
 };
 
 /// Tracks the latest accepted TOTP step per user, to reject reuse
@@ -92,6 +93,14 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
       }
 
       session.complete_totp_login().await?;
+      let kind = session.take_login_kind().await?;
+      auth
+        .record_login(Login::of(
+          user.as_ref(),
+          kind,
+          Some(SecondFactor::Totp),
+        ))
+        .await?;
 
       let res = auth.jwt_provider().encode_sub(&user_id)?;
 
@@ -151,6 +160,14 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
         .await?;
 
       session.complete_totp_login().await?;
+      let kind = session.take_login_kind().await?;
+      auth
+        .record_login(Login::of(
+          user.as_ref(),
+          kind,
+          Some(SecondFactor::TotpRecovery),
+        ))
+        .await?;
 
       let res = auth.jwt_provider().encode_sub(&user_id)?;
 

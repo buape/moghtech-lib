@@ -13,6 +13,7 @@ use mogh_auth_client::{
 use mogh_error::{AddStatusCode, AddStatusCodeError};
 use mogh_pki::RotatableKeyPair;
 use mogh_rate_limit::RateLimiter;
+use serde::{Deserialize, Serialize};
 
 pub mod api;
 pub mod api_key;
@@ -63,6 +64,68 @@ pub enum RequestAuthentication {
   /// X-API-SIGNATURE and X-API-TIMESTAMP. The handshake produces the public key.
   /// DANGER ⚠️ the public key must still be validated as belonging to a particular client.
   PublicKey(String),
+}
+
+/// A login the auth server completed, see [AuthImpl::record_login].
+#[derive(Debug, Clone)]
+pub struct Login {
+  /// The user who logged in.
+  pub user_id: String,
+  pub username: String,
+  /// How the user was authenticated.
+  pub kind: LoginKind,
+  /// The second factor the login was completed with, for a user
+  /// enrolled in one. Never for a workload, or a token exchange.
+  pub second_factor: Option<SecondFactor>,
+}
+
+impl Login {
+  /// The login of `user`.
+  pub fn of(
+    user: &dyn crate::user::AuthUserImpl,
+    kind: LoginKind,
+    second_factor: Option<SecondFactor>,
+  ) -> Login {
+    Login {
+      user_id: user.id().to_string(),
+      username: user.username().to_string(),
+      kind,
+      second_factor,
+    }
+  }
+}
+
+/// How a login authenticated the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoginKind {
+  /// Username and password (`LoginLocalUser`).
+  Local,
+  /// Through a login provider: the user logged in at the provider
+  /// and came back to its callback (`/external/{slug}/callback`),
+  /// or a token of the provider was exchanged (`POST /token`,
+  /// `ExchangeExternalForJwt`).
+  Provider {
+    provider_id: String,
+    provider_name: String,
+  },
+  /// A workload's token exchanged (`POST /token`): verified by a
+  /// trusted issuer and matched to one of its rules, whose user
+  /// logged in.
+  Workload {
+    issuer_id: String,
+    issuer_name: String,
+    rule_id: String,
+    rule_name: String,
+  },
+}
+
+/// The second factor a login was completed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondFactor {
+  Passkey,
+  Totp,
+  /// A TOTP recovery code.
+  TotpRecovery,
 }
 
 /// This trait is implemented at the app level
@@ -293,6 +356,26 @@ pub trait AuthImpl: Send + Sync + 'static {
     panic!(
       "Must implement 'AuthImpl::post_link_redirect' in order for linking to work. This is usually the application profile or settings page."
     )
+  }
+
+  /// A user logged in: they are authenticated, the hooks the login
+  /// needed have run (`sync_external_user`, `sign_up_external_user`,
+  /// `get_or_create_workload_user`), and their session or token is
+  /// about to be issued. For the app's own audit trail; the server
+  /// logs every login itself, so the default does nothing.
+  ///
+  /// Called once per login, at the step which grants it: a local
+  /// login when the password is verified, or once its second factor
+  /// is complete; an external login at the provider's callback
+  /// (redeeming the jwt on the same session afterwards is not
+  /// another login), or once its second factor is complete; a
+  /// token exchange, a user's or a workload's, when the token is
+  /// issued. An error fails the login.
+  fn record_login(
+    &self,
+    _login: Login,
+  ) -> DynFuture<mogh_error::Result<()>> {
+    Box::pin(async { Ok(()) })
   }
 
   // ==============

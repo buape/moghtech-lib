@@ -7,7 +7,8 @@ use mogh_resolver::Resolve;
 use tracing::{info, instrument};
 
 use crate::{
-  api::login::LoginArgs, middleware::check_user_cidr_whitelist,
+  Login, SecondFactor, api::login::LoginArgs,
+  middleware::check_user_cidr_whitelist,
 };
 
 impl Resolve<LoginArgs> for CompletePasskeyLogin {
@@ -55,6 +56,15 @@ impl Resolve<LoginArgs> for CompletePasskeyLogin {
 
       // Update the stored passkey on the database
       auth.update_user_stored_passkey(user_id.clone(), Some(passkey)).await?;
+
+      let kind = session.take_login_kind().await?;
+      auth
+        .record_login(Login::of(
+          user.as_ref(),
+          kind,
+          Some(SecondFactor::Passkey),
+        ))
+        .await?;
 
       info!(
         user_id = user.id(),

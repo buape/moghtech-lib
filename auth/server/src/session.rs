@@ -6,7 +6,7 @@ use webauthn_rs::prelude::{
   PasskeyAuthentication, PasskeyRegistration,
 };
 
-use crate::provider::external::SessionExternalLogin;
+use crate::{LoginKind, provider::external::SessionExternalLogin};
 
 #[derive(Clone)]
 pub struct Session(pub tower_sessions::Session);
@@ -134,6 +134,39 @@ impl Session {
         "Passkey login has not been initiated for this session",
       )
       .status_code(StatusCode::UNAUTHORIZED)
+  }
+
+  const LOGIN_KIND: &str = "login-kind";
+
+  /// Remembers how the first factor of a login was passed, for the
+  /// record of the login once its second factor is complete
+  /// ([crate::AuthImpl::record_login]).
+  pub async fn insert_login_kind(
+    &self,
+    kind: &LoginKind,
+  ) -> mogh_error::Result<()> {
+    self
+      .0
+      .insert(Self::LOGIN_KIND, kind)
+      .await
+      .context("Failed to serialize session data")
+      .map_err(Into::into)
+  }
+
+  /// Takes the login kind of the second factor in progress. A
+  /// session without one (its first factor passed before the kind
+  /// was remembered) counts as a local login.
+  pub async fn take_login_kind(
+    &self,
+  ) -> mogh_error::Result<LoginKind> {
+    Ok(
+      self
+        .0
+        .remove::<LoginKind>(Self::LOGIN_KIND)
+        .await
+        .context("Internal session type error")?
+        .unwrap_or(LoginKind::Local),
+    )
   }
 
   const TOTP_LOGIN: &str = "totp-login";
