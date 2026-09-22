@@ -28,7 +28,7 @@ impl Resolve<LoginArgs> for CompletePasskeyLogin {
         "No passkey provider available, possibly invalid 'host' config.",
       )?;
 
-      let (user_id, state) = session
+      let (user_id, state, kind) = session
         .retrieve_passkey_login()
         .await?;
 
@@ -52,19 +52,19 @@ impl Resolve<LoginArgs> for CompletePasskeyLogin {
 
       passkey.0.update_credential(&update);
 
-      let response =  auth.jwt_provider().encode_sub(&user_id)?;
-
       // Update the stored passkey on the database
       auth.update_user_stored_passkey(user_id.clone(), Some(passkey)).await?;
 
-      let kind = session.take_login_kind().await?;
       auth
         .record_login(Login::of(
           user.as_ref(),
+          *ip,
           kind,
           Some(SecondFactor::Passkey),
         ))
         .await?;
+
+      let response = auth.jwt_provider().encode_sub(&user_id)?;
 
       info!(
         user_id = user.id(),

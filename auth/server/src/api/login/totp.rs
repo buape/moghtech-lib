@@ -92,11 +92,11 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
         );
       }
 
-      session.complete_totp_login().await?;
-      let kind = session.take_login_kind().await?;
+      let kind = session.complete_totp_login().await?;
       auth
         .record_login(Login::of(
           user.as_ref(),
+          *ip,
           kind,
           Some(SecondFactor::Totp),
         ))
@@ -159,11 +159,11 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
         .remove_totp_recovery_code(user_id.clone(), hashed_code)
         .await?;
 
-      session.complete_totp_login().await?;
-      let kind = session.take_login_kind().await?;
+      let kind = session.complete_totp_login().await?;
       auth
         .record_login(Login::of(
           user.as_ref(),
+          *ip,
           kind,
           Some(SecondFactor::TotpRecovery),
         ))
@@ -186,7 +186,137 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::{Arc, Mutex};
+
+  use std::net::IpAddr;
+
+  use crate::{
+    AuthImpl, Login, LoginKind, SecondFactor,
+    provider::jwt::JwtProvider,
+    session::Session,
+    user::{AuthUserImpl, BoxAuthUser},
+  };
+
   use super::*;
+
+  const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
+  const SECRET: &[u8] = b"12345678901234567890";
+
+  struct TestUser;
+
+  impl AuthUserImpl for TestUser {
+    fn id(&self) -> &str {
+      "totp-hook-user"
+    }
+    fn username(&self) -> &str {
+      "totp"
+    }
+    fn totp_secret(&self) -> Option<&str> {
+      static ENCODED: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| BASE32_NOPAD.encode(SECRET));
+      Some(&ENCODED)
+    }
+  }
+
+  #[derive(Default)]
+  struct TestAuth {
+    logins: Arc<Mutex<Vec<Login>>>,
+  }
+
+  impl AuthImpl for TestAuth {
+    fn new() -> Self {
+      Self::default()
+    }
+    fn app_name(&self) -> &'static str {
+      "test"
+    }
+    fn get_user(
+      &self,
+      _user_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<BoxAuthUser>> {
+      Box::pin(async { Ok(Box::new(TestUser) as BoxAuthUser) })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: crate::RequestAuthentication,
+      _ip: IpAddr,
+      _require_user_enabled: bool,
+      req: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      Box::pin(async { Ok(req) })
+    }
+    fn jwt_provider(&self) -> &JwtProvider {
+      static PROVIDER: std::sync::LazyLock<JwtProvider> =
+        std::sync::LazyLock::new(|| {
+          JwtProvider::new(b"secret", 60_000)
+        });
+      &PROVIDER
+    }
+    fn record_login(
+      &self,
+      login: Login,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      self.logins.lock().unwrap().push(login);
+      Box::pin(async { Ok(()) })
+    }
+  }
+
+  fn session() -> Session {
+    Session(tower_sessions::Session::new(
+      None,
+      Arc::new(tower_sessions::MemoryStore::default()),
+      None,
+    ))
+  }
+
+  /// A TOTP completion records the login with the kind its first
+  /// factor left on the session, and takes both off the session.
+  #[tokio::test]
+  async fn test_completion_records_the_first_factors_login() {
+    let auth = TestAuth::default();
+    let logins = auth.logins.clone();
+    let code = auth
+      .make_totp(SECRET.to_vec(), None)
+      .unwrap()
+      .generate_current()
+      .to_string();
+    let session = session();
+    session
+      .insert_totp_login_user_id("totp-hook-user")
+      .await
+      .unwrap();
+    let provider = LoginKind::Provider {
+      provider_id: "oidc".into(),
+      provider_name: "OIDC".into(),
+    };
+    session.insert_login_kind(&provider).await.unwrap();
+    let args = LoginArgs {
+      auth: Box::new(auth),
+      session,
+      ip: IP,
+    };
+    let jwt =
+      CompleteTotpLogin { code }.resolve(&args).await.unwrap();
+    assert_eq!(
+      args.auth.jwt_provider().decode_sub(&jwt.jwt).unwrap(),
+      "totp-hook-user"
+    );
+    {
+      let logins = logins.lock().unwrap();
+      assert_eq!(logins.len(), 1);
+      assert_eq!(logins[0].kind, provider);
+      assert_eq!(logins[0].second_factor, Some(SecondFactor::Totp));
+      assert_eq!(logins[0].ip, IP);
+      assert_eq!(logins[0].username, "totp");
+    }
+    // Nothing is left on the session
+    assert!(args.session.begin_totp_login_attempt().await.is_err());
+    assert_eq!(
+      args.session.take_login_kind().await,
+      LoginKind::Local
+    );
+  }
 
   #[test]
   fn test_consume_totp_step_rejects_replay() {

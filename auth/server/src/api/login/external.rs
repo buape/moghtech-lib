@@ -72,6 +72,7 @@ where
       auth
         .record_login(Login::of(
           user.as_ref(),
+          ip,
           provider_login(&provider),
           None,
         ))
@@ -175,6 +176,7 @@ mod tests {
   struct TestAuth {
     user: Option<TestUser>,
     synced: Arc<Mutex<Vec<ExternalLoginInfo>>>,
+    logins: Arc<Mutex<Vec<Login>>>,
     jwt: JwtProvider,
   }
 
@@ -183,6 +185,7 @@ mod tests {
       TestAuth {
         user,
         synced: Default::default(),
+        logins: Default::default(),
         jwt: JwtProvider::new(b"test-jwt-secret", 60_000),
       }
     }
@@ -236,6 +239,14 @@ mod tests {
       info: ExternalLoginInfo,
     ) -> crate::DynFuture<mogh_error::Result<()>> {
       self.synced.lock().unwrap().push(info);
+      Box::pin(async { Ok(()) })
+    }
+
+    fn record_login(
+      &self,
+      login: Login,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      self.logins.lock().unwrap().push(login);
       Box::pin(async { Ok(()) })
     }
 
@@ -326,6 +337,15 @@ mod tests {
       assert_eq!(auth.synced.lock().unwrap().len(), 1);
       // Nothing is left pending on the session
       assert!(session.begin_totp_login_attempt().await.is_err());
+      // The exchange is the login
+      let logins = auth.logins.lock().unwrap();
+      assert_eq!(logins.len(), 1);
+      assert_eq!(logins[0].user_id, "user-id");
+      assert!(logins[0].second_factor.is_none());
+      assert!(matches!(
+        &logins[0].kind,
+        crate::LoginKind::Provider { provider_id, .. } if provider_id == "oidc"
+      ));
     }
   }
 

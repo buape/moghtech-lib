@@ -2,6 +2,7 @@ use anyhow::Context;
 use axum::extract::FromRequestParts;
 use mogh_error::{AddStatusCode, AddStatusCodeError as _};
 use reqwest::StatusCode;
+use tracing::warn;
 use webauthn_rs::prelude::{
   PasskeyAuthentication, PasskeyRegistration,
 };
@@ -122,25 +123,34 @@ impl Session {
       .map_err(Into::into)
   }
 
+  /// Takes the passkey login in progress, and with it the kind of
+  /// its first factor: the caller records the login on success,
+  /// and a refused passkey ends the attempt (the login starts over).
   pub async fn retrieve_passkey_login(
     &self,
-  ) -> mogh_error::Result<(String, PasskeyAuthentication)> {
-    self
+  ) -> mogh_error::Result<(String, PasskeyAuthentication, LoginKind)>
+  {
+    let (user_id, state) = self
       .0
-      .remove(Self::PASSKEY_LOGIN)
+      .remove::<(String, PasskeyAuthentication)>(Self::PASSKEY_LOGIN)
       .await
       .context("Internal session type error")?
       .context(
         "Passkey login has not been initiated for this session",
       )
-      .status_code(StatusCode::UNAUTHORIZED)
+      .status_code(StatusCode::UNAUTHORIZED)?;
+    Ok((user_id, state, self.take_login_kind().await))
   }
 
   const LOGIN_KIND: &str = "login-kind";
 
   /// Remembers how the first factor of a login was passed, for the
   /// record of the login once its second factor is complete
-  /// ([crate::AuthImpl::record_login]).
+  /// ([crate::AuthImpl::record_login]). Every path which begins a
+  /// second factor ([Self::insert_passkey_login],
+  /// [Self::insert_totp_login_user_id]) sets it right after, and a
+  /// finished or abandoned second factor clears it, so a stale
+  /// value never labels the next login.
   pub async fn insert_login_kind(
     &self,
     kind: &LoginKind,
@@ -155,18 +165,21 @@ impl Session {
 
   /// Takes the login kind of the second factor in progress. A
   /// session without one (its first factor passed before the kind
-  /// was remembered) counts as a local login.
-  pub async fn take_login_kind(
-    &self,
-  ) -> mogh_error::Result<LoginKind> {
-    Ok(
-      self
-        .0
-        .remove::<LoginKind>(Self::LOGIN_KIND)
-        .await
-        .context("Internal session type error")?
-        .unwrap_or(LoginKind::Local),
-    )
+  /// was remembered), or with one the server can't read (written
+  /// by another version), counts as a local login: the kind is
+  /// audit metadata, never a reason to refuse a completed login.
+  pub async fn take_login_kind(&self) -> LoginKind {
+    match self.0.remove::<LoginKind>(Self::LOGIN_KIND).await {
+      Ok(Some(kind)) => kind,
+      Ok(None) => LoginKind::Local,
+      Err(e) => {
+        warn!(
+          "Unreadable login kind on the session, dropped | {e:?}"
+        );
+        let _ = self.0.remove_value(Self::LOGIN_KIND).await;
+        LoginKind::Local
+      }
+    }
   }
 
   const TOTP_LOGIN: &str = "totp-login";
@@ -230,8 +243,12 @@ impl Session {
     Ok(user_id)
   }
 
-  /// Removes the totp login from the session, it can only be completed once.
-  pub async fn complete_totp_login(&self) -> mogh_error::Result<()> {
+  /// Removes the totp login from the session, it can only be
+  /// completed once. Returns the kind of its first factor, for the
+  /// record of the login (whoever gives up on it drops it).
+  pub async fn complete_totp_login(
+    &self,
+  ) -> mogh_error::Result<LoginKind> {
     self
       .0
       .remove::<String>(Self::TOTP_LOGIN)
@@ -242,7 +259,7 @@ impl Session {
       .remove::<u32>(Self::TOTP_LOGIN_ATTEMPTS)
       .await
       .context("Internal session type error")?;
-    Ok(())
+    Ok(self.take_login_kind().await)
   }
 
   // ==================
@@ -354,6 +371,32 @@ mod tests {
       Arc::new(tower_sessions::MemoryStore::default()),
       None,
     ))
+  }
+
+  /// The kind of a first factor rides on the session until the
+  /// second factor ends: taken with it, once, and a local login
+  /// without one.
+  #[tokio::test]
+  async fn test_login_kind_travels_with_the_second_factor() {
+    let session = session();
+    assert_eq!(session.take_login_kind().await, LoginKind::Local);
+    let provider = LoginKind::Provider {
+      provider_id: "oidc".into(),
+      provider_name: "OIDC".into(),
+    };
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    session.insert_login_kind(&provider).await.unwrap();
+    assert_eq!(
+      session.complete_totp_login().await.unwrap(),
+      provider
+    );
+    // Gone with the completion
+    assert_eq!(session.take_login_kind().await, LoginKind::Local);
+    assert!(session.begin_totp_login_attempt().await.is_err());
+    // A value the server can't read is dropped, not refused
+    session.0.insert(Session::LOGIN_KIND, 42u32).await.unwrap();
+    assert_eq!(session.take_login_kind().await, LoginKind::Local);
+    assert_eq!(session.take_login_kind().await, LoginKind::Local);
   }
 
   #[tokio::test]

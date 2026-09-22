@@ -193,8 +193,27 @@ fn requires_recent_login(request: &ManageRequest) -> bool {
   )
 }
 
-/// `authenticated_at` is when the token was issued,
-/// or `None` for credentials without a login (api keys).
+/// The requests which manage resources rather than the caller's
+/// account: the login providers and trusted issuers, whose handlers
+/// require an admin. A credential without a login (an api key, where
+/// the app accepts them at all) may perform these — automation
+/// manages them — and nothing else here.
+fn manages_resources(request: &ManageRequest) -> bool {
+  matches!(
+    request,
+    ManageRequest::CreateExternalLoginProvider(_)
+      | ManageRequest::UpdateExternalLoginProvider(_)
+      | ManageRequest::DeleteExternalLoginProvider(_)
+      | ManageRequest::CreateTrustedIssuer(_)
+      | ManageRequest::UpdateTrustedIssuer(_)
+      | ManageRequest::DeleteTrustedIssuer(_)
+  )
+}
+
+/// `authenticated_at` is when the token was issued, or `None` for
+/// credentials without a login (api keys), which the resource
+/// requests take ([manages_resources]) and the account requests
+/// refuse. A session needs a recent login for both.
 fn check_recent_login(
   window_secs: u64,
   authenticated_at: Option<u64>,
@@ -214,6 +233,7 @@ fn check_recent_login(
       "log in again to continue, this needs a login within the last {}",
       format_window(window_secs)
     ),
+    None if manages_resources(request) => return Ok(()),
     None => String::from(
       "this needs a recent login, api keys can't be used for it",
     ),
@@ -396,9 +416,16 @@ mod tests {
         check_recent_login(WINDOW, Some(NOW - age), NOW, &request)
           .unwrap_or_else(|_| panic!("{method} at {age}s"));
       }
-      // Too old, from the future, or not a login at all (api key).
-      for authenticated_at in
-        [Some(NOW - WINDOW - 1), Some(0), Some(NOW + 60), None]
+      // Too old, from the future, or (an account request) not a
+      // login at all (api key).
+      for authenticated_at in [
+        Some(NOW - WINDOW - 1),
+        Some(0),
+        Some(NOW + 60),
+        (!manages_resources(&request)).then_some(None).flatten(),
+      ]
+      .into_iter()
+      .filter(|at| at.is_some() || !manages_resources(&request))
       {
         let err =
           check_recent_login(WINDOW, authenticated_at, NOW, &request)
@@ -424,6 +451,31 @@ mod tests {
             .is_ok()
         );
       }
+    }
+  }
+
+  /// The resource requests take a credential without a login; a
+  /// stale login is still refused them, and the account requests
+  /// refuse keys.
+  #[test]
+  fn test_resource_requests_take_api_keys() {
+    let (resources, accounts): (Vec<_>, Vec<_>) =
+      sensitive_requests()
+        .into_iter()
+        .partition(manages_resources);
+    // One of each kind is listed, not every resource request.
+    assert!(!resources.is_empty());
+    assert!(accounts.len() > 6);
+    for request in &resources {
+      assert!(check_recent_login(WINDOW, None, NOW, request).is_ok());
+      let err = check_recent_login(WINDOW, Some(0), NOW, request)
+        .unwrap_err();
+      assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+    for request in &accounts {
+      let err =
+        check_recent_login(WINDOW, None, NOW, request).unwrap_err();
+      assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
   }
 

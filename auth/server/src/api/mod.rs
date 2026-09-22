@@ -252,6 +252,7 @@ async fn get_user_id_or_two_factor<I: AuthImpl>(
       auth
         .record_login(Login::of(
           user.as_ref(),
+          ip,
           provider_login(provider),
           None,
         ))

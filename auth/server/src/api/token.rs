@@ -42,7 +42,7 @@ use crate::{
   AuthImpl, Login, LoginKind,
   api::{
     external::load_provider_client,
-    external_login_requires_two_factor, provider_login,
+    external_login_requires_two_factor,
   },
   middleware::check_user_cidr_whitelist,
   provider::{
@@ -805,15 +805,17 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     ));
   }
 
+  let login = ExchangedLogin::Workload {
+    issuer_id: issuer.id.clone(),
+    issuer_name: issuer.name.clone(),
+    rule_id: rule.id.clone(),
+    rule_name: rule.name.clone(),
+  };
   auth
     .record_login(Login::of(
       user.as_ref(),
-      LoginKind::Workload {
-        issuer_id: issuer.id.clone(),
-        issuer_name: issuer.name.clone(),
-        rule_id: rule.id.clone(),
-        rule_name: rule.name.clone(),
-      },
+      ip,
+      LoginKind::from(login.clone()),
       None,
     ))
     .await?;
@@ -846,12 +848,7 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
       expires_in: u64::try_from(ttl_ms / 1000).unwrap_or(u64::MAX),
     },
     user_id: user.id().to_string(),
-    login: ExchangedLogin::Workload {
-      issuer_id: issuer.id,
-      issuer_name: issuer.name,
-      rule_id: rule.id,
-      rule_name: rule.name,
-    },
+    login,
   })
 }
 
@@ -881,10 +878,15 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
   // Sync before the token is issued, like for a login.
   auth.sync_external_user(user.id().to_string(), info).await?;
 
+  let login = ExchangedLogin::Provider {
+    provider_id: provider.id.clone(),
+    provider_name: provider.name.clone(),
+  };
   auth
     .record_login(Login::of(
       user.as_ref(),
-      provider_login(&provider),
+      ip,
+      LoginKind::from(login.clone()),
       None,
     ))
     .await?;
@@ -908,10 +910,7 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
         .unwrap_or(u64::MAX),
     },
     user_id: user.id().to_string(),
-    login: ExchangedLogin::Provider {
-      provider_id: provider.id,
-      provider_name: provider.name,
-    },
+    login,
   })
 }
 

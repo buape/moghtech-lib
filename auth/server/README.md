@@ -552,8 +552,13 @@ fn reauthentication_window_secs(&self) -> u64 {
   again, including their second factor, and retries. `mogh_ui` does this on
   its own: it tells the user why and sends them to `/login?backto=<page>`
   (`setOnReauthenticationRequired` to change that).
-- Api keys are not a login, and are refused for these requests while the check
-  is enabled. Disable it if the app provisions credentials with api keys.
+- Api keys are not a login, and are refused the account requests while the
+  check is enabled. The requests which manage resources rather than the
+  caller's account — the login providers and trusted issuers, whose handlers
+  require an admin — take them, so an admin's key can run Terraform against
+  them; whether keys reach the management api at all is the app's
+  `get_user_id_from_request_authentication`. Disable the check instead if the
+  app provisions credentials with keys.
 - The time is the `iat` of a `JwtProvider` token. Apps which validate other
   tokens in `get_user_id_from_request_authentication` should disable the check.
 
@@ -580,15 +585,20 @@ shows both as a notification. Server errors are logged and only reported as
 
 The server logs every login. For the app's own audit trail, implement
 `record_login`: it is called once per login, at the step which grants it (a
-local login once the password, and any second factor, is verified; an external
-login at the provider's callback, or once its second factor is complete; a token
-exchange when the token is issued), after the hooks the login needed
-(`sync_external_user`, `get_or_create_workload_user`) and before the session or
-token is issued. An error fails the login.
+local sign up or login once the password, and any second factor, is verified;
+an external sign up or login at the provider's callback, or once its second
+factor is complete; a token exchange when the token is issued — an
+`ExchangeExternalForJwt` can end in a second factor too), after the hooks the
+login needed (`sign_up_local_user` / `sign_up_external_user`,
+`sync_external_user`, `get_or_create_workload_user`) and immediately before the
+session or token is issued. An error fails the login; by then a one-time
+credential (a TOTP step, a recovery code) may be consumed, so an app whose
+recording can fail should log and continue instead.
 
 ```rust
 fn record_login(&self, login: Login) -> DynFuture<mogh_error::Result<()>> {
-  // login.user_id, login.username, login.second_factor, and
+  // login.user_id, login.username, login.ip,
+  // login.second_factor: Option<Passkey | Totp | TotpRecovery>, and
   // login.kind: Local | Provider { provider_id, provider_name }
   //   | Workload { issuer_id, issuer_name, rule_id, rule_name }
   Box::pin(async move { audit(login).await })

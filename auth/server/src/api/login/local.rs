@@ -17,6 +17,7 @@ use crate::{
 
 pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
   auth: &I,
+  ip: IpAddr,
   username: String,
   password: &str,
 ) -> mogh_error::Result<JwtResponse> {
@@ -53,6 +54,17 @@ pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
 
   info!(user_id, username, "New user registration (Local)");
 
+  // Signing up logs the new user in.
+  auth
+    .record_login(Login {
+      user_id: user_id.clone(),
+      username,
+      ip,
+      kind: LoginKind::Local,
+      second_factor: None,
+    })
+    .await?;
+
   auth.jwt_provider().encode_sub(&user_id).map_err(Into::into)
 }
 
@@ -84,12 +96,14 @@ impl Resolve<LoginArgs> for SignUpLocalUser {
     self,
     LoginArgs { auth, ip, .. }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
-    sign_up_local_user(auth.as_ref(), self.username, &self.password)
-      .with_failure_rate_limit_using_ip(
-        auth.general_rate_limiter(),
-        ip,
-      )
-      .await
+    sign_up_local_user(
+      auth.as_ref(),
+      *ip,
+      self.username,
+      &self.password,
+    )
+    .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), ip)
+    .await
   }
 }
 
@@ -183,6 +197,7 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
       auth
         .record_login(Login::of(
           user.as_ref(),
+          ip,
           LoginKind::Local,
           None,
         ))
@@ -257,6 +272,8 @@ mod tests {
       self.hashed_password.as_deref()
     }
   }
+
+  const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 7));
 
   #[derive(Default)]
   struct TestAuth {
@@ -353,14 +370,23 @@ mod tests {
     }
   }
 
-  /// A verified password is a login the app hears about, a
-  /// refused one is not.
+  /// A sign up and a verified password are logins the app hears
+  /// about, a refused password is not.
   #[tokio::test]
   async fn test_login_is_recorded() {
     let auth = TestAuth::default();
-    sign_up_local_user(&auth, "user".into(), "password-1")
+    sign_up_local_user(&auth, IP, "user".into(), "password-1")
       .await
       .unwrap();
+    {
+      let logins = auth.logins.lock().unwrap();
+      assert_eq!(logins.len(), 1, "signing up logs the user in");
+      assert_eq!(logins[0].user_id, "id-0");
+      assert_eq!(logins[0].username, "user");
+      assert_eq!(logins[0].ip, IP);
+      assert_eq!(logins[0].kind, LoginKind::Local);
+      assert!(logins[0].second_factor.is_none());
+    }
     let ip = IpAddr::from([127, 0, 0, 1]);
     let res = login_local_user(
       &auth,
@@ -374,11 +400,11 @@ mod tests {
     assert!(matches!(res, JwtOrTwoFactor::Jwt(_)));
     {
       let logins = auth.logins.lock().unwrap();
-      assert_eq!(logins.len(), 1);
-      assert_eq!(logins[0].user_id, "id-0");
-      assert_eq!(logins[0].username, "user");
-      assert_eq!(logins[0].kind, LoginKind::Local);
-      assert!(logins[0].second_factor.is_none());
+      assert_eq!(logins.len(), 2);
+      assert_eq!(logins[1].user_id, "id-0");
+      assert_eq!(logins[1].ip, ip);
+      assert_eq!(logins[1].kind, LoginKind::Local);
+      assert!(logins[1].second_factor.is_none());
     }
     let err = login_local_user(
       &auth,
@@ -390,18 +416,19 @@ mod tests {
     .await
     .unwrap_err();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(auth.logins.lock().unwrap().len(), 1);
+    assert_eq!(auth.logins.lock().unwrap().len(), 2);
   }
 
   #[tokio::test]
   async fn test_sign_up_rejects_taken_username_with_conflict() {
     let auth = TestAuth::default();
-    sign_up_local_user(&auth, "user".into(), "password-1")
+    sign_up_local_user(&auth, IP, "user".into(), "password-1")
       .await
       .unwrap();
-    let err = sign_up_local_user(&auth, "user".into(), "password-2")
-      .await
-      .unwrap_err();
+    let err =
+      sign_up_local_user(&auth, IP, "user".into(), "password-2")
+        .await
+        .unwrap_err();
     assert_eq!(err.status, StatusCode::CONFLICT);
     // The app storage was never asked to create the duplicate.
     assert_eq!(auth.users.lock().unwrap().len(), 1);
@@ -410,7 +437,7 @@ mod tests {
   #[tokio::test]
   async fn test_check_username_available() {
     let auth = TestAuth::default();
-    sign_up_local_user(&auth, "user".into(), "password-1")
+    sign_up_local_user(&auth, IP, "user".into(), "password-1")
       .await
       .unwrap();
     // Free

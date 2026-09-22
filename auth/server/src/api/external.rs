@@ -459,7 +459,8 @@ async fn login_callback<I: AuthImpl>(
       auth
         .record_login(Login {
           user_id: user_id.clone(),
-          username: username.clone(),
+          username,
+          ip,
           kind: provider_login(provider),
           second_factor: None,
         })
@@ -931,6 +932,7 @@ mod tests {
       .unwrap();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     assert!(auth.calls.lock().unwrap().signed_up.is_empty());
+    assert!(auth.calls.lock().unwrap().recorded.is_empty());
     assert!(session.retrieve_authenticated_user_id().await.is_err());
 
     // Provider level setting
@@ -940,8 +942,9 @@ mod tests {
     assert!(
       run_login(&auth, &session, &disabled, "42").await.is_err()
     );
+    assert!(auth.calls.lock().unwrap().recorded.is_empty());
 
-    // The first user can always sign up
+    // The first user can always sign up, which logs them in
     let auth = TestAuth {
       registration_disabled: true,
       no_users_exist: true,
@@ -949,7 +952,19 @@ mod tests {
     };
     let _redirect =
       run_login(&auth, &session, &provider, "42").await.unwrap();
-    assert_eq!(auth.calls.lock().unwrap().signed_up, ["octocat"]);
+    let calls = auth.calls.lock().unwrap();
+    assert_eq!(calls.signed_up, ["octocat"]);
+    assert_eq!(calls.recorded.len(), 1);
+    assert_eq!(calls.recorded[0].username, "octocat");
+    assert_eq!(calls.recorded[0].ip, IP);
+    assert!(calls.recorded[0].second_factor.is_none());
+    assert_eq!(
+      calls.recorded[0].kind,
+      LoginKind::Provider {
+        provider_id: "flow-a".into(),
+        provider_name: provider.name.clone(),
+      }
+    );
   }
 
   #[tokio::test]

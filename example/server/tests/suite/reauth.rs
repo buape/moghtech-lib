@@ -43,6 +43,20 @@ fn new_key(name: &str) -> CreateApiKey {
   }
 }
 
+/// Admin: whoever controls a login provider controls the app.
+fn attacker_sso() -> CreateExternalLoginProvider {
+  CreateExternalLoginProvider {
+    slug: String::new(),
+    name: "Attacker SSO".into(),
+    registration_disabled: false,
+    token_exchange: Default::default(),
+    config:
+      example_client::auth::config::ExternalLoginProviderConfig::Oidc(
+        Default::default(),
+      ),
+  }
+}
+
 fn assert_reauthentication_required<T>(
   res: anyhow::Result<T>,
   what: &str,
@@ -64,7 +78,9 @@ fn assert_reauthentication_required<T>(
   );
 }
 
-/// Every request which changes how somebody can log in.
+/// Every request which changes how the caller can log in. The
+/// resource requests (a login provider) are asserted by the tests:
+/// a stale session is refused them too, an api key is not.
 async fn assert_all_sensitive_requests_refused(
   client: &ExampleClient,
 ) {
@@ -123,22 +139,6 @@ async fn assert_all_sensitive_requests_refused(
       .await,
     "CreateApiKeyV2",
   );
-  // Admin: whoever controls a login provider controls the app.
-  assert_reauthentication_required(
-    client
-      .manage(CreateExternalLoginProvider {
-        slug: String::new(),
-        name: "Attacker SSO".into(),
-        registration_disabled: false,
-        token_exchange: Default::default(),
-        config:
-          example_client::auth::config::ExternalLoginProviderConfig::Oidc(
-            Default::default(),
-          ),
-      })
-      .await,
-    "CreateExternalLoginProvider",
-  );
 }
 
 #[tokio::test]
@@ -153,6 +153,10 @@ async fn an_old_token_cannot_change_how_the_user_logs_in() {
 
   // Eg. a token lifted from a browser hours after the login.
   assert_all_sensitive_requests_refused(&admin).await;
+  assert_reauthentication_required(
+    admin.manage(attacker_sso()).await,
+    "CreateExternalLoginProvider",
+  );
   let user = get_user(&admin).await;
   assert_eq!(user.username, "admin");
   assert!(!user.totp_enrolled);
@@ -192,8 +196,11 @@ async fn api_keys_cannot_create_more_credentials() {
     secret: res.secret,
   });
 
-  // An api key is not a login, recent or otherwise.
+  // An api key is not a login, recent or otherwise: refused every
+  // request about the account.
   assert_all_sensitive_requests_refused(&api).await;
+  // Managing the login providers is what a key is for.
+  api.manage(attacker_sso()).await.unwrap();
   api.manage(GetUserId {}).await.unwrap();
   api.read(GetRequestInfo {}).await.unwrap();
   assert_eq!(admin.read(ListApiKeys {}).await.unwrap().len(), 1);

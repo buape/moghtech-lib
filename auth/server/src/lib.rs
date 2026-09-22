@@ -67,15 +67,25 @@ pub enum RequestAuthentication {
 }
 
 /// A login the auth server completed, see [AuthImpl::record_login].
+/// Built by the server ([Login::of]); apps read it. Fields may be
+/// added.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Login {
   /// The user who logged in.
   pub user_id: String,
+  /// Their username at the time (for a user just signed up through
+  /// a provider, the one the server made unique).
   pub username: String,
+  /// The client ip the login came from (the request's, forwarding
+  /// headers honored from the trusted proxies only).
+  pub ip: IpAddr,
   /// How the user was authenticated.
   pub kind: LoginKind,
   /// The second factor the login was completed with, for a user
-  /// enrolled in one. Never for a workload, or a token exchange.
+  /// enrolled in one. Never for a workload, nor for a `POST /token`
+  /// exchange (which refuses such users); an `ExchangeExternalForJwt`
+  /// can be completed with one.
   pub second_factor: Option<SecondFactor>,
 }
 
@@ -83,12 +93,14 @@ impl Login {
   /// The login of `user`.
   pub fn of(
     user: &dyn crate::user::AuthUserImpl,
+    ip: IpAddr,
     kind: LoginKind,
     second_factor: Option<SecondFactor>,
   ) -> Login {
     Login {
       user_id: user.id().to_string(),
       username: user.username().to_string(),
+      ip,
       kind,
       second_factor,
     }
@@ -96,6 +108,14 @@ impl Login {
 }
 
 /// How a login authenticated the user.
+///
+/// Matched exhaustively on purpose, like
+/// [ExchangedLogin](api::token::ExchangedLogin): a new kind of login
+/// is meant to be a compile error for an app recording them, not a
+/// silently unrecorded login. Its serde form is kept on the session
+/// between the two factors of a login, so it stays backwards
+/// compatible (a value the server can't read counts as a local
+/// login).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoginKind {
   /// Username and password (`LoginLocalUser`).
@@ -117,6 +137,31 @@ pub enum LoginKind {
     rule_id: String,
     rule_name: String,
   },
+}
+
+impl From<api::token::ExchangedLogin> for LoginKind {
+  fn from(login: api::token::ExchangedLogin) -> LoginKind {
+    match login {
+      api::token::ExchangedLogin::Provider {
+        provider_id,
+        provider_name,
+      } => LoginKind::Provider {
+        provider_id,
+        provider_name,
+      },
+      api::token::ExchangedLogin::Workload {
+        issuer_id,
+        issuer_name,
+        rule_id,
+        rule_name,
+      } => LoginKind::Workload {
+        issuer_id,
+        issuer_name,
+        rule_id,
+        rule_name,
+      },
+    }
+  }
 }
 
 /// The second factor a login was completed with.
@@ -359,18 +404,27 @@ pub trait AuthImpl: Send + Sync + 'static {
   }
 
   /// A user logged in: they are authenticated, the hooks the login
-  /// needed have run (`sync_external_user`, `sign_up_external_user`,
-  /// `get_or_create_workload_user`), and their session or token is
-  /// about to be issued. For the app's own audit trail; the server
-  /// logs every login itself, so the default does nothing.
+  /// needed have run (`sign_up_local_user` / `sign_up_external_user`,
+  /// `sync_external_user`, `get_or_create_workload_user`), and their
+  /// session or token is issued right after. For the app's own audit
+  /// trail; the server logs every login itself, so the default does
+  /// nothing.
   ///
   /// Called once per login, at the step which grants it: a local
-  /// login when the password is verified, or once its second factor
-  /// is complete; an external login at the provider's callback
-  /// (redeeming the jwt on the same session afterwards is not
-  /// another login), or once its second factor is complete; a
-  /// token exchange, a user's or a workload's, when the token is
-  /// issued. An error fails the login.
+  /// sign up or login when the password is verified, or once its
+  /// second factor is complete; an external sign up or login at the
+  /// provider's callback (redeeming the jwt on the same session
+  /// afterwards is not another login), or once its second factor is
+  /// complete; a token exchange, a user's (`POST /token` or
+  /// `ExchangeExternalForJwt`, the latter possibly after a second
+  /// factor) or a workload's, when the token is issued.
+  ///
+  /// An error fails the login. By then a one-time credential may
+  /// have been consumed (the TOTP step, a recovery code), so an app
+  /// whose recording can fail should log and continue rather than
+  /// refuse; and the rare failure after the hook (the session
+  /// store, encoding the token) leaves a recorded login the user
+  /// did not get.
   fn record_login(
     &self,
     _login: Login,
