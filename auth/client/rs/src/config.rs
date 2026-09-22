@@ -53,7 +53,7 @@ impl ExternalLoginKind {
   }
 }
 
-/// An external login provider users can log in with.
+/// An external login provider users can use to log in.
 /// Any number of these can be configured, either statically
 /// by the app (file / env) or stored by the app and managed over the API.
 #[typeshare]

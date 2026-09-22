@@ -78,7 +78,7 @@ export type ExternalLoginProviderConfig =
 	| { kind: "Google", params: NamedOauthConfig };
 
 /**
- * An external login provider users can log in with.
+ * An external login provider users can use to log in.
  * Any number of these can be configured, either statically
  * by the app (file / env) or stored by the app and managed over the API.
  */
@@ -881,9 +881,9 @@ export interface UnlinkLocalLogin {
  * - The kind of the provider cannot be changed.
  * - If the client secret is empty or the redacted value from
  * [ListExternalLoginProviders], the existing secret is kept.
+ * Pass `clear_client_secret` to remove it instead.
  * - An empty slug keeps the existing one. Changing it changes the
  * redirect URI registered at the provider.
- * Pass `clear_client_secret` to remove it instead.
  */
 export interface UpdateExternalLoginProvider {
 	/** The id of the provider to update. */

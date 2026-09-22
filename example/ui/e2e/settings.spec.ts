@@ -46,7 +46,7 @@ test("admin enables and disables users", async ({ page, browser }) => {
   await userContext.close();
 });
 
-test("admin adds a login provider, which users can log in with", async ({
+test("admin adds a login provider, which users can use to log in", async ({
   page,
 }) => {
   const providerName = uniqueName("SSO");

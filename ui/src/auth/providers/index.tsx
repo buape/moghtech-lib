@@ -53,7 +53,7 @@ function newProviderConfig(
 
 /**
  * Manage the external login providers (OIDC, Github, Google)
- * users can log in with. For use in app settings pages.
+ * users can use to log in. For use in app settings pages.
  *
  * With `link`, the names link to the app's `LoginProviderPage`
  * route and a new provider opens there; without it the providers
@@ -113,7 +113,7 @@ export function LoginProvidersTable({
       title="Login Providers"
       titleFz="h3"
       icon={<KeyRound size="1.2rem" />}
-      description="External providers users can log in with."
+      description="External providers users can use to log in."
       isPending={isPending}
       error={
         error

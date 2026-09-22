@@ -19,7 +19,7 @@ cmd = "cargo run -p example_server"
 
 [example-mock-idp]
 alias = "emi"
-description = "Runs the mock OIDC provider the example app can log in with"
+description = "Runs the mock OIDC provider the example app can use to log in"
 cmd = "cargo run -p example_mock_idp"
 
 [test-example]
