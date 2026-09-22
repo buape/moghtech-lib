@@ -46,14 +46,16 @@ pub enum UserIdOrTwoFactor {
 
 /// An enabled external login provider to show on the login page.
 ///
-/// Login is started by redirecting the user to `/external/{id}/login`
-/// relative to the auth api path, linking with `/external/{id}/link`.
+/// Login is started by redirecting the user to `/external/{slug}/login`
+/// relative to the auth api path, linking with `/external/{slug}/link`.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct LoginOptionsProvider {
-  /// The provider id
+  /// The provider id, which its links to users carry.
   pub id: String,
+  /// The slug naming the provider in the login / link urls.
+  pub slug: String,
   /// The display name of the provider
   pub name: String,
   /// The kind of provider, eg. to choose an icon.
@@ -102,7 +104,7 @@ pub struct GetLoginOptionsResponse {
   pub registration_disabled: bool,
   /// The enabled external login providers.
   pub providers: Vec<LoginOptionsProvider>,
-  /// The id of the provider the login page should auto-redirect to
+  /// The slug of the provider the login page should auto-redirect to
   /// instead of showing the login page, if any.
   /// This is the first enabled OIDC provider with `auto_redirect`.
   pub auto_redirect: Option<String>,
@@ -454,6 +456,7 @@ mod tests {
       registration_disabled: true,
       providers: vec![LoginOptionsProvider {
         id: "oidc".into(),
+        slug: "oidc".into(),
         name: "Authentik".into(),
         kind: ExternalLoginKind::Oidc,
         registration_disabled: false,
@@ -468,6 +471,7 @@ mod tests {
         "registration_disabled": true,
         "providers": [{
           "id": "oidc",
+          "slug": "oidc",
           "name": "Authentik",
           "kind": "Oidc",
           "registration_disabled": false,

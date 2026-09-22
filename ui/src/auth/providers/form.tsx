@@ -23,8 +23,10 @@ type ListItem = MoghAuth.Types.ExternalLoginProviderListItem;
 type ProviderConfig = MoghAuth.Types.ExternalLoginProviderConfig;
 
 /** Flat form values covering every kind of provider. */
-interface ProviderFormValues {
+export interface ProviderFormValues {
   name: string;
+  /** Names the provider in its urls. Empty keeps the stored one. */
+  slug: string;
   registration_disabled: boolean;
   enabled: boolean;
   client_id: string;
@@ -48,11 +50,12 @@ interface ProviderFormValues {
   admin_groups: string[];
 }
 
-function formValues(item: ListItem): ProviderFormValues {
+export function providerFormValues(item: ListItem): ProviderFormValues {
   const { kind, params } = item.provider.config;
   const oidc = kind === "Oidc" ? params : undefined;
   return {
     name: item.provider.name,
+    slug: item.provider.slug ?? "",
     registration_disabled: item.provider.registration_disabled ?? false,
     enabled: params.enabled ?? false,
     client_id: params.client_id ?? "",
@@ -76,7 +79,7 @@ function formValues(item: ListItem): ProviderFormValues {
   };
 }
 
-function providerConfig(
+export function providerConfig(
   kind: LoginProviderKind,
   values: ProviderFormValues,
 ): ProviderConfig {
@@ -105,12 +108,110 @@ function providerConfig(
   };
 }
 
-function validHttpUrl(value: string) {
+export function validHttpUrl(value: string) {
   try {
     return ["http:", "https:"].includes(new URL(value).protocol);
   } catch {
     return false;
   }
+}
+
+/**
+ * What the server would refuse, by field, checked before a save.
+ * The modal form runs the same checks through mantine's validate.
+ */
+export function providerFormErrors(
+  item: ListItem,
+  values: ProviderFormValues,
+): Partial<Record<keyof ProviderFormValues, string>> {
+  const kind = item.provider.config.kind;
+  const hasSecret = !!item.provider.config.params.client_secret;
+  const existingProviderUrl =
+    item.provider.config.kind === "Oidc"
+      ? (item.provider.config.params.provider ?? "")
+      : "";
+  const errors: Partial<Record<keyof ProviderFormValues, string>> = {};
+  if (!values.name.trim().length) {
+    errors.name = "Name cannot be empty";
+  }
+  const slug = values.slug.trim();
+  if (slug.length && !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(slug)) {
+    errors.slug =
+      "Only lowercase letters, digits and single hyphens between them";
+  } else if (slug.length > 64) {
+    errors.slug = "At most 64 characters";
+  }
+  if (
+    kind === "Oidc" &&
+    values.provider.trim().length &&
+    !validHttpUrl(values.provider)
+  ) {
+    errors.provider = "Must be an http(s) URL";
+  }
+  if (
+    kind === "Oidc" &&
+    values.redirect_host.trim().length &&
+    !validHttpUrl(values.redirect_host)
+  ) {
+    errors.redirect_host = "Must be an http(s) URL";
+  }
+  if (!values.clear_client_secret) {
+    // The server won't send the stored secret to another address
+    if (
+      kind === "Oidc" &&
+      hasSecret &&
+      !values.client_secret.length &&
+      values.provider.trim() !== existingProviderUrl
+    ) {
+      errors.client_secret =
+        "Enter the client secret again when changing the provider URL";
+    }
+    // Only OIDC works without a secret (public clients using PKCE)
+    if (
+      kind !== "Oidc" &&
+      values.enabled &&
+      !hasSecret &&
+      !values.client_secret.length
+    ) {
+      errors.client_secret =
+        "A client secret is required to enable this provider";
+    }
+  }
+  if (!(
+    typeof values.token_exchange_max_age_secs === "number" &&
+    Number.isInteger(values.token_exchange_max_age_secs) &&
+    values.token_exchange_max_age_secs >= 0
+  )) {
+    errors.token_exchange_max_age_secs =
+      "Must be a whole number of seconds, 0 for no limit";
+  }
+  if (values.clear_client_secret && kind !== "Oidc" && values.enabled) {
+    errors.clear_client_secret =
+      "Disable the provider to remove its secret, it can't work without one";
+  }
+  return errors;
+}
+
+/** The update request a provider's form values make. */
+export function providerUpdate(
+  item: ListItem,
+  values: ProviderFormValues,
+): MoghAuth.Types.UpdateExternalLoginProvider {
+  const kind = item.provider.config.kind;
+  return {
+    id: item.provider.id,
+    name: values.name.trim(),
+    slug: values.slug.trim(),
+    registration_disabled: values.registration_disabled,
+    // Github has no signed tokens to exchange
+    token_exchange: {
+      enabled: kind !== "Github" && values.token_exchange_enabled,
+      audiences: values.token_exchange_audiences,
+      max_token_age_secs: values.token_exchange_max_age_secs,
+    },
+    config: providerConfig(kind, values),
+    clear_client_secret: values.clear_client_secret,
+  };
 }
 
 export function LoginProviderModal({
@@ -177,9 +278,10 @@ export function LoginProviderForm({
 
   const form = useForm<ProviderFormValues>({
     mode: "controlled",
-    initialValues: formValues(item),
+    initialValues: providerFormValues(item),
     validate: {
       name: (name) => (name.trim().length ? null : "Name cannot be empty"),
+      slug: (slug, values) => providerFormErrors(item, values).slug ?? null,
       provider: (provider) =>
         kind === "Oidc" && provider.trim().length && !validHttpUrl(provider)
           ? "Must be an http(s) URL"
@@ -235,27 +337,13 @@ export function LoginProviderForm({
 
   return (
     <form
-      onSubmit={form.onSubmit((values) =>
-        update({
-          id: item.provider.id,
-          name: values.name.trim(),
-          registration_disabled: values.registration_disabled,
-          // Github has no signed tokens to exchange
-          token_exchange: {
-            enabled: kind !== "Github" && values.token_exchange_enabled,
-            audiences: values.token_exchange_audiences,
-            max_token_age_secs: values.token_exchange_max_age_secs,
-          },
-          config: providerConfig(kind, values),
-          clear_client_secret: values.clear_client_secret,
-        }),
-      )}
+      onSubmit={form.onSubmit((values) => update(providerUpdate(item, values)))}
     >
       <Stack>
         {readOnly && (
           <Alert icon={<Info size="1rem" />} color="gray">
-            This provider comes from the app configuration (file /
-            environment), and can only be changed there.
+            This provider comes from the app configuration (file / environment),
+            and can only be changed there.
           </Alert>
         )}
 
@@ -300,6 +388,14 @@ export function LoginProviderForm({
             mb={6}
           />
         </Group>
+
+        <TextInput
+          {...form.getInputProps("slug")}
+          label="Slug"
+          description="Names the provider in its login and redirect URIs. Changing it changes the redirect URI to register at the provider."
+          placeholder={item.provider.slug ? undefined : item.provider.id}
+          disabled={readOnly}
+        />
 
         {kind === "Oidc" && (
           <TextInput
@@ -491,8 +587,8 @@ export function LoginProviderForm({
                     {values.token_exchange_audiences.length > 0
                       ? ", including tokens issued to every app listed above."
                       : "."}{" "}
-                    Users who need a second factor for external logins can't
-                    use it.
+                    Users who need a second factor for external logins can't use
+                    it.
                   </Alert>
                 )}
               </>

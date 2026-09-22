@@ -25,6 +25,8 @@ export interface LinkedLogin {
 export interface LoginMethod {
   /** The external login provider id, or undefined for local login. */
   provider_id: string | undefined;
+  /** The slug the provider's link url uses (available providers only). */
+  slug?: string;
   name: string;
   /** Unknown for providers which are no longer available. */
   kind: LoginProviderKind | "Local" | undefined;
@@ -61,6 +63,7 @@ export function LinkedLogins({
     for (const provider of options?.providers ?? []) {
       methods.push({
         provider_id: provider.id,
+        slug: provider.slug,
         name: provider.name,
         kind: provider.kind,
         available: true,
@@ -99,10 +102,9 @@ export function LinkedLogins({
   const { mutateAsync: unlinkLocal } = useManageAuth("UnlinkLocalLogin", {
     onSuccess: onUnlinked,
   });
-  const { mutateAsync: unlinkExternal } = useManageAuth(
-    "UnlinkExternalLogin",
-    { onSuccess: onUnlinked },
-  );
+  const { mutateAsync: unlinkExternal } = useManageAuth("UnlinkExternalLogin", {
+    onSuccess: onUnlinked,
+  });
 
   if (!loginMethods.length) {
     return null;
@@ -202,7 +204,12 @@ export function LinkedLogins({
                   // Through the mutation for its error notification
                   onClick={() =>
                     beginLink({}).then(() =>
-                      location.replace(authClient().externalLinkUrl(providerId)),
+                      location.replace(
+                        authClient().externalLinkUrl(
+                          // The url names the provider by its slug
+                          method.slug ?? providerId,
+                        ),
+                      ),
                     )
                   }
                   leftSection={<Plus size="1rem" />}

@@ -70,6 +70,11 @@ export interface ConfigProps<T> extends SectionProps {
   disableSidebar?: boolean;
   fileContentsLanguage?: MonacoLanguage;
   enableFancyToml?: boolean;
+  /**
+   * Fields holding secrets (a credential being set): the confirm
+   * dialog shows that they change, never their values.
+   */
+  secretKeys?: (keyof T)[];
   groups: Record<
     string, // Section key
     ConfigGroupArgs<T>[] | false | undefined
@@ -85,6 +90,7 @@ export function Config<T>({
   disableSidebar,
   fileContentsLanguage,
   enableFancyToml,
+  secretKeys,
   groups: _groups,
   ...sectionProps
 }: ConfigProps<T>) {
@@ -196,6 +202,7 @@ export function Config<T>({
           fileContentsLanguage={fileContentsLanguage}
           fullWidth={fullWidth}
           enableFancyToml={enableFancyToml}
+          secretKeys={secretKeys}
         />
       </>
     );

@@ -125,7 +125,7 @@ pub async fn get_login_options<I: AuthImpl + ?Sized>(
         ExternalLoginProviderConfig::Oidc(config) if config.auto_redirect
       )
     })
-    .map(|provider| provider.id.clone());
+    .map(|provider| provider.slug().to_string());
 
   GetLoginOptionsResponse {
     local: auth.local_auth_enabled(),
@@ -136,6 +136,7 @@ pub async fn get_login_options<I: AuthImpl + ?Sized>(
         kind: provider.kind(),
         registration_disabled: auth
           .external_registration_disabled(&provider),
+        slug: provider.slug().to_string(),
         id: provider.id,
         name: provider.name,
       })
@@ -278,6 +279,7 @@ mod tests {
       id: id.to_string(),
       name: format!("OIDC {id}"),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Oidc(OidcConfig {
         enabled,
@@ -297,6 +299,7 @@ mod tests {
       id: id.to_string(),
       name: format!("Github {id}"),
       registration_disabled,
+      slug: String::new(),
       token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
         enabled: true,
@@ -366,12 +369,14 @@ mod tests {
           name: "OIDC oidc".into(),
           kind: ExternalLoginKind::Oidc,
           registration_disabled: false,
+          slug: "oidc".into(),
         },
         LoginOptionsProvider {
           id: "abc".into(),
           name: "Github abc".into(),
           kind: ExternalLoginKind::Github,
           registration_disabled: true,
+          slug: "abc".into(),
         },
       ]
     );

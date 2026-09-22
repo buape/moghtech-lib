@@ -332,9 +332,9 @@ fn validate_request(
   }
 }
 
-/// Whether `role` names the provider / rule: by id or by name.
-fn is_role(role: Option<&str>, id: &str, name: &str) -> bool {
-  role.is_none_or(|role| role == id || role == name)
+/// Whether `role` names the provider / rule: by id, slug or name.
+fn is_role(role: Option<&str>, names: &[&str]) -> bool {
+  role.is_none_or(|role| names.contains(&role))
 }
 
 /// The providers which may verify a token claiming to be from `issuer`:
@@ -354,7 +354,10 @@ fn exchange_candidates(
     .filter(|provider| {
       provider.enabled()
         && provider.token_exchange.enabled
-        && is_role(role, &provider.id, &provider.name)
+        && is_role(
+          role,
+          &[&provider.id, provider.slug(), &provider.name],
+        )
     })
     .filter(|provider| match &provider.config {
       ExternalLoginProviderConfig::Oidc(config) => {
@@ -615,7 +618,7 @@ where
         && trusted
           .rules
           .iter()
-          .any(|rule| is_role(role, &rule.id, &rule.name))
+          .any(|rule| is_role(role, &[&rule.id, &rule.name]))
     })
     .collect::<Vec<_>>();
 
@@ -653,7 +656,7 @@ where
       Some(_) => trusted
         .rules
         .iter()
-        .filter(|rule| is_role(role, &rule.id, &rule.name))
+        .filter(|rule| is_role(role, &[&rule.id, &rule.name]))
         .cloned()
         .collect::<Vec<_>>(),
       None => trusted.rules.clone(),
@@ -1085,6 +1088,7 @@ mod tests {
       id: id.to_string(),
       name: "OIDC".to_string(),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: TokenExchangeConfig {
         enabled: exchange,
         ..Default::default()
@@ -1103,6 +1107,7 @@ mod tests {
       id: id.to_string(),
       name: id.to_string(),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: TokenExchangeConfig {
         enabled: true,
         ..Default::default()

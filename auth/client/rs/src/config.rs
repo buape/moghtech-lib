@@ -68,6 +68,13 @@ pub struct ExternalLoginProvider {
   pub id: String,
   /// The display name, eg. shown on the login button.
   pub name: String,
+  /// The part of the login / callback urls naming the provider
+  /// (`/external/{slug}/callback`), see [ExternalLoginProvider::slug]:
+  /// lowercase letters, digits and single hyphens, unique among all
+  /// providers, defaulting to the name ([slugify]). Empty on providers
+  /// stored before slugs existed, which keep their id in the urls.
+  #[serde(default)]
+  pub slug: String,
   /// Disable new user registration using this provider.
   #[serde(default)]
   pub registration_disabled: bool,
@@ -260,21 +267,70 @@ impl ExternalLoginProvider {
     self.config.enabled()
   }
 
-  /// Whether the provider uses the reserved id of its kind,
-  /// see [ExternalLoginKind::reserved_id].
+  /// The slug the provider's urls use: `slug`, or for a provider
+  /// without one (stored before slugs existed, or a static provider
+  /// which never needs one) its id.
+  pub fn slug(&self) -> &str {
+    if self.slug.is_empty() {
+      &self.id
+    } else {
+      &self.slug
+    }
+  }
+
+  /// Whether the provider is addressed by the reserved id of its
+  /// kind (no slug of its own), see [ExternalLoginKind::reserved_id].
   pub fn uses_reserved_id(&self) -> bool {
-    self.id == self.kind().reserved_id()
+    self.slug.is_empty() && self.id == self.kind().reserved_id()
   }
 
   /// The path the provider redirects users back to after login,
   /// relative to the auth api path.
   pub fn callback_path(&self) -> String {
     if self.uses_reserved_id() {
-      format!("/{}/callback", self.id)
+      format!("/{}/callback", self.slug())
     } else {
-      format!("/external/{}/callback", self.id)
+      format!("/external/{}/callback", self.slug())
     }
   }
+}
+
+/// The longest slug accepted.
+pub const MAX_SLUG_LENGTH: usize = 64;
+
+/// The slug a name makes: lowercased, every run of other characters
+/// a single hyphen, no hyphens at the ends, at most [MAX_SLUG_LENGTH]
+/// characters. Empty if the name has no letters or digits.
+pub fn slugify(name: &str) -> String {
+  let mut slug = String::new();
+  for c in name.chars().flat_map(|c| c.to_lowercase()) {
+    if c.is_ascii_alphanumeric() {
+      slug.push(c);
+    } else if !slug.is_empty() && !slug.ends_with('-') {
+      slug.push('-');
+    }
+  }
+  slug.truncate(MAX_SLUG_LENGTH);
+  slug.trim_end_matches('-').to_string()
+}
+
+/// Checks a slug given explicitly: what [slugify] produces, ie.
+/// lowercase ascii letters and digits separated by single hyphens.
+pub fn validate_slug(slug: &str) -> Result<(), String> {
+  if slug.is_empty() {
+    return Err(String::from("Slug cannot be empty"));
+  }
+  if slug.len() > MAX_SLUG_LENGTH {
+    return Err(format!(
+      "Slug cannot be longer than {MAX_SLUG_LENGTH} characters"
+    ));
+  }
+  if slug != slugify(slug) {
+    return Err(String::from(
+      "Slug can only contain lowercase letters, digits and single hyphens between them",
+    ));
+  }
+  Ok(())
 }
 
 /// The kind specific configuration of an [ExternalLoginProvider].
@@ -536,6 +592,7 @@ mod tests {
       id: id.to_string(),
       name: "Github".to_string(),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
         enabled: true,
@@ -556,6 +613,57 @@ mod tests {
       ..Default::default()
     };
     assert!(!format!("{oidc:?}").contains("super-secret"));
+  }
+
+  #[test]
+  fn test_slug_falls_back_to_the_id() {
+    let mut provider = github_provider("a1B2");
+    assert_eq!(provider.slug(), "a1B2");
+    assert_eq!(provider.callback_path(), "/external/a1B2/callback");
+    provider.slug = "company-github".into();
+    assert_eq!(provider.slug(), "company-github");
+    assert_eq!(
+      provider.callback_path(),
+      "/external/company-github/callback"
+    );
+    // The reserved paths go with the id, never with a slug
+    provider.slug = "github".into();
+    assert_eq!(provider.callback_path(), "/external/github/callback");
+    let mut provider = github_provider("github");
+    assert!(provider.uses_reserved_id());
+    assert_eq!(provider.callback_path(), "/github/callback");
+    provider.slug = "gh".into();
+    assert!(!provider.uses_reserved_id());
+    assert_eq!(provider.callback_path(), "/external/gh/callback");
+  }
+
+  #[test]
+  fn test_slugify_and_validate_slug() {
+    assert_eq!(slugify("Company SSO"), "company-sso");
+    assert_eq!(slugify("  Okta -- Prod!! "), "okta-prod");
+    assert_eq!(slugify("Ünïcode Name"), "n-code-name");
+    assert_eq!(slugify("🚀"), "");
+    assert_eq!(slugify(&"a".repeat(100)).len(), MAX_SLUG_LENGTH);
+    assert_eq!(
+      slugify(&format!("{}-b", "a".repeat(63))),
+      "a".repeat(63)
+    );
+    for slug in ["okta", "company-sso", "a1", "x"] {
+      assert!(validate_slug(slug).is_ok(), "{slug}");
+    }
+    for slug in [
+      "",
+      "Okta",
+      "company sso",
+      "-okta",
+      "okta-",
+      "a--b",
+      "a_b",
+      "ä",
+      &"a".repeat(65),
+    ] {
+      assert!(validate_slug(slug).is_err(), "{slug}");
+    }
   }
 
   #[test]
@@ -630,6 +738,20 @@ mod tests {
       serde_json::to_value(TrustedIssuerKeys::Discovery {}).unwrap(),
       serde_json::json!({ "source": "Discovery", "params": {} })
     );
+  }
+
+  #[test]
+  fn test_slug_empty_by_default() {
+    // Providers stored before slugs existed keep their id in the urls
+    let provider: ExternalLoginProvider =
+      serde_json::from_value(serde_json::json!({
+        "id": "a1B2",
+        "name": "Github",
+        "config": { "kind": "Github", "params": {} },
+      }))
+      .unwrap();
+    assert!(provider.slug.is_empty());
+    assert_eq!(provider.slug(), "a1B2");
   }
 
   #[test]

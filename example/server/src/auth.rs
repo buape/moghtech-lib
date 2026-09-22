@@ -304,6 +304,7 @@ impl AuthImpl for ExampleAuthImpl {
       id: ExternalLoginKind::Oidc.reserved_id().to_string(),
       name: String::from("OIDC"),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: config.oidc_token_exchange.clone(),
       config: ExternalLoginProviderConfig::Oidc(config.oidc.clone()),
     }]

@@ -35,6 +35,7 @@ fn create_request(
   config: ExternalLoginProviderConfig,
 ) -> CreateExternalLoginProvider {
   CreateExternalLoginProvider {
+    slug: String::new(),
     name: name.into(),
     registration_disabled: false,
     token_exchange: Default::default(),
@@ -42,16 +43,17 @@ fn create_request(
   }
 }
 
+/// Logs in at the provider's login url, which names it by slug.
 async fn login_with(
   app: &TestApp,
-  provider_id: &str,
+  provider_slug: &str,
   idp_user: &str,
 ) -> ExampleClient {
   app.idp.set_auto_user(Some(&format!("{idp_user}-sub")));
   let client = app.client();
   let landed = follow_external_flow(
     &client,
-    &format!("{}/auth/external/{provider_id}/login", app.address),
+    &format!("{}/auth/external/{provider_slug}/login", app.address),
   )
   .await;
   assert_eq!(landed.query(), Some("redeem_ready=true"), "{landed}");
@@ -97,9 +99,12 @@ async fn stored_provider_lifecycle() {
     .unwrap();
   let id = created.provider.id.clone();
   assert!(!created.read_only);
+  // The urls use the slug, made from the name.
+  let slug = created.provider.slug.clone();
+  assert_eq!(slug, "company-sso");
   assert_eq!(
     created.redirect_uri,
-    format!("{}/auth/external/{id}/callback", app.address)
+    format!("{}/auth/external/{slug}/callback", app.address)
   );
   // The secret never comes back.
   assert_eq!(created.provider.config.client_secret(), REDACTED);
@@ -120,14 +125,16 @@ async fn stored_provider_lifecycle() {
   }
 
   // Logging in works, which needs the stored secret.
-  let alice = login_with(&app, &id, "alice").await;
+  let alice = login_with(&app, &slug, "alice").await;
   let user = get_user(&alice).await;
+  // Links carry the id, which a slug change never touches.
   assert_eq!(user.linked_logins[0].provider_id, id);
 
   // An update with the redacted / an empty secret keeps the stored one.
   for client_secret in [REDACTED, ""] {
     let updated = admin
       .manage(UpdateExternalLoginProvider {
+        slug: String::new(),
         id: id.clone(),
         name: "Renamed SSO".into(),
         registration_disabled: true,
@@ -141,7 +148,9 @@ async fn stored_provider_lifecycle() {
       .await
       .unwrap();
     assert_eq!(updated.provider.name, "Renamed SSO");
-    login_with(&app, &id, "alice").await;
+    // An empty slug keeps the existing one, whatever the name.
+    assert_eq!(updated.provider.slug, slug);
+    login_with(&app, &slug, "alice").await;
   }
   let options = app.client().login(GetLoginOptions {}).await.unwrap();
   assert!(options.providers[0].registration_disabled);
@@ -149,6 +158,7 @@ async fn stored_provider_lifecycle() {
   // A wrong secret is used right away (no stale cached client).
   admin
     .manage(UpdateExternalLoginProvider {
+      slug: String::new(),
       id: id.clone(),
       name: "Renamed SSO".into(),
       registration_disabled: false,
@@ -165,7 +175,7 @@ async fn stored_provider_lifecycle() {
   let client = app.client();
   let landed = follow_external_flow(
     &client,
-    &format!("{}/auth/external/{id}/login", app.address),
+    &format!("{}/auth/external/{slug}/login", app.address),
   )
   .await;
   // The provider refuses the wrong secret, which is a server side
@@ -191,7 +201,7 @@ async fn stored_provider_lifecycle() {
   assert!(get_user(&alice).await.linked_logins.is_empty());
   let landed = follow_external_flow(
     &client,
-    &format!("{}/auth/external/{id}/login", app.address),
+    &format!("{}/auth/external/{slug}/login", app.address),
   )
   .await;
   external_error(&landed, "login_error");
@@ -262,6 +272,7 @@ async fn provider_configs_are_validated() {
     .unwrap();
   let res = admin
     .manage(UpdateExternalLoginProvider {
+      slug: String::new(),
       id: created.provider.id.clone(),
       name: "Now OIDC".into(),
       registration_disabled: false,
@@ -275,6 +286,7 @@ async fn provider_configs_are_validated() {
   // Github has no signed tokens to exchange.
   let res = admin
     .manage(UpdateExternalLoginProvider {
+      slug: String::new(),
       id: created.provider.id,
       name: "Github".into(),
       registration_disabled: false,
@@ -317,6 +329,7 @@ async fn static_providers_are_read_only() {
 
   let res = admin
     .manage(UpdateExternalLoginProvider {
+      slug: String::new(),
       id: "oidc".into(),
       name: "Hijacked".into(),
       registration_disabled: false,
@@ -345,7 +358,8 @@ async fn static_providers_are_read_only() {
     .unwrap();
   assert_ne!(created.provider.id, "oidc");
   let first = login_with(&app, "oidc", "alice").await;
-  let second = login_with(&app, &created.provider.id, "alice").await;
+  let second =
+    login_with(&app, &created.provider.slug, "alice").await;
   // The same subject at another provider is another user.
   assert_ne!(get_user(&first).await.id, get_user(&second).await.id);
 }
@@ -355,7 +369,7 @@ async fn stored_providers_survive_a_restart() {
   let mut app = TestApp::spawn().await;
   let admin = app.sign_up("admin").await;
   app.add_idp_user("alice", &[]);
-  let id = admin
+  let slug = admin
     .manage(create_request(
       "Company SSO",
       ExternalLoginProviderConfig::Oidc(oidc_config(&app)),
@@ -363,14 +377,14 @@ async fn stored_providers_survive_a_restart() {
     .await
     .unwrap()
     .provider
-    .id;
-  let alice = login_with(&app, &id, "alice").await;
+    .slug;
+  let alice = login_with(&app, &slug, "alice").await;
   let alice_id = get_user(&alice).await.id;
 
   app.restart().await;
 
   // Decrypted with the key file generated on the first start.
-  let again = login_with(&app, &id, "alice").await;
+  let again = login_with(&app, &slug, "alice").await;
   assert_eq!(get_user(&again).await.id, alice_id);
   // Tokens signed before the restart are still valid (same jwt secret).
   assert_eq!(get_user(&alice).await.id, alice_id);

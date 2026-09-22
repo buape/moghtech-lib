@@ -594,8 +594,28 @@ pub async fn resolve_external_provider<I: AuthImpl + ?Sized>(
     .status_code(StatusCode::NOT_FOUND)
 }
 
+/// Finds the provider whose urls use the slug (a provider without
+/// one is known by its id, see [ExternalLoginProvider::slug]).
+/// Static providers take precedence. Returns 404 if not found.
+pub async fn resolve_external_provider_by_slug<
+  I: AuthImpl + ?Sized,
+>(
+  auth: &I,
+  slug: &str,
+) -> mogh_error::Result<ResolvedProvider> {
+  validate_provider_id(slug).status_code(StatusCode::NOT_FOUND)?;
+  list_external_providers(auth)
+    .await?
+    .into_iter()
+    .find(|resolved| resolved.provider.slug() == slug)
+    .with_context(|| {
+      format!("No external login provider with slug '{slug}'")
+    })
+    .status_code(StatusCode::NOT_FOUND)
+}
+
 /// Lists all the providers, static ones first.
-/// Providers with invalid or duplicate ids are skipped.
+/// Providers with invalid or duplicate ids or slugs are skipped.
 pub async fn list_external_providers<I: AuthImpl + ?Sized>(
   auth: &I,
 ) -> mogh_error::Result<Vec<ResolvedProvider>> {
@@ -673,6 +693,19 @@ fn merge_providers(
       );
       continue;
     }
+    // The urls would be ambiguous. Slugs are checked when a provider
+    // is stored; this catches static ones and rows edited directly.
+    if providers
+      .iter()
+      .any(|existing| existing.provider.slug() == provider.slug())
+    {
+      warn!(
+        "Skipping external login provider '{}' with duplicate slug '{}'",
+        provider.name,
+        provider.slug()
+      );
+      continue;
+    }
     providers.push(ResolvedProvider {
       provider,
       is_static,
@@ -692,6 +725,7 @@ mod tests {
       id: id.to_string(),
       name: format!("Github {id}"),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(NamedOauthConfig {
         enabled: true,

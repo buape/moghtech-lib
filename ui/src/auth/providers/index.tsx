@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  Anchor,
   Badge,
   Button,
   Group,
@@ -11,12 +12,16 @@ import {
 import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Pencil, Trash, View } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
 import * as MoghAuth from "mogh_auth_client";
 import {
   ConfirmModal,
   CopyText,
   CreateModal,
   DataTable,
+  filterBySplit,
+  ItemLink,
+  SearchInput,
   Section,
   SectionProps,
   useExternalLoginProviders,
@@ -26,6 +31,7 @@ import { LoginProviderIcon, LoginProviderKind } from "../login/providers";
 import { LoginProviderModal } from "./form";
 
 export * from "./form";
+export * from "./page";
 
 type ListItem = MoghAuth.Types.ExternalLoginProviderListItem;
 
@@ -39,28 +45,39 @@ const KINDS: { value: LoginProviderKind; label: string }[] = [
 function newProviderConfig(
   kind: LoginProviderKind,
 ): MoghAuth.Types.ExternalLoginProviderConfig {
-  return { kind, params: { enabled: false } } as
-    MoghAuth.Types.ExternalLoginProviderConfig;
+  return {
+    kind,
+    params: { enabled: false },
+  } as MoghAuth.Types.ExternalLoginProviderConfig;
 }
 
 /**
  * Manage the external login providers (OIDC, Github, Google)
  * users can log in with. For use in app settings pages.
  *
+ * With `link`, the names link to the app's `LoginProviderPage`
+ * route and a new provider opens there; without it the providers
+ * are viewed and edited in a modal.
+ *
  * The API behind it is limited to admin users, see `AuthUserImpl::is_admin`.
  * Providers from the app configuration are listed read only.
  */
-export function LoginProvidersTable(sectionProps: SectionProps) {
+export function LoginProvidersTable({
+  link,
+  ...sectionProps
+}: {
+  /** The route of a provider's page, by its id. */
+  link: (id: string) => string;
+} & SectionProps) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { data: providers, isPending, error } = useExternalLoginProviders();
 
   const [opened, setOpened] = useState<{
     id: string;
     justCreated?: boolean;
   }>();
-  const openedItem = providers?.find(
-    (item) => item.provider.id === opened?.id,
-  );
+  const openedItem = providers?.find((item) => item.provider.id === opened?.id);
 
   // The login page and linked logins show the enabled providers
   const invalidate = () =>
@@ -84,13 +101,19 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
       },
     });
 
+  const [search, setSearch] = useState("");
+  const filtered = filterBySplit(
+    providers,
+    search,
+    (item) => item.provider.name,
+  );
+
   return (
     <Section
       title="Login Providers"
       titleFz="h3"
       icon={<KeyRound size="1.2rem" />}
       description="External providers users can log in with."
-      withBorder
       isPending={isPending}
       error={
         error
@@ -98,10 +121,13 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
             "Failed to load login providers")
           : false
       }
-      actions={
+      {...sectionProps}
+    >
+      <Group>
         <CreateModal
           entityType="Login Provider"
           configureLabel="the kind and a display name"
+          modalSize="xl"
           loading={createPending}
           disabled={!newName.trim().length}
           onOpenChange={(opened) => opened && setNewName("")}
@@ -115,7 +141,13 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
                 await invalidate();
                 // Continue to the full configuration, which
                 // shows the redirect URI of the new provider.
-                setOpened({ id: item.provider.id, justCreated: true });
+                if (link) {
+                  navigate(link(item.provider.id), {
+                    state: { justCreated: true },
+                  });
+                } else {
+                  setOpened({ id: item.provider.id, justCreated: true });
+                }
                 return true;
               })
               .catch(() => false)
@@ -139,26 +171,27 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
             </Stack>
           )}
         />
-      }
-      {...sectionProps}
-    >
+        <SearchInput value={search} onSearch={setSearch} />
+      </Group>
       <DataTable
         noBorder
         tableKey="manage-login-providers-v1"
-        data={providers ?? []}
+        data={filtered}
         noResults={
           <Text c="dimmed">No external login providers configured.</Text>
         }
-        onRowClick={(item) => setOpened({ id: item.provider.id })}
+        onRowClick={(item) => navigate(link(item.provider.id))}
         columns={[
           {
             header: "Name",
             accessorFn: (item: ListItem) => item.provider.name,
             cell: ({ row: { original: item } }) => (
-              <Group gap="xs" wrap="nowrap">
-                <LoginProviderIcon kind={item.provider.config.kind} />
-                <Text fw="bold">{item.provider.name}</Text>
-              </Group>
+              <ItemLink
+                name={item.provider.name}
+                icon={<LoginProviderIcon kind={item.provider.config.kind} />}
+                to={link(item.provider.id)}
+                gap="0.5rem"
+              />
             ),
           },
           {
@@ -223,22 +256,6 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
             header: "Actions",
             cell: ({ row: { original: item } }) => (
               <Group gap="xs" wrap="nowrap">
-                <Button
-                  variant="default"
-                  leftSection={
-                    item.read_only ? (
-                      <View size="1rem" />
-                    ) : (
-                      <Pencil size="1rem" />
-                    )
-                  }
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setOpened({ id: item.provider.id });
-                  }}
-                >
-                  {item.read_only ? "View" : "Edit"}
-                </Button>
                 {!item.read_only && (
                   <ConfirmModal
                     icon={<Trash size="1rem" />}
@@ -252,8 +269,8 @@ export function LoginProvidersTable(sectionProps: SectionProps) {
                       <Text>
                         Users can no longer log in with{" "}
                         <b>{item.provider.name}</b>, and their links to it are
-                        removed. Users without another login method lose
-                        access. To pause it instead, disable the provider.
+                        removed. Users without another login method lose access.
+                        To pause it instead, disable the provider.
                       </Text>
                     }
                   >

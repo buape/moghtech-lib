@@ -127,6 +127,7 @@ async fn assert_all_sensitive_requests_refused(
   assert_reauthentication_required(
     client
       .manage(CreateExternalLoginProvider {
+        slug: String::new(),
         name: "Attacker SSO".into(),
         registration_disabled: false,
         token_exchange: Default::default(),

@@ -30,7 +30,7 @@ use crate::{
   provider::{
     external::{
       BuiltProvider, CompletedExternalLogin, SessionExternalLogin,
-      load_built_provider, resolve_external_provider,
+      load_built_provider, resolve_external_provider_by_slug,
     },
     load_cache::LoadFailedRecently,
   },
@@ -38,34 +38,32 @@ use crate::{
   validations::constant_time_eq,
 };
 
+/// The urls name the provider by its slug (its id for a provider
+/// without one), see `ExternalLoginProvider::slug`.
 #[derive(Deserialize)]
 struct ProviderPath {
-  provider_id: String,
+  slug: String,
 }
 
 pub fn router<I: AuthImpl>() -> Router {
   let mut router = Router::new()
     .route(
-      "/external/{provider_id}/login",
-      get(
-        |Path(ProviderPath { provider_id }), ip, session, query| {
-          external_login::<I>(provider_id, ip, session, query)
-        },
-      ),
-    )
-    .route(
-      "/external/{provider_id}/link",
-      get(|Path(ProviderPath { provider_id }), ip, session| {
-        external_link::<I>(provider_id, ip, session)
+      "/external/{slug}/login",
+      get(|Path(ProviderPath { slug }), ip, session, query| {
+        external_login::<I>(slug, ip, session, query)
       }),
     )
     .route(
-      "/external/{provider_id}/callback",
-      get(
-        |Path(ProviderPath { provider_id }), ip, session, query| {
-          external_callback::<I>(provider_id, ip, session, query)
-        },
-      ),
+      "/external/{slug}/link",
+      get(|Path(ProviderPath { slug }), ip, session| {
+        external_link::<I>(slug, ip, session)
+      }),
+    )
+    .route(
+      "/external/{slug}/callback",
+      get(|Path(ProviderPath { slug }), ip, session, query| {
+        external_callback::<I>(slug, ip, session, query)
+      }),
     );
 
   // Providers using the reserved id of their kind keep the original
@@ -100,13 +98,15 @@ pub fn router<I: AuthImpl>() -> Router {
   router
 }
 
-/// Resolves the provider and its client, ensuring it's enabled.
+/// Resolves the provider of the url's slug and its client,
+/// ensuring it's enabled.
 async fn load_enabled_provider<I: AuthImpl>(
   auth: &I,
-  provider_id: &str,
+  slug: &str,
 ) -> mogh_error::Result<(ExternalLoginProvider, Arc<BuiltProvider>)> {
-  let provider =
-    resolve_external_provider(auth, provider_id).await?.provider;
+  let provider = resolve_external_provider_by_slug(auth, slug)
+    .await?
+    .provider;
 
   if !provider.enabled() {
     return Err(
@@ -160,7 +160,7 @@ pub(crate) async fn load_provider_client<I: AuthImpl + ?Sized>(
 }
 
 pub async fn external_login<I: AuthImpl>(
-  provider_id: String,
+  slug: String,
   RequestIp(ip): RequestIp,
   session: Session,
   Query(RedirectQuery { redirect }): Query<RedirectQuery>,
@@ -168,14 +168,14 @@ pub async fn external_login<I: AuthImpl>(
   let auth = I::new();
   let res = async {
     let (provider, built) =
-      load_enabled_provider(&auth, &provider_id).await?;
+      load_enabled_provider(&auth, &slug).await?;
 
     let begin = built.begin_login();
 
     // Data inserted here will be matched on callback side for csrf protection.
     session
       .insert_external_login(&SessionExternalLogin {
-        provider_id,
+        provider_id: provider.id.clone(),
         link_user_id: None,
         state: begin.state,
         nonce: begin.nonce,
@@ -192,14 +192,14 @@ pub async fn external_login<I: AuthImpl>(
 }
 
 pub async fn external_link<I: AuthImpl>(
-  provider_id: String,
+  slug: String,
   RequestIp(ip): RequestIp,
   session: Session,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
   let res = async {
     let (provider, built) =
-      load_enabled_provider(&auth, &provider_id).await?;
+      load_enabled_provider(&auth, &slug).await?;
 
     let user_id = session.retrieve_external_link_user_id().await?;
 
@@ -211,7 +211,7 @@ pub async fn external_link<I: AuthImpl>(
 
     session
       .insert_external_login(&SessionExternalLogin {
-        provider_id,
+        provider_id: provider.id.clone(),
         link_user_id: Some(user_id),
         state: begin.state,
         nonce: begin.nonce,
@@ -316,10 +316,10 @@ fn auth_redirect(
 #[instrument(
   "ExternalLoginCallback",
   skip_all,
-  fields(ip = ip.to_string(), provider_id)
+  fields(ip = ip.to_string(), slug)
 )]
 pub async fn external_callback<I: AuthImpl>(
-  provider_id: String,
+  slug: String,
   RequestIp(ip): RequestIp,
   session: Session,
   Query(query): Query<StandardCallbackQuery>,
@@ -331,7 +331,7 @@ pub async fn external_callback<I: AuthImpl>(
     let (client_state, code) = query.open()?;
 
     let (provider, built) =
-      load_enabled_provider(&auth, &provider_id).await?;
+      load_enabled_provider(&auth, &slug).await?;
 
     let login = session.retrieve_external_login().await?;
 
@@ -339,7 +339,9 @@ pub async fn external_callback<I: AuthImpl>(
       flow = ExternalFlow::Link;
     }
 
-    validate_callback(&login, &provider_id, &client_state)?;
+    // The provider the url named, by its id: the slug may have
+    // changed while the login was in flight.
+    validate_callback(&login, &provider.id, &client_state)?;
 
     let link_user_id = login.link_user_id.clone();
     let redirect = login.redirect.clone();
@@ -735,6 +737,7 @@ mod tests {
       id: id.to_string(),
       name: "Github".to_string(),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: Default::default(),
       config: ExternalLoginProviderConfig::Github(
         mogh_auth_client::config::NamedOauthConfig {

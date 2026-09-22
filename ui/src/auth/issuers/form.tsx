@@ -31,7 +31,7 @@ type ListItem = MoghAuth.Types.TrustedIssuerListItem;
 type TrustedIssuer = MoghAuth.Types.TrustedIssuer;
 type KeysSource = MoghAuth.Types.TrustedIssuerKeys["source"];
 
-interface RuleFormValues {
+export interface RuleFormValues {
   /** Empty for rules which don't exist yet. */
   id: string;
   name: string;
@@ -42,7 +42,7 @@ interface RuleFormValues {
   token_ttl_secs: number;
 }
 
-interface IssuerFormValues {
+export interface IssuerFormValues {
   name: string;
   enabled: boolean;
   issuer: string;
@@ -55,13 +55,13 @@ interface IssuerFormValues {
   rules: RuleFormValues[];
 }
 
-const KEYS_SOURCES: { value: KeysSource; label: string }[] = [
+export const KEYS_SOURCES: { value: KeysSource; label: string }[] = [
   { value: "Discovery", label: "Discovery" },
   { value: "JwksUri", label: "Keys URL" },
   { value: "Static", label: "Static keys" },
 ];
 
-const newRule = (): RuleFormValues => ({
+export const newRule = (): RuleFormValues => ({
   id: "",
   name: "",
   enabled: true,
@@ -72,7 +72,9 @@ const newRule = (): RuleFormValues => ({
   token_ttl_secs: 900,
 });
 
-function formValues(issuer: TrustedIssuer | undefined): IssuerFormValues {
+export function issuerFormValues(
+  issuer: TrustedIssuer | undefined,
+): IssuerFormValues {
   const keys = issuer?.keys;
   return {
     name: issuer?.name ?? "",
@@ -97,7 +99,10 @@ function formValues(issuer: TrustedIssuer | undefined): IssuerFormValues {
   };
 }
 
-function trustedIssuer(id: string, values: IssuerFormValues): TrustedIssuer {
+export function trustedIssuer(
+  id: string,
+  values: IssuerFormValues,
+): TrustedIssuer {
   const keys: MoghAuth.Types.TrustedIssuerKeys =
     values.keys_source === "JwksUri"
       ? { source: "JwksUri", params: values.keys_url.trim() }
@@ -131,10 +136,60 @@ function validHttpUrl(value: string) {
   }
 }
 
-const wholeSeconds = (value: unknown) =>
+export const wholeSeconds = (value: unknown) =>
   typeof value === "number" && Number.isInteger(value) && value >= 0
     ? null
     : "Must be a whole number of seconds";
+
+/**
+ * What the server would refuse, checked before a save. The modal
+ * form runs the same checks through mantine's validate.
+ */
+export function issuerFormErrors(values: IssuerFormValues): string[] {
+  const errors: string[] = [];
+  if (!values.name.trim().length) errors.push("Name cannot be empty");
+  if (!validHttpUrl(values.issuer.trim())) {
+    errors.push("The issuer must be an http(s) URL");
+  }
+  if (values.keys_source === "JwksUri" && !validHttpUrl(values.keys_url.trim())) {
+    errors.push("The keys URL must be an http(s) URL");
+  }
+  if (values.keys_source === "Static") {
+    try {
+      if (!Array.isArray(JSON.parse(values.keys_static).keys)) {
+        errors.push('The static keys must be a key set: { "keys": [...] }');
+      }
+    } catch {
+      errors.push("The static keys must be valid JSON");
+    }
+  }
+  // What ties a token to this app
+  if (!values.audiences.length) errors.push("At least one audience is required");
+  const age = wholeSeconds(values.max_token_age_secs);
+  if (age) errors.push(`Maximum token age: ${age.toLowerCase()}`);
+  for (const rule of values.rules) {
+    const name = rule.name.trim() || "(unnamed)";
+    if (!rule.name.trim().length) errors.push("A rule has no name");
+    // A rule without claims would accept every token of the issuer
+    if (!rule.claims.length) {
+      errors.push(`Rule '${name}' needs at least one claim to match`);
+    }
+    for (const { claim, pattern } of rule.claims) {
+      if (!claim.trim().length) errors.push(`Rule '${name}': a claim has no name`);
+      // The server refuses patterns which match anything
+      if (!pattern.length) {
+        errors.push(`Rule '${name}': claim '${claim}' has no value`);
+      } else if (/^\*+$/.test(pattern)) {
+        errors.push(
+          `Rule '${name}': claim '${claim}' matches any value, which restricts nothing`,
+        );
+      }
+    }
+    const ttl = wholeSeconds(rule.token_ttl_secs);
+    if (ttl) errors.push(`Rule '${name}': token lifetime ${ttl.toLowerCase()}`);
+  }
+  return errors;
+}
 
 export function TrustedIssuerModal({
   opened,
@@ -188,7 +243,7 @@ export function TrustedIssuerForm({
 
   const form = useForm<IssuerFormValues>({
     mode: "controlled",
-    initialValues: formValues(item?.issuer),
+    initialValues: issuerFormValues(item?.issuer),
     validate: {
       name: (name) => (name.trim().length ? null : "Name cannot be empty"),
       issuer: (issuer) =>

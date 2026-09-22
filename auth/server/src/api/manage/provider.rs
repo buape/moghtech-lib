@@ -12,7 +12,7 @@ use mogh_auth_client::{
   },
   config::{
     ExternalLoginProvider, ExternalLoginProviderConfig, REDACTED,
-    TokenExchangeConfig,
+    TokenExchangeConfig, slugify, validate_slug,
   },
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
@@ -77,6 +77,56 @@ fn validate_name(name: &str) -> mogh_error::Result<String> {
     );
   }
   Ok(name.to_string())
+}
+
+/// The slug a request gives, or the one made from the name. A slug
+/// another provider already uses (a static one counts: its slug is
+/// its id) would make the urls ambiguous.
+async fn validate_provider_slug<I: AuthImpl + ?Sized>(
+  auth: &I,
+  slug: &str,
+  name: &str,
+  except_id: Option<&str>,
+) -> mogh_error::Result<String> {
+  let from_name = slug.trim().is_empty();
+  let slug = if from_name {
+    let slug = slugify(name);
+    if slug.is_empty() {
+      return Err(
+        anyhow!(
+          "The name '{name}' makes no slug (it needs letters or digits), give the provider one"
+        )
+        .status_code(StatusCode::BAD_REQUEST),
+      );
+    }
+    slug
+  } else {
+    let slug = slug.trim().to_string();
+    validate_slug(&slug).map_err(|e| {
+      anyhow!("{e}").status_code(StatusCode::BAD_REQUEST)
+    })?;
+    slug
+  };
+  let taken = list_external_providers(auth).await?.into_iter().any(
+    |resolved| {
+      except_id != Some(resolved.provider.id.as_str())
+        && resolved.provider.slug() == slug
+    },
+  );
+  if taken {
+    let hint = if from_name {
+      " (made from the name), give the provider a different one"
+    } else {
+      ""
+    };
+    return Err(
+      anyhow!(
+        "Another login provider already uses the slug '{slug}'{hint}"
+      )
+      .status_code(StatusCode::CONFLICT),
+    );
+  }
+  Ok(slug)
 }
 
 fn validate_http_url(field: &str, url: &str) -> anyhow::Result<()> {
@@ -258,16 +308,20 @@ pub async fn create_provider<I: AuthImpl + ?Sized>(
   check_admin(user)?;
   validate_config(&request.config)?;
 
+  let name = validate_name(&request.name)?;
+  let token_exchange =
+    validate_token_exchange(request.token_exchange, &request.config)?;
+  // Last: the only check which looks at the other providers.
+  let slug =
+    validate_provider_slug(auth, &request.slug, &name, None).await?;
   let provider = ExternalLoginProvider {
     // Random ids are never reused, so a new provider
     // can't inherit the linked users of a deleted one.
     id: random_string(PROVIDER_ID_LENGTH),
-    name: validate_name(&request.name)?,
+    name,
+    slug,
     registration_disabled: request.registration_disabled,
-    token_exchange: validate_token_exchange(
-      request.token_exchange,
-      &request.config,
-    )?,
+    token_exchange,
     config: request.config,
   };
 
@@ -370,9 +424,31 @@ pub async fn update_provider<I: AuthImpl + ?Sized>(
     return Err(e);
   }
 
+  // An empty slug keeps the existing one (as it is: a provider from
+  // before slugs keeps using its id until it is given one).
+  let slug = if request.slug.trim().is_empty() {
+    existing.slug.clone()
+  } else {
+    let slug = validate_provider_slug(
+      auth,
+      &request.slug,
+      &name,
+      Some(&existing.id),
+    )
+    .await;
+    match slug {
+      Ok(slug) => slug,
+      Err(e) => {
+        request.config.zeroize();
+        return Err(e);
+      }
+    }
+  };
+
   let provider = ExternalLoginProvider {
     id: existing.id,
     name,
+    slug,
     registration_disabled: request.registration_disabled,
     token_exchange,
     config: request.config,
@@ -466,7 +542,9 @@ impl Resolve<ManageArgs> for DeleteExternalLoginProvider {
 mod tests {
   use std::sync::{Arc, Mutex};
 
-  use mogh_auth_client::config::{NamedOauthConfig, OidcConfig};
+  use mogh_auth_client::config::{
+    MAX_SLUG_LENGTH, NamedOauthConfig, OidcConfig,
+  };
 
   use super::*;
 
@@ -592,6 +670,7 @@ mod tests {
     CreateExternalLoginProvider {
       name: "  Github  ".into(),
       registration_disabled: false,
+      slug: String::new(),
       token_exchange: Default::default(),
       config: github_config(secret),
     }
@@ -605,6 +684,7 @@ mod tests {
       id: id.into(),
       name: "Renamed".into(),
       registration_disabled: true,
+      slug: String::new(),
       token_exchange: Default::default(),
       config,
       clear_client_secret: false,
@@ -669,23 +749,167 @@ mod tests {
     assert_eq!(item.provider.id.len(), PROVIDER_ID_LENGTH);
     assert_eq!(item.provider.name, "Github");
     assert!(!item.read_only);
+    // The urls use the slug, made from the name
+    assert_eq!(item.provider.slug, "github");
     assert_eq!(
       item.redirect_uri,
-      format!(
-        "https://example.com/auth/external/{}/callback",
-        item.provider.id
-      )
+      "https://example.com/auth/external/github/callback"
     );
     // The response is redacted, the stored provider is not
     assert_eq!(item.provider.config.client_secret(), REDACTED);
     assert_eq!(stored_secret(&auth, &item.provider.id), "secret");
 
     // Ids are unique
+    let mut request = create_request("secret");
+    request.name = "Other".into();
     let other =
+      create_provider(&auth, &ADMIN, request).await.unwrap();
+    assert_ne!(item.provider.id, other.provider.id);
+  }
+
+  #[tokio::test]
+  async fn test_slug_is_made_from_the_name_or_given() {
+    let auth = TestAuth::default();
+    create_provider(&auth, &ADMIN, create_request("secret"))
+      .await
+      .unwrap();
+    // The same name makes the same slug, which is taken now
+    let err =
+      create_provider(&auth, &ADMIN, create_request("secret"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(err.error.to_string().contains("made from the name"));
+
+    // Given explicitly, and trimmed
+    let mut request = create_request("secret");
+    request.slug = " company-github ".into();
+    let item = create_provider(&auth, &ADMIN, request).await.unwrap();
+    assert_eq!(item.provider.slug, "company-github");
+    assert_eq!(
+      item.redirect_uri,
+      "https://example.com/auth/external/company-github/callback"
+    );
+
+    // Given and taken
+    let mut request = create_request("secret");
+    request.slug = "company-github".into();
+    let err =
+      create_provider(&auth, &ADMIN, request).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+
+    // Malformed slugs, and a name which makes none
+    let long = "a".repeat(MAX_SLUG_LENGTH + 1);
+    for (name, slug) in [
+      ("Github", "Company Github"),
+      ("Github", "-github"),
+      ("Github", "github--2"),
+      ("Github", "UPPER"),
+      ("Github", long.as_str()),
+      ("!!!", ""),
+    ] {
+      let mut request = create_request("secret");
+      request.name = name.into();
+      request.slug = slug.into();
+      let err =
+        create_provider(&auth, &ADMIN, request).await.unwrap_err();
+      assert_eq!(
+        err.status,
+        StatusCode::BAD_REQUEST,
+        "{name} / {slug}"
+      );
+    }
+    assert_eq!(auth.stored.lock().unwrap().len(), 2);
+  }
+
+  #[tokio::test]
+  async fn test_update_slug() {
+    let auth = TestAuth::default();
+    let id = create_provider(&auth, &ADMIN, create_request("secret"))
+      .await
+      .unwrap()
+      .provider
+      .id;
+    let mut request = create_request("secret");
+    request.name = "Other".into();
+    create_provider(&auth, &ADMIN, request).await.unwrap();
+
+    // Empty keeps the slug, even when the name changes
+    let item = update_provider(
+      &auth,
+      &ADMIN,
+      update_request(&id, github_config("secret")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(item.provider.name, "Renamed");
+    assert_eq!(item.provider.slug, "github");
+
+    // Changing it changes the redirect uri
+    let mut request = update_request(&id, github_config("secret"));
+    request.slug = "gh".into();
+    let item = update_provider(&auth, &ADMIN, request).await.unwrap();
+    assert_eq!(item.provider.slug, "gh");
+    assert_eq!(
+      item.redirect_uri,
+      "https://example.com/auth/external/gh/callback"
+    );
+
+    // Its own slug is no conflict, another provider's is
+    let mut request = update_request(&id, github_config("secret"));
+    request.slug = "gh".into();
+    update_provider(&auth, &ADMIN, request).await.unwrap();
+    let mut request = update_request(&id, github_config("secret"));
+    request.slug = "other".into();
+    let err =
+      update_provider(&auth, &ADMIN, request).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    let mut request = update_request(&id, github_config("secret"));
+    request.slug = "Not A Slug".into();
+    let err =
+      update_provider(&auth, &ADMIN, request).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      auth.stored.lock().unwrap()[0].slug,
+      "gh",
+      "refused updates change nothing"
+    );
+  }
+
+  /// The provider of a kind from the app configuration is addressed
+  /// by its reserved id, which is its slug: no stored provider can
+  /// take it while it exists. Without it, the slug is free like any
+  /// other, and stays under `/external/`.
+  #[tokio::test]
+  async fn test_static_provider_holds_the_slug_of_its_id() {
+    let auth = TestAuth {
+      static_providers: vec![ExternalLoginProvider {
+        id: "github".into(),
+        name: "Github".into(),
+        registration_disabled: false,
+        slug: String::new(),
+        token_exchange: Default::default(),
+        config: github_config("static-secret"),
+      }],
+      ..Default::default()
+    };
+    let err =
+      create_provider(&auth, &ADMIN, create_request("secret"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(auth.stored.lock().unwrap().is_empty());
+
+    let auth = TestAuth::default();
+    let item =
       create_provider(&auth, &ADMIN, create_request("secret"))
         .await
         .unwrap();
-    assert_ne!(item.provider.id, other.provider.id);
+    assert_eq!(item.provider.slug, "github");
+    assert_eq!(
+      item.redirect_uri,
+      "https://example.com/auth/external/github/callback"
+    );
   }
 
   #[tokio::test]
@@ -761,6 +985,7 @@ mod tests {
       CreateExternalLoginProvider {
         name: "OIDC".into(),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: Default::default(),
         config: oidc_config("https://idp.example.com", "secret"),
       },
@@ -823,6 +1048,7 @@ mod tests {
       &auth,
       &ADMIN,
       CreateExternalLoginProvider {
+        slug: String::new(),
         token_exchange: exchange(&[]),
         ..create_request("secret")
       },
@@ -837,6 +1063,7 @@ mod tests {
       CreateExternalLoginProvider {
         name: "OIDC".into(),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: exchange(&[" cli ", "", "other", "cli"]),
         config: oidc_config("https://idp.example.com", "secret"),
       },
@@ -865,6 +1092,7 @@ mod tests {
         CreateExternalLoginProvider {
           name: "OIDC".into(),
           registration_disabled: false,
+          slug: String::new(),
           token_exchange: exchange(&audiences),
           config: oidc_config("https://idp.example.com", "secret"),
         },
@@ -897,6 +1125,7 @@ mod tests {
       CreateExternalLoginProvider {
         name: "OIDC".into(),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: Default::default(),
         config: oidc_config("https://idp.example.com", "secret"),
       },
@@ -911,6 +1140,7 @@ mod tests {
       &auth,
       &ADMIN,
       UpdateExternalLoginProvider {
+        slug: String::new(),
         clear_client_secret: true,
         ..update_request(
           &id,
@@ -929,6 +1159,7 @@ mod tests {
       &auth,
       &ADMIN,
       UpdateExternalLoginProvider {
+        slug: String::new(),
         clear_client_secret: true,
         ..update_request(
           &id,
@@ -961,6 +1192,7 @@ mod tests {
       &auth,
       &ADMIN,
       UpdateExternalLoginProvider {
+        slug: String::new(),
         clear_client_secret: true,
         ..update_request(&id, github_config(""))
       },
@@ -981,6 +1213,7 @@ mod tests {
       &auth,
       &ADMIN,
       UpdateExternalLoginProvider {
+        slug: String::new(),
         clear_client_secret: true,
         ..update_request(&id, disabled)
       },
@@ -1028,6 +1261,7 @@ mod tests {
         id: "github".into(),
         name: "Github".into(),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: Default::default(),
         config: github_config("static-secret"),
       }],

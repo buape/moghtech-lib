@@ -245,6 +245,7 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
         id: ExternalLoginKind::Oidc.reserved_id().to_string(),
         name: String::from("OIDC"),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: Default::default(),
         config: ExternalLoginProviderConfig::Oidc(config.oidc.clone()),
       },
@@ -252,6 +253,7 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
         id: ExternalLoginKind::Github.reserved_id().to_string(),
         name: String::from("Github"),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: Default::default(),
         config: ExternalLoginProviderConfig::Github(
           config.github_oauth.clone(),
@@ -602,6 +604,7 @@ ExternalLoginProvider {
   id: String::from("oidc"),
   name: String::from("OIDC"),
   registration_disabled: false,
+  slug: String::new(),
   token_exchange: TokenExchangeConfig {
     enabled: true,
     // Accept tokens the provider issued to these apps,
@@ -625,6 +628,17 @@ curl https://app.example.com/api/... -H "Authorization: Bearer <app jwt>"
 ```
 
 Or with the rust client: `mogh_auth_client::request::token_exchange`.
+
+A provider's login and callback urls name it by its **slug**
+(`/external/{slug}/login`, `/external/{slug}/callback`): lowercase letters,
+digits and single hyphens, unique among all providers, made from the name
+unless the create request gives one. Users' links to the provider carry its
+id, never the slug, so changing the slug only changes the redirect URI to
+register at the provider. Providers stored before slugs existed have an empty
+`slug` and keep their id in the urls (`ExternalLoginProvider::slug()`). So do
+providers from the app configuration, which under the reserved id of their kind
+also keep the original paths (`/oidc/callback`); while such a provider exists,
+its id is a slug no stored provider can take.
 
 The same exchange is part of the login api as `ExchangeExternalForJwt { token }`,
 for clients already using it (`authClient().login("ExchangeExternalForJwt", { token })`).

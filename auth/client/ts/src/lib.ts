@@ -114,35 +114,35 @@ export function MoghAuthClient(url: string, jwt?: string) {
 
   /**
    * Redirect to log in with an external login provider.
-   * @param providerId The provider `id` from `GetLoginOptions`.
+   * @param providerSlug The provider `slug` from `GetLoginOptions`.
    */
-  const externalLogin = (providerId: string) => {
+  const externalLogin = (providerSlug: string) => {
     const _redirect = location.pathname.startsWith("/login")
       ? location.origin +
         (new URLSearchParams(location.search).get("backto") ?? "")
       : location.href;
     const redirect = encodeURIComponent(_redirect);
     location.replace(
-      `${url}/external/${encodeURIComponent(providerId)}/login?redirect=${redirect}`
+      `${url}/external/${encodeURIComponent(providerSlug)}/login?redirect=${redirect}`
     );
   };
 
   /**
    * The url to redirect to in order to link the signed in user to an
    * external login provider. `BeginExternalLoginLink` must be called first.
-   * @param providerId The provider `id` from `GetLoginOptions`.
+   * @param providerSlug The provider `slug` from `GetLoginOptions`.
    */
-  const externalLinkUrl = (providerId: string) =>
-    `${url}/external/${encodeURIComponent(providerId)}/link`;
+  const externalLinkUrl = (providerSlug: string) =>
+    `${url}/external/${encodeURIComponent(providerSlug)}/link`;
 
   /**
    * Link the signed in user to an external login provider.
    * Begins the link on the session, then redirects to the provider.
-   * @param providerId The provider `id` from `GetLoginOptions`.
+   * @param providerSlug The provider `slug` from `GetLoginOptions`.
    */
-  const externalLink = async (providerId: string) => {
+  const externalLink = async (providerSlug: string) => {
     await manage("BeginExternalLoginLink", {});
-    location.replace(externalLinkUrl(providerId));
+    location.replace(externalLinkUrl(providerSlug));
   };
 
   /**

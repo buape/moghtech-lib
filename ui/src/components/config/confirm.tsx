@@ -20,6 +20,8 @@ export interface ConfirmUpdateProps<T> {
   openKeyListener?: boolean;
   confirmKeyListener?: boolean;
   enableFancyToml?: boolean;
+  /** Fields whose values are never shown, see `ConfigProps.secretKeys`. */
+  secretKeys?: (keyof T)[];
 }
 
 export function ConfirmUpdate<T>({
@@ -34,6 +36,7 @@ export function ConfirmUpdate<T>({
   openKeyListener = true,
   confirmKeyListener = true,
   enableFancyToml,
+  secretKeys,
 }: ConfirmUpdateProps<T>) {
   const [opened, { open, close }] = useDisclosure();
 
@@ -92,6 +95,7 @@ export function ConfirmUpdate<T>({
                   language={language}
                   fileContentsLanguage={fileContentsLanguage}
                   enableFancyToml={enableFancyToml}
+                  secret={secretKeys?.includes(key as keyof T)}
                 />
               ))}
           </Stack>
@@ -136,6 +140,7 @@ function ConfirmUpdateItem<T>({
   fileContentsKeys = ["file_contents"],
   keyValueFields,
   enableFancyToml,
+  secret,
 }: {
   _key: keyof T;
   val: T[keyof T];
@@ -145,8 +150,27 @@ function ConfirmUpdateItem<T>({
   fileContentsKeys?: string[];
   keyValueFields?: string[];
   enableFancyToml?: boolean;
+  secret?: boolean;
 }) {
   const [show, setShow] = useState(true);
+  if (secret) {
+    return (
+      <Stack gap="xs" p="xl" className="bordered-light" bdrs="md">
+        <Text c="Neutral">{fmtSnakeCaseToUpperSpaceCase(_key as string)}</Text>
+        <Box component="pre" mih={0}>
+          <Text component="span" c="Critical">
+            {previous[_key] ? "••••••••" : "None"}
+          </Text>{" "}
+          <Text component="span" c="dimmed">
+            {"->"}
+          </Text>{" "}
+          <Text component="span" c="Good">
+            {_val ? "••••••••" : "None"}
+          </Text>
+        </Box>
+      </Stack>
+    );
+  }
   const val =
     typeof _val === "string"
       ? _val

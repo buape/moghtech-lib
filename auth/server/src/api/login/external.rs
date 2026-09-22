@@ -189,6 +189,7 @@ mod tests {
         id: "oidc".to_string(),
         name: "OIDC".to_string(),
         registration_disabled: false,
+        slug: String::new(),
         token_exchange: TokenExchangeConfig {
           enabled: true,
           ..Default::default()

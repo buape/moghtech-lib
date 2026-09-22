@@ -311,6 +311,7 @@ mod tests {
         CreateExternalLoginProvider {
           name: "Github".into(),
           registration_disabled: false,
+          slug: String::new(),
           token_exchange: Default::default(),
           config: ExternalLoginProviderConfig::Github(
             NamedOauthConfig::default(),

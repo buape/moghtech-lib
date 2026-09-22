@@ -1,7 +1,7 @@
 import { Button, ButtonProps, useComputedColorScheme } from "@mantine/core";
 import { KeyRound } from "lucide-react";
 import * as MoghAuth from "mogh_auth_client";
-import { authClient } from "../..";
+import { authClient, hexColorByIntention } from "../..";
 
 /**
  * The login header has room for this many provider buttons.
@@ -52,7 +52,7 @@ export function LoginProviderButton({
 } & ButtonProps) {
   return (
     <Button
-      onClick={() => authClient().externalLogin(provider.id)}
+      onClick={() => authClient().externalLogin(provider.slug)}
       leftSection={<LoginProviderIcon kind={provider.kind} />}
       title={provider.name}
       {...props}

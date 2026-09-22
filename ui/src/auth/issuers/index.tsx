@@ -1,12 +1,34 @@
 import { useState } from "react";
-import { Badge, Button, Group, Text } from "@mantine/core";
+import {
+  Anchor,
+  Badge,
+  Button,
+  Group,
+  Stack,
+  TagsInput,
+  Text,
+  TextInput,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, ServerCog, Trash, View } from "lucide-react";
+import {
+  Fingerprint,
+  Pencil,
+  Plus,
+  ServerCog,
+  Trash,
+  View,
+} from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
 import * as MoghAuth from "mogh_auth_client";
 import {
   ConfirmModal,
+  CreateModal,
   DataTable,
+  filterBySplit,
+  hexColorByIntention,
+  ItemLink,
+  SearchInput,
   Section,
   SectionProps,
   useManageAuth,
@@ -15,6 +37,7 @@ import {
 import { TrustedIssuerModal } from "./form";
 
 export * from "./form";
+export * from "./page";
 
 type ListItem = MoghAuth.Types.TrustedIssuerListItem;
 
@@ -24,17 +47,26 @@ type ListItem = MoghAuth.Types.TrustedIssuerListItem;
  * their platform issues them for an app token, without an api key.
  * For use in app settings pages.
  *
+ * With `link`, the names link to the app's `TrustedIssuerPage`
+ * route, and a new issuer (name, issuer url and audience, created
+ * disabled) continues there for its rules; without it the issuers
+ * are viewed and edited in a modal.
+ *
  * The API behind it is limited to admin users, see `AuthUserImpl::is_admin`.
  * Issuers from the app configuration are listed read only.
  */
 export function TrustedIssuersTable({
   groupOptions,
+  link,
   ...sectionProps
 }: {
   /** The groups of the app, suggested for the groups of a rule. */
   groupOptions?: string[];
+  /** The route of an issuer's page, by its id. */
+  link: (id: string) => string;
 } & SectionProps) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { data: issuers, isPending, error } = useTrustedIssuers();
 
   const [opened, setOpened] = useState<{ id: string | undefined }>();
@@ -43,21 +75,36 @@ export function TrustedIssuersTable({
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: ["ListTrustedIssuers"] });
 
-  const { mutateAsync: deleteIssuer, isPending: deletePending } =
-    useManageAuth("DeleteTrustedIssuer", {
+  // The page flow creates the issuer with the minimum, and
+  // continues with its rules there.
+  const [newIssuer, setNewIssuer] = useState({
+    name: "",
+    issuer: "",
+    audience: location.origin,
+  });
+  const { mutateAsync: create, isPending: createPending } = useManageAuth(
+    "CreateTrustedIssuer",
+  );
+
+  const { mutateAsync: deleteIssuer, isPending: deletePending } = useManageAuth(
+    "DeleteTrustedIssuer",
+    {
       onSuccess: () => {
         notifications.show({ message: "Deleted trusted issuer." });
         invalidate();
       },
-    });
+    },
+  );
+
+  const [search, setSearch] = useState("");
+  const filtered = filterBySplit(issuers, search, (item) => item.issuer.name);
 
   return (
     <Section
-      title="Workload Identity"
+      title="Trusted Issuers"
       titleFz="h3"
       icon={<ServerCog size="1.2rem" />}
-      description="Token issuers (CI platforms, Kubernetes clusters) whose workloads can get an app token without an api key."
-      withBorder
+      description="Trusted issuers allow CI workloads to acquire short lived auth tokens on demand."
       isPending={isPending}
       error={
         error
@@ -65,29 +112,109 @@ export function TrustedIssuersTable({
             "Failed to load trusted issuers")
           : false
       }
-      actions={
-        <Button
-          leftSection={<Plus size="1rem" />}
-          onClick={() => setOpened({ id: undefined })}
-          w={{ base: "100%", xs: "fit-content" }}
-        >
-          New Trusted Issuer
-        </Button>
-      }
       {...sectionProps}
     >
+      <Group>
+        <CreateModal
+          entityType="Trusted Issuer"
+          configureLabel="the name, issuer and audience"
+          modalSize="xl"
+          loading={createPending}
+          disabled={!newIssuer.name.trim() || !newIssuer.issuer.trim()}
+          onOpenChange={(opened) => {
+            if (opened) {
+              setNewIssuer({
+                name: "",
+                issuer: "",
+                audience: location.origin,
+              });
+            }
+          }}
+          onConfirm={() =>
+            create({
+              issuer: {
+                id: "",
+                name: newIssuer.name.trim(),
+                // Disabled until it has rules
+                enabled: false,
+                issuer: newIssuer.issuer.trim(),
+                keys: { source: "Discovery", params: {} },
+                audiences: newIssuer.audience.trim()
+                  ? [newIssuer.audience.trim()]
+                  : [],
+                max_token_age_secs: 300,
+                rules: [],
+              },
+            })
+              .then(async (item) => {
+                await invalidate();
+                navigate(link(item.issuer.id));
+                return true;
+              })
+              .catch(() => false)
+          }
+          configSection={() => (
+            <Stack>
+              <TextInput
+                value={newIssuer.name}
+                onChange={(e) =>
+                  setNewIssuer({ ...newIssuer, name: e.target.value })
+                }
+                label="Name"
+                placeholder="eg. Github Actions"
+                data-autofocus
+              />
+              <TextInput
+                value={newIssuer.issuer}
+                onChange={(e) =>
+                  setNewIssuer({ ...newIssuer, issuer: e.target.value })
+                }
+                label="Issuer"
+                description="The issuer (iss) of the tokens"
+                placeholder="https://token.actions.githubusercontent.com"
+              />
+              <TagsInput
+                value={newIssuer.audience ? [newIssuer.audience] : []}
+                onChange={(audiences) =>
+                  setNewIssuer({
+                    ...newIssuer,
+                    audience: audiences[audiences.length - 1] ?? "",
+                  })
+                }
+                label="Audience"
+                description="The audience (aud) the workload requests its token for. Use one specific to this app."
+                placeholder="Add audience"
+                maxTags={1}
+              />
+            </Stack>
+          )}
+        />
+        <SearchInput value={search} onSearch={setSearch} />
+      </Group>
       <DataTable
         noBorder
         tableKey="manage-trusted-issuers-v1"
-        data={issuers ?? []}
+        data={filtered}
         noResults={<Text c="dimmed">No trusted issuers configured.</Text>}
-        onRowClick={(item) => setOpened({ id: item.issuer.id })}
+        onRowClick={(item) => navigate(link(item.issuer.id))}
         columns={[
           {
             header: "Name",
             accessorFn: (item: ListItem) => item.issuer.name,
             cell: ({ row: { original: item } }) => (
-              <Text fw="bold">{item.issuer.name}</Text>
+              <ItemLink
+                name={item.issuer.name}
+                icon={
+                  <Fingerprint
+                    size="1rem"
+                    color={hexColorByIntention(
+                      item.issuer.enabled ? "Good" : "Critical",
+                    )}
+                  />
+                }
+                to={link(item.issuer.id)}
+                gap="0.5rem"
+              />
             ),
           },
           {
@@ -161,22 +288,6 @@ export function TrustedIssuersTable({
             header: "Actions",
             cell: ({ row: { original: item } }) => (
               <Group gap="xs" wrap="nowrap">
-                <Button
-                  variant="default"
-                  leftSection={
-                    item.read_only ? (
-                      <View size="1rem" />
-                    ) : (
-                      <Pencil size="1rem" />
-                    )
-                  }
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setOpened({ id: item.issuer.id });
-                  }}
-                >
-                  {item.read_only ? "View" : "Edit"}
-                </Button>
                 {!item.read_only && (
                   <ConfirmModal
                     icon={<Trash size="1rem" />}
@@ -188,9 +299,9 @@ export function TrustedIssuersTable({
                     confirmProps={{ variant: "filled", color: "red" }}
                     topAdditonal={
                       <Text>
-                        Workloads of <b>{item.issuer.name}</b> can no longer
-                        get app tokens, and the users of its rules are removed.
-                        To pause it instead, disable the issuer.
+                        Workloads of <b>{item.issuer.name}</b> can no longer get
+                        app tokens, and the users of its rules are removed. To
+                        pause it instead, disable the issuer.
                       </Text>
                     }
                   >
