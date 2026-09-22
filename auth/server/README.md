@@ -758,6 +758,49 @@ If workloads come from shared ips, keep the failure limit generous, make jobs
 retry an exchange with a delay rather than in a tight loop, or use self hosted
 runners with their own ips. Successful exchanges are never rate limited.
 
+### The exchange on another surface
+
+Apps serving the exchange elsewhere, eg. a Vault compatible `auth/jwt/login`
+whose `client_token` is the app token, call what the endpoint calls:
+
+```rust
+use mogh_auth_server::api::token::{
+  ExchangedLogin, RoleNotFound, TokenExchangeOptions, exchange_token,
+  token_exchange_error,
+};
+
+let exchanged = exchange_token(
+  &auth,
+  ip,
+  TokenExchangeRequest::id_token(jwt),
+  TokenExchangeOptions {
+    // Vault's `role`: only log in through the login provider or workload
+    // rule with this id or name. A workload token is then matched against
+    // that rule alone (not the first matching rule of its issuer), and a
+    // role nothing of that name accepts is refused before the exchange
+    // has any effect, as `RoleNotFound` (an `invalid_grant`).
+    role: Some(String::from("deploy")),
+  },
+)
+.await;
+
+match exchanged {
+  Ok(exchanged) => {
+    // exchanged.response is what `/token` answers; exchanged.user_id and
+    // exchanged.login (the provider, or the issuer + rule) say who it is.
+    if let ExchangedLogin::Workload { rule_name, .. } = &exchanged.login {}
+  }
+  Err(e) => {
+    if e.error.downcast_ref::<RoleNotFound>().is_some() {}
+    // The OAuth error and status the endpoint would answer with
+    let (status, error) = token_exchange_error(&e);
+  }
+}
+```
+
+It is exactly the endpoint's exchange: the failure rate limit by ip included,
+the app told about the login through the same hooks.
+
 Github Actions:
 
 ```yaml

@@ -9,6 +9,9 @@
 //! - The user must already exist, the endpoint never signs anyone up.
 //! - Users who need a second factor for external logins are rejected,
 //!   there is nobody to ask for it.
+//!
+//! Apps serving the exchange on another surface (a Vault compatible
+//! `auth/jwt/login`) use [exchange_token] and [token_exchange_error].
 
 use std::{net::IpAddr, sync::Arc};
 
@@ -67,6 +70,69 @@ pub fn router<I: AuthImpl>() -> Router {
   Router::new().route("/token", post(token::<I>))
 }
 
+/// What the exchange should accept, beyond a valid token.
+#[derive(Debug, Clone, Default)]
+pub struct TokenExchangeOptions {
+  /// Only log in through the login provider or workload rule with
+  /// this id or name (Vault's `role`): a workload token is matched
+  /// against that rule alone, rather than the first matching rule
+  /// of its issuer, and a user token only by that provider. A role
+  /// nothing accepting the token's issuer has is refused up front
+  /// ([RoleNotFound]), before the exchange has any effect.
+  pub role: Option<String>,
+}
+
+/// What [exchange_token] logged a token in as.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExchangedToken {
+  /// The issued app token, as the endpoint answers.
+  pub response: TokenExchangeResponse,
+  /// The id of the user the token belongs to.
+  pub user_id: String,
+  /// What the token logged in through.
+  pub login: ExchangedLogin,
+}
+
+/// What a token was exchanged through.
+#[derive(Debug, Clone)]
+pub enum ExchangedLogin {
+  /// A user's token, verified by a login provider.
+  Provider {
+    provider_id: String,
+    provider_name: String,
+  },
+  /// A workload's token, verified by a trusted issuer and matched
+  /// to one of its rules.
+  Workload {
+    issuer_id: String,
+    issuer_name: String,
+    rule_id: String,
+    rule_name: String,
+  },
+}
+
+/// The `role` of [TokenExchangeOptions] names no login provider
+/// and no workload rule accepting tokens of the token's issuer.
+/// Reported as `invalid_grant`; apps can tell it apart with
+/// `error.downcast_ref::<RoleNotFound>()`.
+#[derive(Debug)]
+pub struct RoleNotFound {
+  pub role: String,
+}
+
+impl std::fmt::Display for RoleNotFound {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "No login provider or workload rule '{}' accepts tokens of this issuer",
+      self.role
+    )
+  }
+}
+
+impl std::error::Error for RoleNotFound {}
+
 /// An error with the OAuth error code to report it as (RFC 6749 section 5.2).
 #[derive(Debug)]
 struct OauthError {
@@ -107,6 +173,18 @@ fn invalid_grant(
 
 /// Converts any error into the OAuth error format.
 fn error_response(e: mogh_error::Error) -> Response {
+  let (status, error) = token_exchange_error(&e);
+  no_store((status, Json(error)).into_response())
+}
+
+/// The status and OAuth error (RFC 6749 section 5.2) a failed
+/// [exchange_token] is answered with, as the endpoint answers it.
+/// Everything but the token's own rejection (`invalid_*`, the rate
+/// limit, an unavailable provider) is logged here and reported as
+/// a bare `server_error`: the reasons may include internal details.
+pub fn token_exchange_error(
+  e: &mogh_error::Error,
+) -> (StatusCode, TokenExchangeError) {
   let (status, error) =
     if let Some(oauth) = e.error.downcast_ref::<OauthError>() {
       (
@@ -152,7 +230,7 @@ fn error_response(e: mogh_error::Error) -> Response {
         },
       )
     };
-  no_store((status, Json(error)).into_response())
+  (status, error)
 }
 
 /// Token responses must not be cached (RFC 6749 section 5.1).
@@ -176,24 +254,41 @@ async fn token<I: AuthImpl>(
     let Form(request) = form.map_err(|e| {
       invalid_request(format!("Invalid token request | {e}"))
     })?;
-    let auth = &auth;
-    exchange(
-      auth,
-      ip,
-      request,
-      |provider| async move {
-        load_provider_client(auth, &provider).await
-      },
-      load_issuer_keys,
-    )
-    .await
+    exchange_token(&auth, ip, request, Default::default()).await
   }
-  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
   .await;
   match res {
-    Ok(response) => no_store(Json(response).into_response()),
+    Ok(exchanged) => {
+      no_store(Json(exchanged.response).into_response())
+    }
     Err(e) => error_response(e),
   }
+}
+
+/// The RFC 8693 exchange of the `/token` endpoint as a function,
+/// for apps serving it on another surface, eg. a Vault compatible
+/// `auth/jwt/login`. Exactly what the endpoint does, the failure
+/// rate limit by client `ip` included (the surface is
+/// unauthenticated wherever it is served): the token is verified
+/// by the login providers and trusted issuers, the user's login
+/// rules apply, and the app is told about the login through its
+/// hooks. Errors map with [token_exchange_error].
+pub async fn exchange_token<I: AuthImpl>(
+  auth: &I,
+  ip: IpAddr,
+  request: TokenExchangeRequest,
+  options: TokenExchangeOptions,
+) -> mogh_error::Result<ExchangedToken> {
+  exchange(
+    auth,
+    ip,
+    request,
+    |provider| async move { load_provider_client(auth, &provider).await },
+    load_issuer_keys,
+    options.role.as_deref(),
+  )
+  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
+  .await
 }
 
 /// Checks the request parameters, returning the token type to issue.
@@ -237,8 +332,14 @@ fn validate_request(
   }
 }
 
+/// Whether `role` names the provider / rule: by id or by name.
+fn is_role(role: Option<&str>, id: &str, name: &str) -> bool {
+  role.is_none_or(|role| role == id || role == name)
+}
+
 /// The providers which may verify a token claiming to be from `issuer`:
-/// enabled, opted in to token exchange, and of that issuer.
+/// enabled, opted in to token exchange, of that issuer, and the
+/// `role` if one is named.
 ///
 /// The issuer is not verified at this point, it only selects who
 /// verifies the token. Trusted issuers which aren't login providers
@@ -246,11 +347,14 @@ fn validate_request(
 fn exchange_candidates(
   providers: impl IntoIterator<Item = ExternalLoginProvider>,
   issuer: &str,
+  role: Option<&str>,
 ) -> Vec<ExternalLoginProvider> {
   providers
     .into_iter()
     .filter(|provider| {
-      provider.enabled() && provider.token_exchange.enabled
+      provider.enabled()
+        && provider.token_exchange.enabled
+        && is_role(role, &provider.id, &provider.name)
     })
     .filter(|provider| match &provider.config {
       ExternalLoginProviderConfig::Oidc(config) => {
@@ -270,6 +374,7 @@ fn exchange_candidates(
 ///
 /// `load_client` loads the client which verifies tokens of a provider,
 /// `load_keys` the keys which verify tokens of a trusted issuer.
+/// `role` restricts both, see [TokenExchangeOptions].
 #[instrument("TokenExchange", skip_all, fields(ip = ip.to_string()))]
 async fn exchange<I, L, F, K, G>(
   auth: &I,
@@ -277,7 +382,8 @@ async fn exchange<I, L, F, K, G>(
   request: TokenExchangeRequest,
   load_client: L,
   load_keys: K,
-) -> mogh_error::Result<TokenExchangeResponse>
+  role: Option<&str>,
+) -> mogh_error::Result<ExchangedToken>
 where
   I: AuthImpl + ?Sized,
   L: Fn(ExternalLoginProvider) -> F,
@@ -289,7 +395,7 @@ where
   let token = request.subject_token.as_str();
 
   let user_rejection =
-    match verify_exchange(auth, token, load_client).await {
+    match verify_exchange(auth, token, load_client, role).await {
       Ok(Some(verified)) => {
         return complete_exchange(
           auth,
@@ -304,7 +410,7 @@ where
     };
 
   let workload_rejection =
-    match verify_workload(auth, token, load_keys).await {
+    match verify_workload(auth, token, load_keys, role).await {
       Ok(Some(verified)) => {
         return complete_workload(
           auth,
@@ -319,9 +425,23 @@ where
     };
 
   Err(user_rejection.or(workload_rejection).unwrap_or_else(|| {
-    invalid_grant(
-      "No login provider or trusted issuer accepts tokens of this issuer",
-    )
+    match role {
+      // Nothing of that name takes the token's issuer, told
+      // apart from a rejected token for Vault's "role not found".
+      Some(role) => anyhow::Error::new(RoleNotFound {
+        role: role.to_string(),
+      })
+      .context(OauthError {
+        code: "invalid_grant",
+        description: format!(
+          "No login provider or workload rule '{role}' accepts tokens of this issuer"
+        ),
+      })
+      .status_code(StatusCode::BAD_REQUEST),
+      None => invalid_grant(
+        "No login provider or trusted issuer accepts tokens of this issuer",
+      ),
+    }
   }))
 }
 
@@ -338,11 +458,13 @@ pub(crate) struct VerifiedExchange {
 /// The login rules for the user (cidr whitelist, second
 /// factor, sync) are still up to the caller.
 ///
-/// `None` if no login provider takes tokens of the issuer.
+/// `None` if no login provider (named `role`, if one is) takes
+/// tokens of the issuer.
 pub(crate) async fn verify_exchange<I, L, F>(
   auth: &I,
   token: &str,
   load_client: L,
+  role: Option<&str>,
 ) -> mogh_error::Result<Option<VerifiedExchange>>
 where
   I: AuthImpl + ?Sized,
@@ -368,6 +490,7 @@ where
       .into_iter()
       .map(|resolved| resolved.provider),
     &issuer,
+    role,
   );
 
   if candidates.is_empty() {
@@ -461,11 +584,14 @@ struct VerifiedWorkload {
 }
 
 /// Finds the trusted issuer which accepts the token, and the rule
-/// the token matches. `None` if no trusted issuer has that issuer.
+/// the token matches: the first matching one, or with a `role` the
+/// rule of that id / name. `None` if no trusted issuer has that
+/// issuer (and, with a role, a rule of that name).
 async fn verify_workload<I, K, G>(
   auth: &I,
   token: &str,
   load_keys: K,
+  role: Option<&str>,
 ) -> mogh_error::Result<Option<VerifiedWorkload>>
 where
   I: AuthImpl + ?Sized,
@@ -484,7 +610,12 @@ where
     .into_iter()
     .map(|resolved| resolved.issuer)
     .filter(|trusted| {
-      trusted.enabled && issuers_match(&trusted.issuer, &issuer)
+      trusted.enabled
+        && issuers_match(&trusted.issuer, &issuer)
+        && trusted
+          .rules
+          .iter()
+          .any(|rule| is_role(role, &rule.id, &rule.name))
     })
     .collect::<Vec<_>>();
 
@@ -516,12 +647,28 @@ where
         continue;
       }
     };
-    let Some(rule) = match_rule(&trusted.rules, &claims).cloned()
-    else {
-      unmatched.get_or_insert(invalid_grant(format!(
-        "The token is valid, but matches no rule of '{}'",
-        trusted.name
-      )));
+    // With a role, only the rule(s) of that name are evaluated,
+    // like Vault evaluates the named role.
+    let rules = match role {
+      Some(_) => trusted
+        .rules
+        .iter()
+        .filter(|rule| is_role(role, &rule.id, &rule.name))
+        .cloned()
+        .collect::<Vec<_>>(),
+      None => trusted.rules.clone(),
+    };
+    let Some(rule) = match_rule(&rules, &claims).cloned() else {
+      unmatched.get_or_insert(invalid_grant(match role {
+        Some(role) => format!(
+          "The token is valid, but does not match rule '{role}' of '{}'",
+          trusted.name
+        ),
+        None => format!(
+          "The token is valid, but matches no rule of '{}'",
+          trusted.name
+        ),
+      }));
       continue;
     };
     check_rule_id(&trusted, &rule)?;
@@ -594,7 +741,7 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     claims,
   }: VerifiedWorkload,
   issued_token_type: &str,
-) -> mogh_error::Result<TokenExchangeResponse> {
+) -> mogh_error::Result<ExchangedToken> {
   // What identifies the workload, for the audit log below.
   let subject = truncate_for_log(
     claims
@@ -675,11 +822,20 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     "Workload logged in (token exchange)"
   );
 
-  Ok(TokenExchangeResponse {
-    access_token: jwt.jwt,
-    issued_token_type: issued_token_type.to_string(),
-    token_type: "Bearer".to_string(),
-    expires_in: u64::try_from(ttl_ms / 1000).unwrap_or(u64::MAX),
+  Ok(ExchangedToken {
+    response: TokenExchangeResponse {
+      access_token: jwt.jwt,
+      issued_token_type: issued_token_type.to_string(),
+      token_type: "Bearer".to_string(),
+      expires_in: u64::try_from(ttl_ms / 1000).unwrap_or(u64::MAX),
+    },
+    user_id: user.id().to_string(),
+    login: ExchangedLogin::Workload {
+      issuer_id: issuer.id,
+      issuer_name: issuer.name,
+      rule_id: rule.id,
+      rule_name: rule.name,
+    },
   })
 }
 
@@ -694,7 +850,7 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
     info,
   }: VerifiedExchange,
   issued_token_type: &str,
-) -> mogh_error::Result<TokenExchangeResponse> {
+) -> mogh_error::Result<ExchangedToken> {
   // Users outside their whitelist are rejected
   // before the exchange has any effect on them.
   check_user_cidr_whitelist(user.as_ref(), ip)?;
@@ -719,12 +875,19 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
     "User logged in (token exchange)"
   );
 
-  Ok(TokenExchangeResponse {
-    access_token: jwt.jwt,
-    issued_token_type: issued_token_type.to_string(),
-    token_type: "Bearer".to_string(),
-    expires_in: u64::try_from(auth.jwt_provider().ttl_ms() / 1000)
-      .unwrap_or(u64::MAX),
+  Ok(ExchangedToken {
+    response: TokenExchangeResponse {
+      access_token: jwt.jwt,
+      issued_token_type: issued_token_type.to_string(),
+      token_type: "Bearer".to_string(),
+      expires_in: u64::try_from(auth.jwt_provider().ttl_ms() / 1000)
+        .unwrap_or(u64::MAX),
+    },
+    user_id: user.id().to_string(),
+    login: ExchangedLogin::Provider {
+      provider_id: provider.id,
+      provider_name: provider.name,
+    },
   })
 }
 
@@ -980,12 +1143,23 @@ mod tests {
     auth: &TestAuth,
     token: String,
   ) -> mogh_error::Result<TokenExchangeResponse> {
+    run_as(auth, token, None)
+      .await
+      .map(|exchanged| exchanged.response)
+  }
+
+  async fn run_as(
+    auth: &TestAuth,
+    token: String,
+    role: Option<&str>,
+  ) -> mogh_error::Result<ExchangedToken> {
     exchange(
       auth,
       IP,
       TokenExchangeRequest::id_token(token),
       load_client,
       load_issuer_keys,
+      role,
     )
     .await
   }
@@ -1581,7 +1755,7 @@ mod tests {
     ];
 
     let ids = |issuer: &str| {
-      exchange_candidates(providers.clone(), issuer)
+      exchange_candidates(providers.clone(), issuer, None)
         .into_iter()
         .map(|provider| provider.id)
         .collect::<Vec<_>>()
@@ -1594,6 +1768,132 @@ mod tests {
     assert!(ids("https://github.com").is_empty());
     assert!(ids("https://evil.example.com").is_empty());
     assert!(ids("").is_empty());
+
+    // A role names a provider by id or name, nothing else qualifies
+    let named = |issuer: &str, role: &str| {
+      exchange_candidates(providers.clone(), issuer, Some(role))
+        .into_iter()
+        .map(|provider| provider.id)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(named(ISSUER, "oidc"), ["oidc"]);
+    assert_eq!(named(ISSUER, "OIDC"), ["oidc"]);
+    assert!(named(ISSUER, "github").is_empty());
+    assert!(named("https://accounts.google.com", "oidc").is_empty());
+  }
+
+  // ========
+  // = ROLE =
+  // ========
+
+  /// The broad rule comes first: without a role it takes every
+  /// release token, with the role the narrower rule named is the
+  /// one evaluated and logged in as.
+  fn broad_then_narrow() -> Vec<WorkloadRule> {
+    let mut broad = deploy_rule();
+    broad.id = "release".to_string();
+    broad.name = "Release".to_string();
+    broad.claims.truncate(1);
+    broad.groups = vec!["releasers".to_string()];
+    vec![broad, deploy_rule()]
+  }
+
+  #[tokio::test]
+  async fn test_role_selects_the_named_rule() {
+    let auth = workload_auth(broad_then_narrow());
+    let token =
+      || workload_token(12345, "refs/heads/release/1").mint();
+
+    let first = run_as(&auth, token(), None).await.unwrap();
+    assert!(matches!(
+      &first.login,
+      ExchangedLogin::Workload { rule_id, .. } if rule_id == "release"
+    ));
+    assert_eq!(first.user_id, "user-id");
+
+    // By name, and by id
+    for role in ["Deploy", "deploy"] {
+      let named = run_as(&auth, token(), Some(role)).await.unwrap();
+      let ExchangedLogin::Workload {
+        issuer_id,
+        issuer_name,
+        rule_id,
+        rule_name,
+      } = &named.login
+      else {
+        panic!("a workload login")
+      };
+      assert_eq!(
+        (issuer_id.as_str(), issuer_name.as_str()),
+        ("ci", "CI")
+      );
+      assert_eq!(
+        (rule_id.as_str(), rule_name.as_str()),
+        ("deploy", "Deploy")
+      );
+      assert_eq!(named.response.expires_in, 900);
+    }
+    let workloads = auth.workloads.lock().unwrap();
+    assert_eq!(workloads.len(), 3);
+    assert_eq!(workloads[0].groups, ["releasers"]);
+    assert_eq!(workloads[1].groups, ["deployers"]);
+  }
+
+  #[tokio::test]
+  async fn test_role_refuses_before_any_effect() {
+    let auth = workload_auth(broad_then_narrow());
+
+    // The named rule exists but the token doesn't match it: no
+    // falling back to the rule which would.
+    let token = workload_token(12345, "refs/heads/main").mint();
+    let err = run_as(&auth, token, Some("Deploy")).await.unwrap_err();
+    assert_eq!(code(&err), "invalid_grant");
+    assert!(
+      err
+        .error
+        .to_string()
+        .contains("does not match rule 'Deploy'")
+    );
+    assert!(err.error.downcast_ref::<RoleNotFound>().is_none());
+
+    // No rule (and no provider) of that name takes the issuer:
+    // Vault's "role not found", told apart for the app.
+    let token = workload_token(12345, "refs/heads/release/1").mint();
+    let err = run_as(&auth, token, Some("nope")).await.unwrap_err();
+    assert_eq!(code(&err), "invalid_grant");
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    let not_found = err.error.downcast_ref::<RoleNotFound>().unwrap();
+    assert_eq!(not_found.role, "nope");
+    let (status, body) = token_exchange_error(&err);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body.error, "invalid_grant");
+    assert!(body.error_description.unwrap().contains("'nope'"));
+
+    // Neither refusal reached the app
+    assert!(auth.workloads.lock().unwrap().is_empty());
+  }
+
+  #[tokio::test]
+  async fn test_role_names_a_login_provider() {
+    let auth = TestAuth::with_user(Some(TestUser {
+      external_skip_2fa: true,
+      ..Default::default()
+    }));
+    let exchanged =
+      run_as(&auth, token().mint(), Some("OIDC")).await.unwrap();
+    assert!(matches!(
+      &exchanged.login,
+      ExchangedLogin::Provider { provider_id, provider_name }
+        if provider_id == "oidc" && provider_name == "OIDC"
+    ));
+    assert_eq!(exchanged.user_id, "user-id");
+
+    let err = run_as(&auth, token().mint(), Some("other"))
+      .await
+      .unwrap_err();
+    assert!(err.error.downcast_ref::<RoleNotFound>().is_some());
+    // Only the successful exchange synced the user
+    assert_eq!(auth.synced.lock().unwrap().len(), 1);
   }
 
   async fn error_body(
