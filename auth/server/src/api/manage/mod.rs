@@ -119,6 +119,9 @@ async fn handler<I: AuthImpl>(
   );
 
   check_not_workload(user.as_ref().as_ref(), &request)?;
+  // Before the window check, which `0` disables: an api key is
+  // refused the account requests whatever the window.
+  check_credential_kind(authenticated_at, &request)?;
 
   let auth = I::new();
   check_recent_login(
@@ -197,7 +200,8 @@ fn requires_recent_login(request: &ManageRequest) -> bool {
 /// account: the login providers and trusted issuers, whose handlers
 /// require an admin. A credential without a login (an api key, where
 /// the app accepts them at all) may perform these — automation
-/// manages them — and nothing else here.
+/// manages them — and none of the account requests, see
+/// [check_credential_kind].
 fn manages_resources(request: &ManageRequest) -> bool {
   matches!(
     request,
@@ -211,9 +215,35 @@ fn manages_resources(request: &ManageRequest) -> bool {
 }
 
 /// `authenticated_at` is when the token was issued, or `None` for
-/// credentials without a login (api keys), which the resource
-/// requests take ([manages_resources]) and the account requests
-/// refuse. A session needs a recent login for both.
+/// credentials without a login (api keys, and tokens the app accepts
+/// which [AuthImpl::jwt_provider] did not issue). Those take the resource
+/// requests ([manages_resources]) and the ones which need no login
+/// ([requires_recent_login]), and are refused the account requests,
+/// whatever [AuthImpl::reauthentication_window_secs] is (`0`
+/// included): a leaked api key must not be able to change the
+/// password, unenroll 2fa or mint replacement credentials.
+fn check_credential_kind(
+  authenticated_at: Option<u64>,
+  request: &ManageRequest,
+) -> mogh_error::Result<()> {
+  if authenticated_at.is_some()
+    || !requires_recent_login(request)
+    || manages_resources(request)
+  {
+    return Ok(());
+  }
+  Err(
+    anyhow::anyhow!(
+      "{REAUTHENTICATION_REQUIRED}: this needs a recent login, credentials without a login (api keys) can't be used for it"
+    )
+    .status_code(axum::http::StatusCode::FORBIDDEN),
+  )
+}
+
+/// `authenticated_at` is when the token was issued: a session needs
+/// a login within the window for the account and the resource
+/// requests alike. `None` (an api key) has no login to be recent,
+/// [check_credential_kind] decides what it may do.
 fn check_recent_login(
   window_secs: u64,
   authenticated_at: Option<u64>,
@@ -223,24 +253,20 @@ fn check_recent_login(
   if window_secs == 0 || !requires_recent_login(request) {
     return Ok(());
   }
-  let reason = match authenticated_at {
-    // A token from the future doesn't count as recent either,
-    // `saturating_sub` would make its age zero.
-    Some(at) if at <= now && now - at <= window_secs => {
-      return Ok(());
-    }
-    Some(_) => format!(
-      "log in again to continue, this needs a login within the last {}",
-      format_window(window_secs)
-    ),
-    None if manages_resources(request) => return Ok(()),
-    None => String::from(
-      "this needs a recent login, api keys can't be used for it",
-    ),
+  let Some(at) = authenticated_at else {
+    return Ok(());
   };
+  // A token from the future doesn't count as recent either,
+  // `saturating_sub` would make its age zero.
+  if at <= now && now - at <= window_secs {
+    return Ok(());
+  }
   Err(
-    anyhow::anyhow!("{REAUTHENTICATION_REQUIRED}: {reason}")
-      .status_code(axum::http::StatusCode::FORBIDDEN),
+    anyhow::anyhow!(
+      "{REAUTHENTICATION_REQUIRED}: log in again to continue, this needs a login within the last {}",
+      format_window(window_secs)
+    )
+    .status_code(axum::http::StatusCode::FORBIDDEN),
   )
 }
 
@@ -405,6 +431,31 @@ mod tests {
       .collect()
   }
 
+  /// The handler's credential checks, in its order.
+  fn check(
+    window_secs: u64,
+    authenticated_at: Option<u64>,
+    request: &ManageRequest,
+  ) -> mogh_error::Result<()> {
+    check_credential_kind(authenticated_at, request)?;
+    check_recent_login(window_secs, authenticated_at, NOW, request)
+  }
+
+  fn assert_reauthentication_required(
+    res: mogh_error::Result<()>,
+    what: &str,
+  ) {
+    let err = res.expect_err(what);
+    assert_eq!(err.status, StatusCode::FORBIDDEN, "{what}");
+    // Clients recognize the error by the start of its message.
+    assert!(
+      format!("{:#}", err.error)
+        .starts_with(REAUTHENTICATION_REQUIRED),
+      "{what}: {:#}",
+      err.error
+    );
+  }
+
   #[test]
   fn test_sensitive_requests_need_a_recent_login() {
     let sensitive = sensitive_requests();
@@ -413,30 +464,16 @@ mod tests {
       let method: ManageRequestMethod = (&request).into();
       // Just logged in, and at the end of the window.
       for age in [0, 1, WINDOW] {
-        check_recent_login(WINDOW, Some(NOW - age), NOW, &request)
+        check(WINDOW, Some(NOW - age), &request)
           .unwrap_or_else(|_| panic!("{method} at {age}s"));
       }
-      // Too old, from the future, or (an account request) not a
-      // login at all (api key).
-      for authenticated_at in [
-        Some(NOW - WINDOW - 1),
-        Some(0),
-        Some(NOW + 60),
-        (!manages_resources(&request)).then_some(None).flatten(),
-      ]
-      .into_iter()
-      .filter(|at| at.is_some() || !manages_resources(&request))
+      // Too old, or from the future.
+      for authenticated_at in
+        [Some(NOW - WINDOW - 1), Some(0), Some(NOW + 60)]
       {
-        let err =
-          check_recent_login(WINDOW, authenticated_at, NOW, &request)
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN, "{method}");
-        // Clients recognize the error by the start of its message.
-        assert!(
-          format!("{:#}", err.error)
-            .starts_with(REAUTHENTICATION_REQUIRED),
-          "{method}: {:#}",
-          err.error
+        assert_reauthentication_required(
+          check(WINDOW, authenticated_at, &request),
+          &format!("{method} at {authenticated_at:?}"),
         );
       }
     }
@@ -445,48 +482,73 @@ mod tests {
   #[test]
   fn test_harmless_requests_work_with_any_credentials() {
     for request in harmless_requests() {
-      for authenticated_at in [Some(0), Some(NOW + 60), None] {
-        assert!(
-          check_recent_login(WINDOW, authenticated_at, NOW, &request)
-            .is_ok()
-        );
+      for window in [0, WINDOW] {
+        for authenticated_at in [Some(0), Some(NOW + 60), None] {
+          assert!(check(window, authenticated_at, &request).is_ok());
+        }
       }
     }
   }
 
   /// The resource requests take a credential without a login; a
-  /// stale login is still refused them, and the account requests
-  /// refuse keys.
+  /// stale login is still refused them.
   #[test]
   fn test_resource_requests_take_api_keys() {
-    let (resources, accounts): (Vec<_>, Vec<_>) =
-      sensitive_requests()
-        .into_iter()
-        .partition(manages_resources);
+    let resources = sensitive_requests()
+      .into_iter()
+      .filter(manages_resources)
+      .collect::<Vec<_>>();
     // One of each kind is listed, not every resource request.
     assert!(!resources.is_empty());
-    assert!(accounts.len() > 6);
     for request in &resources {
-      assert!(check_recent_login(WINDOW, None, NOW, request).is_ok());
-      let err = check_recent_login(WINDOW, Some(0), NOW, request)
-        .unwrap_err();
-      assert_eq!(err.status, StatusCode::FORBIDDEN);
-    }
-    for request in &accounts {
-      let err =
-        check_recent_login(WINDOW, None, NOW, request).unwrap_err();
-      assert_eq!(err.status, StatusCode::FORBIDDEN);
+      for window in [0, WINDOW] {
+        assert!(check(window, None, request).is_ok());
+      }
+      assert_reauthentication_required(
+        check(WINDOW, Some(0), request),
+        "stale login",
+      );
     }
   }
 
+  /// An api key is refused every account request, whether the
+  /// reauthentication window is enabled or not (`0`): it could
+  /// otherwise set a password, unenroll 2fa or mint a replacement
+  /// key, and keep the account after the key is deleted.
+  #[test]
+  fn test_api_keys_are_refused_account_requests_at_any_window() {
+    let accounts = sensitive_requests()
+      .into_iter()
+      .filter(|request| !manages_resources(request))
+      .collect::<Vec<_>>();
+    assert!(accounts.len() > 6);
+    for request in &accounts {
+      let method: ManageRequestMethod = request.into();
+      assert_reauthentication_required(
+        check_credential_kind(None, request),
+        &method.to_string(),
+      );
+      for window in [0, 1, WINDOW] {
+        assert_reauthentication_required(
+          check(window, None, request),
+          &format!("{method} at window {window}"),
+        );
+      }
+    }
+    for request in harmless_requests().iter().chain(
+      sensitive_requests().iter().filter(|r| manages_resources(r)),
+    ) {
+      assert!(check_credential_kind(None, request).is_ok());
+    }
+  }
+
+  /// `0` disables the window for sessions, not the refusal of api
+  /// keys ([test_api_keys_are_refused_account_requests_at_any_window]).
   #[test]
   fn test_recent_login_check_can_be_disabled() {
     for request in sensitive_requests() {
-      for authenticated_at in [Some(0), None] {
-        assert!(
-          check_recent_login(0, authenticated_at, NOW, &request)
-            .is_ok()
-        );
+      for authenticated_at in [Some(0), Some(NOW + 60)] {
+        assert!(check(0, authenticated_at, &request).is_ok());
       }
     }
   }

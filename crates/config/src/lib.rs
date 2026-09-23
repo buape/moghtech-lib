@@ -3,6 +3,21 @@
 //! This library is used to parse Core, Periphery, and CLI config files.
 //! It supports interpolating in environment variables (only '${VAR}' syntax),
 //! as well as merging together multiple files into a final configuration object.
+//!
+//! Sources are toml, yaml, json, and env files (`.env`, `*.env`):
+//! flat `NAME=value` entries whose names are lowercased to match
+//! struct fields, the way `envy` reads the process environment,
+//! with dots nesting (`DATABASE.ADDRESS` fills `database.address`;
+//! a name with an empty segment, `.dockerconfigjson`, stays one flat
+//! key), and whose values are taken verbatim (no interpolation: they are
+//! secrets, not templates). The final deserialization coerces
+//! string values into the field's type (numbers, booleans, comma
+//! separated lists, `Option`, unit enum variants), see [lenient].
+//!
+//! With the `cicada` feature, `cicada://filesystem/path.yaml?env=a+b`
+//! loads a file from Cicada interpolated with the environments, and
+//! `cicada://.env?env=a+b` the environments themselves as an env
+//! file; the loader is re-exported as [cicada].
 
 use std::path::Path;
 
@@ -10,17 +25,33 @@ use colored::Colorize;
 use indexmap::IndexSet;
 use serde::de::DeserializeOwned;
 
+mod env_file;
 mod error;
 mod includes;
 mod interpolate;
+pub mod lenient;
 mod load;
 mod merge;
 
+pub use env_file::{
+  EnvFileError, is_env_file, parse_env_file, parse_env_file_object,
+};
 pub use error::{
   Error, deserialize_final, redact_serde_error, value_type,
 };
 pub use interpolate::*;
 pub use merge::{merge_config, merge_objects};
+
+/// The Cicada loader behind `cicada:` paths, so an application
+/// reaches its background (`cicada::spawn`, `cicada::on_change`,
+/// `cicada::subscribe`) and direct loads (`cicada::load_env_as`)
+/// without depending on the crate itself.
+///
+/// Versioning: the loader's API is part of this crate's API. A
+/// `cicada_loader` minor (`0.x`) bump ships as a `mogh_config`
+/// major release; a loader patch bump stays a patch release.
+#[cfg(feature = "cicada")]
+pub use cicada_loader as cicada;
 
 pub type Result<T> = ::core::result::Result<T, Error>;
 
@@ -100,7 +131,7 @@ impl ConfigLoader<'_, '_> {
 
     if debug_print {
       println!(
-        "{}: {}: {paths:?}",
+        "{}: {}: {match_wildcards:?}",
         "DEBUG".cyan(),
         "Config wildcards".dimmed()
       );

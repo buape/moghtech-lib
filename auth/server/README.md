@@ -540,7 +540,7 @@ last 15 minutes, so a token which leaked is not enough to take the account over
 for good. Reading, `GetUserId` and deleting api keys are not affected.
 
 ```rust
-/// Seconds. `0` disables the check.
+/// Seconds. `0` disables the check for sessions (api keys stay refused).
 fn reauthentication_window_secs(&self) -> u64 {
   15 * 60
 }
@@ -552,15 +552,17 @@ fn reauthentication_window_secs(&self) -> u64 {
   again, including their second factor, and retries. `mogh_ui` does this on
   its own: it tells the user why and sends them to `/login?backto=<page>`
   (`setOnReauthenticationRequired` to change that).
-- Api keys are not a login, and are refused the account requests while the
-  check is enabled. The requests which manage resources rather than the
-  caller's account — the login providers and trusted issuers, whose handlers
-  require an admin — take them, so an admin's key can run Terraform against
-  them; whether keys reach the management api at all is the app's
-  `get_user_id_from_request_authentication`. Disable the check instead if the
-  app provisions credentials with keys.
-- The time is the `iat` of a `JwtProvider` token. Apps which validate other
-  tokens in `get_user_id_from_request_authentication` should disable the check.
+- Api keys are not a login, and are always refused the account requests,
+  whatever the window (`0` included): a leaked key must not be able to set a
+  password, unenroll 2FA or mint a replacement key. The requests which manage
+  resources rather than the caller's account — the login providers and
+  trusted issuers, whose handlers require an admin — take them, so an admin's
+  key can run Terraform against them; whether keys reach the management api
+  at all is the app's `get_user_id_from_request_authentication`.
+- The time is the `iat` of a `JwtProvider` token. Other tokens which
+  `get_user_id_from_request_authentication` accepts have no known login and
+  count as api keys: they are refused the account requests whatever the window,
+  and may make only the resource requests.
 
 ### Failed external logins
 

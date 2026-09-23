@@ -40,7 +40,8 @@ impl<S: Send + Sync> FromRequestParts<S> for UserExtractor {
 }
 
 /// When the token the request is authenticated with was issued (unix
-/// seconds). `None` for credentials without a login, ie. api keys.
+/// seconds). `None` for credentials without a login: api keys, and
+/// tokens not issued by [AuthImpl::jwt_provider].
 #[derive(Clone, Copy)]
 pub struct AuthenticatedAt(pub Option<u64>);
 

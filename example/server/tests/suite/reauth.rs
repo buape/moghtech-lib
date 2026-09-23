@@ -206,8 +206,11 @@ async fn api_keys_cannot_create_more_credentials() {
   assert_eq!(admin.read(ListApiKeys {}).await.unwrap().len(), 1);
 }
 
+/// `0` disables the check for sessions only: an api key is still not
+/// a login, and a leaked one must not be able to set a password,
+/// unenroll 2fa or mint a replacement key.
 #[tokio::test]
-async fn the_check_can_be_disabled() {
+async fn the_check_can_be_disabled_but_not_for_api_keys() {
   let app = spawn_with_window(0).await;
   let admin = app.sign_up("admin").await;
   let res = admin.manage(new_key("automation")).await.unwrap();
@@ -215,7 +218,16 @@ async fn the_check_can_be_disabled() {
     key: res.key,
     secret: res.secret,
   });
-  // Eg. for apps which provision api keys with api keys.
-  api.manage(new_key("another")).await.unwrap();
+
+  assert_all_sensitive_requests_refused(&api).await;
+  // The resource requests still take an admin's key.
+  api.manage(attacker_sso()).await.unwrap();
+  let user = get_user(&admin).await;
+  assert_eq!(user.username, "admin");
+  assert_eq!(admin.read(ListApiKeys {}).await.unwrap().len(), 1);
+
+  // The session is not held to any window.
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  admin.manage(new_key("another")).await.unwrap();
   assert_eq!(admin.read(ListApiKeys {}).await.unwrap().len(), 2);
 }

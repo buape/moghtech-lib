@@ -111,8 +111,11 @@ type ApiError = { result?: { error?: string; trace?: string[] } };
 function notifyError(kind: string, type: string, e: ApiError) {
   console.log(`${kind} error:`, e);
   const msg = e.result?.error || "Unknown error. See console.";
+  // Skip the causes the message already shows, eg. a failed
+  // attempt's error under the rate limit's attempts remaining note.
   const detail = e.result?.trace
-    ?.map((msg) => msg[0].toUpperCase() + msg.slice(1))
+    ?.filter((cause) => !msg.includes(cause))
+    .map((msg) => msg[0].toUpperCase() + msg.slice(1))
     .join(" | ");
   let msg_log = msg[0].toUpperCase() + msg.slice(1) + " | ";
   if (detail) {

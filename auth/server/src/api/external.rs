@@ -14,7 +14,7 @@ use mogh_auth_client::{
   },
 };
 use mogh_error::AddStatusCodeError;
-use mogh_rate_limit::WithFailureRateLimit;
+use mogh_rate_limit::{FailedAttempt, WithFailureRateLimit};
 use mogh_request_ip::RequestIp;
 use serde::Deserialize;
 use std::{net::IpAddr, sync::Arc};
@@ -268,6 +268,12 @@ fn error_redirect<I: AuthImpl>(
     // The details are for the operator, not for the url bar.
     error!("External login failed | {:#}", e.error);
     String::from("Login failed, see the server logs for details")
+  } else if let Some(attempt) =
+    e.error.downcast_ref::<FailedAttempt>()
+  {
+    // The rate limit tops the flows' errors. Its message already has
+    // the error with its causes, which `{:#}` would repeat after it.
+    attempt.to_string()
   } else {
     format!("{:#}", e.error)
   };
@@ -1079,6 +1085,37 @@ mod tests {
     assert!(location(redirect).starts_with(
       "https://example.com/login?theme=dark&login_error=User"
     ));
+  }
+
+  /// The flows' failures come through the rate limit, which notes
+  /// the attempts left on top of the error.
+  #[tokio::test]
+  async fn test_error_redirect_shows_the_attempts_left_once() {
+    let auth = TestAuth {
+      error_redirect: Some("https://example.com/login"),
+      ..Default::default()
+    };
+    let limiter = mogh_rate_limit::RateLimiter::new(
+      false,
+      3,
+      std::time::Duration::from_secs(60),
+    );
+    let ip = IpAddr::from([10, 0, 0, 1]);
+    let res = async {
+      Err::<Redirect, _>(
+        anyhow!("User registration is disabled")
+          .context("Login rejected")
+          .status_code(StatusCode::UNAUTHORIZED),
+      )
+    }
+    .with_failure_rate_limit_using_ip(&limiter, &ip)
+    .await;
+    let redirect =
+      error_redirect(&auth, ExternalFlow::Login, res).unwrap();
+    assert_eq!(
+      location(redirect),
+      "https://example.com/login?login_error=Login%20rejected%3A%20User%20registration%20is%20disabled%20%7C%20You%20have%202%20attempts%20remaining"
+    );
   }
 
   #[test]

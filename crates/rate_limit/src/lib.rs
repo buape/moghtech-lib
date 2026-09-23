@@ -1,4 +1,5 @@
 use std::{
+  fmt,
   net::IpAddr,
   sync::Arc,
   time::{Duration, Instant},
@@ -11,6 +12,46 @@ use mogh_error::AddStatusCodeError;
 use tokio::sync::RwLock;
 
 pub use mogh_request_ip::{TrustedProxies, get_client_ip};
+
+/// The context the error of a failed attempt is returned with,
+/// noting how many attempts are left.
+///
+/// The attempt's own error stays underneath it, so its types are
+/// still found with `error.downcast_ref::<T>()`. The error displays
+/// as the attempt's error (with its causes) followed by the note:
+/// `Invalid login credentials | You have 2 attempts remaining`.
+/// Rendering the whole chain (`{:#}`, or the `trace` of a
+/// serialized error) lists the attempt's error again below it.
+#[derive(Debug)]
+pub struct FailedAttempt {
+  /// The attempt's error with its causes, as `{:#}` renders it.
+  error: String,
+  remaining_attempts: usize,
+}
+
+impl FailedAttempt {
+  /// How many more attempts from the ip may fail within the
+  /// window before it is refused with `429 Too Many Requests`.
+  pub fn remaining_attempts(&self) -> usize {
+    self.remaining_attempts
+  }
+
+  /// `message` followed by the note, the way the
+  /// attempt's error is displayed:
+  /// `{message} | You have N attempts remaining`.
+  pub fn annotate(&self, message: impl fmt::Display) -> String {
+    format!(
+      "{message} | You have {} attempts remaining",
+      self.remaining_attempts
+    )
+  }
+}
+
+impl fmt::Display for FailedAttempt {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(&self.annotate(&self.error))
+  }
+}
 
 /// Trait to extend fallible futures with stateful
 /// rate limiting.
@@ -27,7 +68,9 @@ where
   /// If the rate limiting rules are not violated, the
   /// future will be executed, and if it fails then the
   /// attempt time will be recorded for rate limit,
-  /// and original error returned.
+  /// and original error returned with a [FailedAttempt]
+  /// context noting the attempts remaining. The original
+  /// error's status, headers and types are kept.
   ///
   /// The end result rate limits failing requests,
   /// while succeeding requests are not rate limited.
@@ -102,11 +145,14 @@ where
           write.push(now);
           // Add 1 to count because it doesn't include this attempt.
           let remaining_attempts = limiter.max_attempts - (count + 1);
-          // Return original error with remaining attempts shown
-          e.error = anyhow!(
-            "{:#} | You have {remaining_attempts} attempts remaining",
-            e.error,
-          );
+          // Return original error with remaining attempts shown.
+          // As context, not a new error with its message, so
+          // callers can still downcast to the original error.
+          let attempt = FailedAttempt {
+            error: format!("{:#}", e.error),
+            remaining_attempts,
+          };
+          e.error = e.error.context(attempt);
           Err(e)
         }
       }
@@ -275,6 +321,75 @@ mod tests {
     assert_eq!(executions.load(Ordering::SeqCst), 3);
   }
 
+  #[derive(Debug)]
+  struct BadCredentials;
+
+  impl fmt::Display for BadCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("bad credentials")
+    }
+  }
+
+  impl std::error::Error for BadCredentials {}
+
+  #[tokio::test]
+  async fn failed_attempts_keep_the_original_error() {
+    let limiter = RateLimiter::new(false, 3, Duration::from_secs(60));
+    let failing_typed = || async {
+      Err::<(), _>(
+        anyhow::Error::new(BadCredentials)
+          .context("Login failed")
+          .status_code(StatusCode::UNAUTHORIZED)
+          .header("x-test", HeaderValue::from_static("kept")),
+      )
+    };
+    let err = failing_typed()
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+
+    // Status and headers of the original error are kept.
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(err.headers.as_ref().unwrap()["x-test"], "kept");
+    // The error's types are still found.
+    assert!(err.error.downcast_ref::<BadCredentials>().is_some());
+    let attempt = err.error.downcast_ref::<FailedAttempt>().unwrap();
+    assert_eq!(attempt.remaining_attempts(), 2);
+    // Displayed as the original error with its causes, then the note.
+    assert_eq!(
+      err.error.to_string(),
+      "Login failed: bad credentials | You have 2 attempts remaining"
+    );
+    // With the original error below it in the chain.
+    assert_eq!(
+      err
+        .error
+        .chain()
+        .skip(1)
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>(),
+      ["Login failed", "bad credentials"]
+    );
+    assert_eq!(
+      attempt.annotate("Denied"),
+      "Denied | You have 2 attempts remaining"
+    );
+
+    let err = failing_typed()
+      .with_failure_rate_limit_using_ip(&limiter, &IP)
+      .await
+      .unwrap_err();
+    assert!(err.error.downcast_ref::<BadCredentials>().is_some());
+    assert_eq!(
+      err
+        .error
+        .downcast_ref::<FailedAttempt>()
+        .unwrap()
+        .remaining_attempts(),
+      1
+    );
+  }
+
   /// Fails after giving other tasks (the cleanup) time to run.
   async fn failing_slowly() -> mogh_error::Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -282,7 +397,7 @@ mod tests {
   }
 
   fn remaining(err: &mogh_error::Error) -> String {
-    let msg = format!("{:#}", err.error);
+    let msg = err.error.to_string();
     msg
       .split("You have ")
       .nth(1)

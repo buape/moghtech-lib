@@ -52,8 +52,13 @@ test("failed logins and invalid signups show the reason", async ({ page }) => {
   await logOut(page);
 
   await logIn(page, username, "not-the-password");
+  // The reason once, then the rate limit's note. The failed attempt's
+  // error is also in the trace, which the notification leaves out.
   await expect(
-    notification(page, /Invalid login credentials/),
+    notification(
+      page,
+      /Invalid login credentials \| You have \d+ attempts remaining \| See console/,
+    ),
   ).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Username" })).toBeVisible();
 
@@ -61,7 +66,12 @@ test("failed logins and invalid signups show the reason", async ({ page }) => {
   await page.getByRole("textbox", { name: "Username" }).fill(username);
   await page.getByRole("textbox", { name: "Password", exact: true }).fill("correct-horse-battery");
   await page.getByRole("button", { name: "Sign Up" }).click();
-  await expect(notification(page, /Username is already taken/)).toBeVisible();
+  await expect(
+    notification(
+      page,
+      /Username is already taken \| You have \d+ attempts remaining \| See console/,
+    ),
+  ).toBeVisible();
 
   await page.getByRole("textbox", { name: "Username" }).fill(uniqueName("short"));
   await page.getByRole("textbox", { name: "Password", exact: true }).fill("short");

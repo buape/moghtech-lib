@@ -281,7 +281,19 @@ async fn failed_exchanges_are_rate_limited() {
   })
   .await;
   sign_up_alice(&app).await;
-  for _ in 0..3 {
+  // A failure keeps its OAuth error code, noting the attempts left.
+  let (status, error) =
+    app.token_exchange("x", "urn:made:up").await.unwrap_err();
+  assert_eq!(status, StatusCode::BAD_REQUEST);
+  assert_eq!(error.error, "invalid_request");
+  assert!(
+    error
+      .error_description
+      .as_deref()
+      .is_some_and(|d| d.ends_with("You have 2 attempts remaining")),
+    "{error:?}"
+  );
+  for _ in 0..2 {
     let (status, _) = app
       .token_exchange("not-a-token", TOKEN_TYPE_ID_TOKEN)
       .await

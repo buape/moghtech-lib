@@ -9,7 +9,11 @@ use colored::Colorize;
 use serde::de::DeserializeOwned;
 
 use crate::{
-  Error, Result, includes::IncludesLoader, interpolate_value,
+  Error, Result,
+  env_file::{is_env_file, parse_env_file_object},
+  error::{redact_serde_error, redact_toml_error, redact_yaml_error},
+  includes::IncludesLoader,
+  interpolate_value,
   merge::merge_objects,
 };
 
@@ -81,6 +85,19 @@ pub fn load_config_files(
       if file_name == include_file_name {
         continue;
       }
+      // An env file next to the config (a compose `.env`) is only
+      // a config source when a wildcard asks for it, or when it is
+      // listed as a path itself.
+      if keywords.is_empty() && is_env_file(&path) {
+        if debug_print {
+          println!(
+            "{}: {}: {path:?} (match it with a wildcard to load it)",
+            "DEBUG".cyan(),
+            "Skipping env file".dimmed()
+          );
+        }
+        continue;
+      }
       // Ensure file name matches a wildcard keyword
       let index = if keywords.is_empty() {
         0
@@ -147,6 +164,8 @@ pub fn load_config_files(
 /// - `cicada://filesystem/config.yaml?env=prod` -> `["prod"]`
 /// - `cicada://filesystem/config.yaml?env=prod+us-east` -> `["prod", "us-east"]`
 /// - `cicada://filesystem/config.yaml?env=prod&env=us-east` -> `["prod", "us-east"]`
+/// - `cicada://.env?env=prod+us-east` -> the environments themselves,
+///   as an env file (the loader's reserved `.env` path)
 #[cfg(feature = "cicada")]
 pub fn parse_cicada_path(
   path: &Path,
@@ -181,6 +200,19 @@ pub fn parse_cicada_path(
 /// can be cicada paths (`cicada://filesystem/config.yaml?env=prod+us-east`),
 /// provided user configures `CICADA_...` env vars.
 /// See [parse_cicada_path] for the environment syntax.
+///
+/// A local file which fails to open or parse is reported and
+/// skipped. A cicada source which fails to load or parse is an
+/// error ([Error::CicadaLoad], or the parse error): skipping it
+/// would start the app with defaults where the operator expects
+/// their configuration.
+///
+/// Each local toml / yaml / json source is interpolated (`${VAR}`,
+/// `$(cmd)`) as it is parsed. Env file sources and every cicada
+/// source are not: their values are secrets taken verbatim, never
+/// templates (Core interpolated a cicada file's `[[SECRET]]`
+/// placeholders already), and a secret must not be able to run a
+/// command in the process reading it.
 pub fn load_parse_config_files<T: DeserializeOwned>(
   files: &[PathBuf],
   merge_nested: bool,
@@ -190,33 +222,46 @@ pub fn load_parse_config_files<T: DeserializeOwned>(
 
   for file in files {
     #[cfg(feature = "cicada")]
-    let source = if let Some((file, environments)) =
-      parse_cicada_path(file)
-    {
-      let contents = match cicada_loader::load(&file, environments) {
-        Ok(contents) => contents,
+    let (source, interpolate) =
+      if let Some((node, environments)) = parse_cicada_path(file) {
+        // Never skipped, unlike a local file: eg. Core briefly
+        // unreachable at an exit-on-change restart must not start
+        // the app with its defaults.
+        let contents = cicada_loader::load(&node, environments)
+          .map_err(|e| Error::CicadaLoad {
+            path: file.clone(),
+            message: format!("{e:#}"),
+          })?;
+        let source = parse_config_contents(&node, &contents)?;
+        (Ok(source), false)
+      } else {
+        (load_parse_config_file(file), !is_env_file(file))
+      };
+
+    #[cfg(not(feature = "cicada"))]
+    let (source, interpolate) =
+      (load_parse_config_file(file), !is_env_file(file));
+
+    let source: serde_json::Map<String, serde_json::Value> =
+      match source {
+        Ok(source) => source,
         Err(e) => {
-          println!(
-            "{}: Cicada configuration at '{}' failed to load | {e:?}",
-            "ERROR".red(),
-            file.display(),
-          );
+          println!("{}: {e}", "WARN".yellow());
           continue;
         }
       };
-      parse_config_contents(&file, &contents)
+
+    // Interpolate each string leaf (and key) individually, rather
+    // than the serialized document, so values containing quotes,
+    // backslashes or newlines cannot break or inject into the json.
+    let source = if !interpolate {
+      source
     } else {
-      load_parse_config_file(file)
-    };
-
-    #[cfg(not(feature = "cicada"))]
-    let source = load_parse_config_file(file);
-
-    let source = match source {
-      Ok(source) => source,
-      Err(e) => {
-        println!("{}: {e}", "WARN".yellow());
-        continue;
+      let mut source = serde_json::Value::Object(source);
+      interpolate_value(&mut source);
+      match source {
+        serde_json::Value::Object(source) => source,
+        _ => unreachable!("interpolation keeps the value an object"),
       }
     };
 
@@ -234,13 +279,7 @@ pub fn load_parse_config_files<T: DeserializeOwned>(
     };
   }
 
-  // Interpolate each string leaf (and key) individually, rather
-  // than the serialized document, so values containing quotes,
-  // backslashes or newlines cannot break or inject into the json.
-  let mut target = serde_json::Value::Object(target);
-  interpolate_value(&mut target);
-
-  crate::error::deserialize_final(&target)
+  crate::error::deserialize_final(&serde_json::Value::Object(target))
 }
 
 /// Loads and parses a single config file
@@ -262,11 +301,31 @@ pub fn load_parse_config_file<T: DeserializeOwned>(
   parse_config_contents(file, &contents)
 }
 
-/// Parses config contents
+/// Parses config contents by the file's name: toml, yaml / yml,
+/// json, or an env file (`.env`, `*.env`, see
+/// [parse_env_file_object]): a flat set of `NAME=value` entries
+/// with names lowercased and dots nesting, so `DB_PASSWORD=x` fills
+/// a `db_password` field and `DATABASE.ADDRESS=y` fills
+/// `database.address`, the way `envy` would read the process
+/// environment. A name with an empty segment (`.dockerconfigjson`)
+/// stays one flat key.
 pub fn parse_config_contents<T: DeserializeOwned>(
   file: &Path,
   contents: &str,
 ) -> Result<T> {
+  if is_env_file(file) {
+    let object = parse_env_file_object(contents).map_err(|e| {
+      Error::ParseEnvFile {
+        e,
+        path: file.to_path_buf(),
+      }
+    })?;
+    return serde_json::from_value(serde_json::Value::Object(object))
+      .map_err(|e| Error::ParseJson {
+        path: file.to_path_buf(),
+        message: redact_serde_error(&e),
+      });
+  }
   let extension = file
     .extension()
     .and_then(|e| e.to_str())
@@ -274,19 +333,19 @@ pub fn parse_config_contents<T: DeserializeOwned>(
   let config = match extension.as_deref() {
     Some("toml") => {
       toml::from_str(contents).map_err(|e| Error::ParseToml {
-        e,
         path: file.to_path_buf(),
+        message: redact_toml_error(&e, contents),
       })?
     }
     Some("yaml") | Some("yml") => serde_yaml_ng::from_str(contents)
       .map_err(|e| Error::ParseYaml {
-      e,
       path: file.to_path_buf(),
+      message: redact_yaml_error(&e),
     })?,
     Some("json") => serde_json::from_str(contents).map_err(|e| {
       Error::ParseJson {
-        e,
         path: file.to_path_buf(),
+        message: redact_serde_error(&e),
       }
     })?,
     Some(_) | None => {

@@ -34,7 +34,7 @@ use mogh_auth_client::{
   },
 };
 use mogh_error::AddStatusCodeError as _;
-use mogh_rate_limit::WithFailureRateLimit as _;
+use mogh_rate_limit::{FailedAttempt, WithFailureRateLimit as _};
 use mogh_request_ip::RequestIp;
 use tracing::{error, info, instrument};
 
@@ -182,6 +182,8 @@ fn error_response(e: mogh_error::Error) -> Response {
 /// Everything but the token's own rejection (`invalid_*`, the rate
 /// limit, an unavailable provider) is logged here and reported as
 /// a bare `server_error`: the reasons may include internal details.
+/// The descriptions of failures counted against the rate limit note
+/// the attempts left (`... | You have 2 attempts remaining`).
 pub fn token_exchange_error(
   e: &mogh_error::Error,
 ) -> (StatusCode, TokenExchangeError) {
@@ -191,7 +193,7 @@ pub fn token_exchange_error(
         StatusCode::BAD_REQUEST,
         TokenExchangeError {
           error: oauth.code.to_string(),
-          error_description: Some(oauth.description.clone()),
+          error_description: Some(oauth_description(e, oauth)),
         },
       )
     } else if [
@@ -231,6 +233,19 @@ pub fn token_exchange_error(
       )
     };
   (status, error)
+}
+
+/// The description of the OAuth error `e` was found to be. A failed
+/// exchange counts against the rate limit, which notes how many
+/// attempts are left, as it does on the other errors' descriptions.
+fn oauth_description(
+  e: &mogh_error::Error,
+  oauth: &OauthError,
+) -> String {
+  match e.error.downcast_ref::<FailedAttempt>() {
+    Some(attempt) => attempt.annotate(&oauth.description),
+    None => oauth.description.clone(),
+  }
 }
 
 /// Token responses must not be cached (RFC 6749 section 5.1).
@@ -927,6 +942,7 @@ mod tests {
     },
     passkey::Passkey,
   };
+  use mogh_rate_limit::RateLimiter;
 
   use super::*;
   use crate::{
@@ -992,6 +1008,8 @@ mod tests {
     synced: Arc<Mutex<Vec<ExternalLoginInfo>>>,
     logins: Arc<Mutex<Vec<Login>>>,
     jwt: JwtProvider,
+    /// Disabled, unless a test enables it.
+    rate_limiter: Arc<RateLimiter>,
   }
 
   impl TestAuth {
@@ -1009,6 +1027,7 @@ mod tests {
         synced: Default::default(),
         logins: Default::default(),
         jwt: JwtProvider::new(b"test-jwt-secret", JWT_TTL_MS),
+        rate_limiter: RateLimiter::new(true, 0, Default::default()),
       }
     }
   }
@@ -1098,6 +1117,10 @@ mod tests {
 
     fn jwt_provider(&self) -> &JwtProvider {
       &self.jwt
+    }
+
+    fn general_rate_limiter(&self) -> &RateLimiter {
+      &self.rate_limiter
     }
   }
 
@@ -1951,6 +1974,90 @@ mod tests {
     assert!(err.error.downcast_ref::<RoleNotFound>().is_some());
     // Only the successful exchange synced the user
     assert_eq!(auth.synced.lock().unwrap().len(), 1);
+  }
+
+  /// [exchange_token] is [exchange] behind the app's failure rate
+  /// limit, which must keep the errors' types: the OAuth codes of
+  /// the endpoint and the [RoleNotFound] apps tell apart.
+  #[tokio::test]
+  async fn test_exchange_token_errors_keep_their_type() {
+    let mut auth = TestAuth::with_user(None);
+    auth.rate_limiter =
+      RateLimiter::new(false, 3, std::time::Duration::from_secs(60));
+    let exchange_token = |request, role: Option<&str>| {
+      exchange_token(
+        &auth,
+        IP,
+        request,
+        TokenExchangeOptions {
+          role: role.map(String::from),
+        },
+      )
+    };
+
+    let mut request = TokenExchangeRequest::id_token(token().mint());
+    request.grant_type = String::from("client_credentials");
+    let err = exchange_token(request, None).await.unwrap_err();
+    assert_eq!(code(&err), "unsupported_grant_type");
+    let (status, body) = token_exchange_error(&err);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      body,
+      TokenExchangeError {
+        error: String::from("unsupported_grant_type"),
+        // The caller is still told how many attempts are left.
+        error_description: Some(format!(
+          "Only '{GRANT_TYPE_TOKEN_EXCHANGE}' is supported | You have 2 attempts remaining"
+        )),
+      }
+    );
+
+    let err =
+      exchange_token(TokenExchangeRequest::id_token(""), None)
+        .await
+        .unwrap_err();
+    let (status, body) = token_exchange_error(&err);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      body,
+      TokenExchangeError {
+        error: String::from("invalid_request"),
+        error_description: Some(String::from(
+          "'subject_token' is empty | You have 1 attempts remaining"
+        )),
+      }
+    );
+
+    let err = exchange_token(
+      TokenExchangeRequest::id_token(token().mint()),
+      Some("nope"),
+    )
+    .await
+    .unwrap_err();
+    let not_found = err.error.downcast_ref::<RoleNotFound>().unwrap();
+    assert_eq!(not_found.role, "nope");
+    let (status, body) = token_exchange_error(&err);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      body,
+      TokenExchangeError {
+        error: String::from("invalid_grant"),
+        error_description: Some(String::from(
+          "No login provider or workload rule 'nope' accepts tokens of this issuer | You have 0 attempts remaining"
+        )),
+      }
+    );
+
+    // Out of attempts
+    let err = exchange_token(
+      TokenExchangeRequest::id_token(token().mint()),
+      None,
+    )
+    .await
+    .unwrap_err();
+    let (status, body) = token_exchange_error(&err);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body.error, "temporarily_unavailable");
   }
 
   async fn error_body(

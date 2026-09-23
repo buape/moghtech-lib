@@ -99,7 +99,8 @@ pub struct CoreConfig {
   pub lock_login_credentials_for: Vec<String>,
   pub bcrypt_cost: u32,
   /// Changes to how a user logs in (password, 2fa, api keys, ...) need
-  /// a login at most this long ago. 0 disables the check.
+  /// a login at most this long ago. 0 disables the check for
+  /// sessions; api keys are refused them either way.
   pub reauthentication_window_seconds: u64,
   /// Send the browser back to the login page when an external
   /// login fails, instead of answering with the JSON error.

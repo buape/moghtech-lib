@@ -365,16 +365,21 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// a token issued at most this many seconds ago: passwords, usernames,
   /// 2fa, linked logins, new api keys, login providers, trusted issuers.
   /// A token which leaked is then not enough to take over the account
-  /// for good. `0` disables the check. Default: 15 minutes.
+  /// for good. `0` disables the check for sessions. Default: 15 minutes.
   ///
   /// - Older tokens get `403 Forbidden`, with a message starting with
   ///   [REAUTHENTICATION_REQUIRED][mogh_auth_client::api::manage::REAUTHENTICATION_REQUIRED].
   ///   The user has to log in again, which includes their second factor.
-  /// - Api keys have no login to be recent, and are refused for these
-  ///   requests while the check is enabled.
-  /// - The time is the `iat` of a token of [Self::jwt_provider]. Apps
-  ///   validating other tokens in [Self::get_user_id_from_request_authentication]
-  ///   should disable this, or those tokens are always refused.
+  /// - Api keys have no login to be recent: they get the same `403`
+  ///   for these requests whatever the window, `0` included. Except
+  ///   the requests which manage resources rather than the caller's
+  ///   account (login providers, trusted issuers, whose handlers
+  ///   require an admin), which an admin's key may make.
+  /// - The time is the `iat` of a token of [Self::jwt_provider]. Other
+  ///   tokens which [Self::get_user_id_from_request_authentication]
+  ///   accepts have no known login and count as api keys: they are
+  ///   refused the account requests whatever the window, and may make
+  ///   only the resource requests.
   fn reauthentication_window_secs(&self) -> u64 {
     15 * 60
   }

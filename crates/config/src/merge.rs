@@ -6,6 +6,8 @@ use crate::{Error, Result};
 /// - Source will overide target.
 /// - Will recurse when field is object if merge_object = true, otherwise object will be replaced.
 /// - Will extend when field is array if extend_array = true, otherwise array will be replaced.
+///   A string source onto an array (an env file's comma separated list,
+///   `HOSTS=a,b`) extends it with the list's entries.
 /// - Will return error when types on source and target fields do not match.
 pub fn merge_objects(
   mut target: serde_json::Map<String, serde_json::Value>,
@@ -52,6 +54,20 @@ pub fn merge_objects(
         match value {
           serde_json::Value::Array(source_arr) => {
             target_arr.extend(source_arr);
+            target.insert(key, serde_json::Value::Array(target_arr));
+          }
+          // An env file source lists values comma separated, the
+          // same syntax the final deserialization splits.
+          serde_json::Value::String(list) => {
+            target_arr.extend(
+              list
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| {
+                  serde_json::Value::String(entry.to_string())
+                }),
+            );
             target.insert(key, serde_json::Value::Array(target_arr));
           }
           _ => {
@@ -229,5 +245,65 @@ mod tests {
   fn merge_config_rejects_non_objects() {
     let err = merge_config(1_i64, 2_i64, false, false).unwrap_err();
     assert!(matches!(err, Error::ValueIsNotObject));
+  }
+
+  /// merge_config round trips through json, where every map key is
+  /// a string: integer, bool and newtype keys come back typed.
+  #[test]
+  fn merge_config_keeps_typed_map_keys() {
+    use std::collections::{BTreeMap, HashMap};
+
+    #[derive(
+      serde::Serialize,
+      serde::Deserialize,
+      Debug,
+      PartialEq,
+      Eq,
+      Hash,
+      PartialOrd,
+      Ord,
+    )]
+    struct Id(String);
+
+    #[derive(
+      serde::Serialize, serde::Deserialize, Debug, PartialEq,
+    )]
+    struct Config {
+      ports: HashMap<u16, String>,
+      limits: BTreeMap<u64, u32>,
+      flags: HashMap<bool, String>,
+      owners: BTreeMap<Id, String>,
+    }
+    let target = Config {
+      ports: HashMap::from([(8080, "api".into())]),
+      limits: BTreeMap::from([(10, 1)]),
+      flags: HashMap::from([(true, "on".into())]),
+      owners: BTreeMap::from([(Id("a".into()), "x".into())]),
+    };
+    let source = Config {
+      ports: HashMap::from([(9090, "metrics".into())]),
+      limits: BTreeMap::from([(10, 2)]),
+      flags: HashMap::from([(false, "off".into())]),
+      owners: BTreeMap::from([(Id("b".into()), "y".into())]),
+    };
+    let merged = merge_config(target, source, true, false).unwrap();
+    assert_eq!(
+      merged,
+      Config {
+        ports: HashMap::from([
+          (8080, "api".into()),
+          (9090, "metrics".into())
+        ]),
+        limits: BTreeMap::from([(10, 2)]),
+        flags: HashMap::from([
+          (true, "on".into()),
+          (false, "off".into())
+        ]),
+        owners: BTreeMap::from([
+          (Id("a".into()), "x".into()),
+          (Id("b".into()), "y".into())
+        ]),
+      }
+    );
   }
 }

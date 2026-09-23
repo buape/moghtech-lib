@@ -499,3 +499,375 @@ fn cicada_path_without_the_feature_is_an_error() {
   );
   assert!(err.to_string().contains("'cicada' feature"));
 }
+
+#[derive(serde::Deserialize, Debug, PartialEq)]
+struct Typed {
+  db_password: String,
+  port: u16,
+  debug: bool,
+  #[serde(default)]
+  allowed_hosts: Vec<String>,
+  #[serde(default)]
+  region: Option<String>,
+  #[serde(default = "default_title")]
+  title: String,
+}
+
+fn default_title() -> String {
+  String::from("untitled")
+}
+
+fn load_typed(paths: &[&Path]) -> mogh_config::Result<Typed> {
+  ConfigLoader {
+    paths,
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Typed>()
+}
+
+#[test]
+fn env_files_are_config_sources_with_envy_semantics() {
+  let dir = TestDir::new("env_file_source");
+  let toml = dir.write(
+    "defaults.toml",
+    "port = 1\ndebug = false\ntitle = \"app\"",
+  );
+  // Names lowercase to the struct's fields, values coerce into
+  // their types, comma lists become vectors.
+  let env = dir.write(
+    ".env",
+    "# secrets\nexport DB_PASSWORD=\"hunter2 \\\"quoted\\\"\"\nPORT=8080\nDEBUG=true\nALLOWED_HOSTS=a.example.com, b.example.com\nREGION=eu\n",
+  );
+  let config = load_typed(&[&toml, &env]).unwrap();
+  assert_eq!(
+    config,
+    Typed {
+      db_password: "hunter2 \"quoted\"".into(),
+      port: 8080,
+      debug: true,
+      allowed_hosts: vec![
+        "a.example.com".into(),
+        "b.example.com".into()
+      ],
+      region: Some("eu".into()),
+      title: "app".into(),
+    }
+  );
+  // Later paths still win: a toml after the env file overrides it.
+  let override_toml = dir.write("override.toml", "port = 9090");
+  let config = load_typed(&[&toml, &env, &override_toml]).unwrap();
+  assert_eq!(config.port, 9090);
+  assert_eq!(config.db_password, "hunter2 \"quoted\"");
+}
+
+#[test]
+fn env_extension_files_are_env_files_too() {
+  let dir = TestDir::new("env_extension");
+  let env = dir.write(
+    "app.env",
+    "DB_PASSWORD=x\nPORT=443\nDEBUG=false\nALLOWED_HOSTS=\n",
+  );
+  let config = load_typed(&[&env]).unwrap();
+  assert_eq!(config.port, 443);
+  // An empty list value is an empty vector, not one empty entry.
+  assert!(config.allowed_hosts.is_empty());
+  assert_eq!(config.region, None);
+  assert_eq!(config.title, "untitled");
+}
+
+#[test]
+fn env_file_values_are_never_interpolated() {
+  let var = "MOGH_CONFIG_TEST_ENV_FILE_VAR";
+  unsafe { std::env::set_var(var, "expanded") };
+  let dir = TestDir::new("env_file_verbatim");
+  // The toml value interpolates, the env file's does not (a secret
+  // holding `$(...)` must not run anything).
+  let toml = dir
+    .write("config.toml", &format!("interpolated = \"${{{var}}}\""));
+  let env = dir
+    .write(".env", &format!("VERBATIM=${{{var}}} $(echo) still\n"));
+  let config = load(&[&toml, &env], &[], true, false);
+  assert_eq!(
+    config,
+    serde_json::json!({
+      "interpolated": "expanded",
+      "verbatim": format!("${{{var}}} $(echo) still"),
+    })
+  );
+}
+
+#[test]
+fn string_values_coerce_from_interpolation_too() {
+  let var = "MOGH_CONFIG_TEST_PORT_VAR";
+  unsafe { std::env::set_var(var, "7070") };
+  let dir = TestDir::new("interpolated_coercion");
+  let toml = dir.write(
+    "config.toml",
+    &format!(
+      "db_password = \"x\"\nport = \"${{{var}}}\"\ndebug = \"true\""
+    ),
+  );
+  let config = load_typed(&[&toml]).unwrap();
+  assert_eq!(config.port, 7070);
+  assert!(config.debug);
+}
+
+#[test]
+fn env_file_errors_name_the_line_not_the_value() {
+  let dir = TestDir::new("env_file_errors");
+  // A malformed file is reported and skipped like a malformed toml.
+  let bad = dir.write(".env", "DB_PASSWORD=x\nnot an entry\n");
+  let good = dir.write(
+    "app.env",
+    "DB_PASSWORD=hunter2secret\nPORT=notaport\nDEBUG=true\n",
+  );
+  let err = load_typed(&[&bad, &good]).unwrap_err().to_string();
+  assert!(err.contains("at 'port'"), "{err}");
+  assert!(err.contains("expected u16"), "{err}");
+  assert!(!err.contains("notaport"), "{err}");
+  assert!(!err.contains("hunter2secret"), "{err}");
+  let err = mogh_config::parse_env_file("A=1\nnope").unwrap_err();
+  assert_eq!(err.line, 2);
+}
+
+#[test]
+fn dotted_env_names_nest_into_structs() {
+  #[derive(serde::Deserialize, Debug, PartialEq)]
+  struct Database {
+    address: String,
+    username: String,
+    password: String,
+    #[serde(default)]
+    pool_size: u32,
+  }
+  #[derive(serde::Deserialize, Debug, PartialEq)]
+  struct Config {
+    title: String,
+    database: Database,
+  }
+  let dir = TestDir::new("dotted_env_names");
+  // Defaults in toml, secrets from the env file; the nested merge
+  // keeps the toml keys the env file does not set.
+  let toml = dir.write(
+    "defaults.toml",
+    "title = \"app\"\n[database]\naddress = \"localhost:5432\"\npool_size = 4\n",
+  );
+  let env = dir.write(
+    ".env",
+    "DATABASE.ADDRESS=db.example.com:5432\nDATABASE.USERNAME=app\nDATABASE.PASSWORD=\"hunter2\"\n",
+  );
+  let config = ConfigLoader {
+    paths: &[&toml, &env],
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Config>()
+  .unwrap();
+  assert_eq!(
+    config,
+    Config {
+      title: "app".into(),
+      database: Database {
+        address: "db.example.com:5432".into(),
+        username: "app".into(),
+        password: "hunter2".into(),
+        pool_size: 4,
+      },
+    }
+  );
+  // A conflicting file is refused (reported and skipped, like a
+  // malformed toml), and the error names the line, not the value.
+  let bad = dir
+    .write("bad.env", "DATABASE=secretvalue\nDATABASE.ADDRESS=x\n");
+  let err = mogh_config::parse_env_file_object(
+    &std::fs::read_to_string(&bad).unwrap(),
+  )
+  .unwrap_err();
+  assert_eq!(err.line, 2);
+  assert!(!err.to_string().contains("secretvalue"));
+}
+
+/// Cicada accepts secret names which cannot nest on dots (a
+/// Kubernetes style `.dockerconfigjson`, `a..b`): each loads as one
+/// flat key rather than failing the whole source, and the rest of
+/// the file still nests. Only real conflicts fail it.
+#[test]
+fn env_names_that_cannot_nest_stay_flat_keys() {
+  #[derive(serde::Deserialize, Debug, PartialEq)]
+  struct Database {
+    address: String,
+  }
+  #[derive(serde::Deserialize, Debug, PartialEq)]
+  struct Config {
+    #[serde(rename = ".dockerconfigjson")]
+    docker_config_json: String,
+    #[serde(rename = "a..b")]
+    a_b: u16,
+    database: Database,
+  }
+  let dir = TestDir::new("flat_env_names");
+  let env = dir.write(
+    ".env",
+    ".dockerconfigjson={\"auths\":{}}\nA..B=7\nDATABASE.ADDRESS=db:5432\n",
+  );
+  let config = ConfigLoader {
+    paths: &[&env],
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Config>()
+  .unwrap();
+  assert_eq!(
+    config,
+    Config {
+      docker_config_json: "{\"auths\":{}}".into(),
+      a_b: 7,
+      database: Database {
+        address: "db:5432".into(),
+      },
+    }
+  );
+  // Two names which collide after lowercasing still fail, naming
+  // the line and both names (never a value).
+  let err =
+    mogh_config::parse_env_file_object("DB=secretvalue\ndb=other")
+      .unwrap_err();
+  assert_eq!(err.line, 2);
+  assert_eq!(
+    err.to_string(),
+    "line 2: `db` conflicts with `DB` (line 1): names are case insensitive"
+  );
+}
+
+#[test]
+fn env_lists_extend_arrays_under_extend_array() {
+  let dir = TestDir::new("env_list_extend");
+  let toml = dir.write("a.toml", "hosts = [\"a\"]\nport = 1\n");
+  let env = dir.write("b.env", "HOSTS=b, c\nPORT=2\n");
+  // extend_array: the list extends, and the rest of the env file
+  // still applies (it used to be dropped with a type mismatch).
+  let config = load(&[&toml, &env], &[], true, true);
+  assert_eq!(
+    config,
+    serde_json::json!({ "hosts": ["a", "b", "c"], "port": "2" })
+  );
+  // Without it, the list replaces.
+  let config = load(&[&toml, &env], &[], true, false);
+  assert_eq!(
+    config,
+    serde_json::json!({ "hosts": "b, c", "port": "2" })
+  );
+}
+
+#[test]
+fn directory_scans_only_load_env_files_by_wildcard() {
+  let dir = TestDir::new("env_dir_scan");
+  dir.write("main.toml", "port = 1\n");
+  // A compose style `.env` next to the config.
+  dir.write(".env", "PORT=99\nCOMPOSE_PROJECT_NAME=x\n");
+  // No wildcards: every toml, no env file.
+  let config = load(&[&dir.0], &[], true, false);
+  assert_eq!(config, serde_json::json!({ "port": 1 }));
+  // Asked for by wildcard: loaded, and later than main.toml (a later
+  // wildcard wins within the directory).
+  let config = load(&[&dir.0], &["*.toml", ".env"], true, false);
+  assert_eq!(
+    config,
+    serde_json::json!({ "port": "99", "compose_project_name": "x" })
+  );
+}
+
+#[test]
+fn coercion_errors_inside_lists_report_the_string() {
+  #[derive(serde::Deserialize, Debug)]
+  #[allow(dead_code)]
+  struct Pins {
+    pins: Vec<u8>,
+  }
+  let dir = TestDir::new("list_error_path");
+  let env = dir.write(".env", "PINS=1, secretx, 3\n");
+  let err = ConfigLoader {
+    paths: &[&env],
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Pins>()
+  .unwrap_err()
+  .to_string();
+  assert!(err.contains("at 'pins[1]'"), "{err}");
+  assert!(err.contains("found string"), "{err}");
+  assert!(!err.contains("secretx"), "{err}");
+}
+
+/// A json key is a string, and it coerces into the map's key type,
+/// as it did before the lenient final deserialization: typed toml
+/// keys and env file keys alike.
+#[test]
+fn map_keys_coerce_into_their_types() {
+  use std::collections::{BTreeMap, HashMap};
+
+  #[derive(serde::Deserialize, Debug, PartialEq, Eq, Hash)]
+  struct Team(String);
+
+  #[derive(serde::Deserialize, Debug, PartialEq, Eq, Hash)]
+  #[serde(rename_all = "snake_case")]
+  enum Stage {
+    PreRelease,
+    Stable,
+  }
+
+  #[derive(serde::Deserialize, Debug)]
+  struct Config {
+    ports: HashMap<u16, String>,
+    limits: BTreeMap<u64, u32>,
+    flags: HashMap<bool, String>,
+    owners: HashMap<Team, String>,
+    stages: HashMap<Stage, u8>,
+  }
+  let dir = TestDir::new("map_keys");
+  let toml = dir.write(
+    "config.toml",
+    "[ports]\n8080 = \"api\"\n[limits]\n10 = 1\n[flags]\ntrue = \"on\"\n[owners]\nops = \"max\"\n[stages]\npre_release = 1\n",
+  );
+  let env = dir.write(
+    ".env",
+    "PORTS.9090=metrics\nLIMITS.10=2\nSTAGES.STABLE=3\n",
+  );
+  let config = ConfigLoader {
+    paths: &[&toml, &env],
+    match_wildcards: &[],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Config>()
+  .unwrap();
+  assert_eq!(
+    config.ports,
+    HashMap::from([(8080, "api".into()), (9090, "metrics".into())])
+  );
+  assert_eq!(config.limits, BTreeMap::from([(10, 2)]));
+  assert_eq!(config.flags, HashMap::from([(true, "on".into())]));
+  assert_eq!(
+    config.owners,
+    HashMap::from([(Team("ops".into()), "max".into())])
+  );
+  assert_eq!(
+    config.stages,
+    HashMap::from([(Stage::PreRelease, 1), (Stage::Stable, 3)])
+  );
+}
