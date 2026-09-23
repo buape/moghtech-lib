@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_auth_client"
-version = "4.2.0"
+version = "4.2.1"
 dependencies = [
  "anyhow",
  "mogh_error",
