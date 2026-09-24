@@ -9,7 +9,8 @@
 //!   whitespace such as `" "` or a tab stays a valid char.
 //! - A sequence (`Vec<T>`, tuples) splits a string on commas,
 //!   entries trimmed and empty ones dropped, so `""` is an empty
-//!   list; each entry coerces in turn.
+//!   list; each entry coerces in turn. A tuple or `[T; N]` given
+//!   more entries than it has is an error, as in serde_json.
 //! - `Option<T>` is `Some` (only `null` is `None`).
 //! - A unit enum variant matches the string.
 //! - A `String` stays what it is.
@@ -81,13 +82,8 @@ impl<'de> Deserializer<'de> for Lenient {
       Value::Bool(b) => visitor.visit_bool(b),
       Value::Number(n) => n.deserialize_any(visitor),
       Value::String(s) => visitor.visit_string(s),
-      Value::Array(items) => visitor.visit_seq(Seq {
-        iter: items.into_iter(),
-      }),
-      Value::Object(map) => visitor.visit_map(Map {
-        iter: map.into_iter(),
-        value: None,
-      }),
+      Value::Array(items) => visit_array(items, visitor),
+      Value::Object(map) => visit_object(map, visitor),
     }
   }
 
@@ -158,9 +154,7 @@ impl<'de> Deserializer<'de> for Lenient {
     V: Visitor<'de>,
   {
     match self.string() {
-      Some(s) => visitor.visit_seq(Seq {
-        iter: split_list(s).into_iter(),
-      }),
+      Some(s) => visit_array(split_list(s), visitor),
       None => self.deserialize_any(visitor),
     }
   }
@@ -327,6 +321,50 @@ fn split_list(s: &str) -> Vec<Value> {
     .filter(|entry| !entry.is_empty())
     .map(|entry| Value::String(entry.to_string()))
     .collect()
+}
+
+/// Visits the items as a sequence. A visitor which stops early (a
+/// tuple, `[T; N]`) leaving items unread is an error, as in
+/// serde_json, rather than the rest being dropped silently.
+fn visit_array<'de, V: Visitor<'de>>(
+  items: Vec<Value>,
+  visitor: V,
+) -> Result<V::Value, Error> {
+  let len = items.len();
+  let mut seq = Seq {
+    iter: items.into_iter(),
+  };
+  let value = visitor.visit_seq(&mut seq)?;
+  if seq.iter.len() == 0 {
+    Ok(value)
+  } else {
+    Err(serde::de::Error::invalid_length(
+      len,
+      &"fewer elements in array",
+    ))
+  }
+}
+
+/// Visits the entries as a map, erroring like [visit_array] on
+/// entries left unread.
+fn visit_object<'de, V: Visitor<'de>>(
+  map: serde_json::Map<String, Value>,
+  visitor: V,
+) -> Result<V::Value, Error> {
+  let len = map.len();
+  let mut access = Map {
+    iter: map.into_iter(),
+    value: None,
+  };
+  let value = visitor.visit_map(&mut access)?;
+  if access.iter.len() == 0 {
+    Ok(value)
+  } else {
+    Err(serde::de::Error::invalid_length(
+      len,
+      &"fewer elements in map",
+    ))
+  }
 }
 
 struct Seq {
@@ -592,6 +630,49 @@ mod tests {
     assert!(err.to_string().contains("expected u16"), "{err}");
     assert!(
       from::<HashMap<Stage, u8>>(json!({ "beta": 1 })).is_err()
+    );
+  }
+
+  /// A tuple or fixed size array reads as many entries as it has:
+  /// more is an error (as in serde_json), not the rest dropped.
+  #[test]
+  fn extra_sequence_entries_are_an_error() {
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Pair(u8, u8);
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Fixed {
+      pair: (u8, u8),
+      key: [u8; 2],
+    }
+
+    assert!(from::<(u8, u8)>(json!([1, 2, 3])).is_err());
+    assert!(from::<[u8; 2]>(json!([9, 8, 7, 6])).is_err());
+    assert!(from::<Pair>(json!([1, 2, 3])).is_err());
+    let err = from::<(u8, u8)>(json!("1,2,3")).unwrap_err();
+    assert!(
+      err.to_string().contains("expected fewer elements in array"),
+      "{err}"
+    );
+    assert!(
+      from::<Fixed>(json!({ "pair": [1, 2, 3], "key": [9, 8] }))
+        .is_err()
+    );
+
+    // Exactly enough is fine, from an array or a string.
+    assert_eq!(
+      from::<Fixed>(json!({ "pair": "1, 2", "key": [9, 8] }))
+        .unwrap(),
+      Fixed {
+        pair: (1, 2),
+        key: [9, 8]
+      }
+    );
+    assert_eq!(from::<Pair>(json!(["1", 2])).unwrap(), Pair(1, 2));
+    // A Vec reads them all.
+    assert_eq!(
+      from::<Vec<u8>>(json!("1,2,3")).unwrap(),
+      vec![1, 2, 3]
     );
   }
 

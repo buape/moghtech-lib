@@ -62,6 +62,23 @@ fn a_cicada_source_which_fails_to_load_is_an_error() {
     debug_print: false,
   }
   .load::<Config>();
+
+  // A `cicada:` line in an include file is a cicada source too (it
+  // used to be dropped as a missing local path).
+  std::fs::write(
+    dir.join(".include"),
+    "cicada://app/included.env?env=prod # the secrets\n",
+  )
+  .unwrap();
+  let included = ConfigLoader {
+    paths: &[&dir],
+    match_wildcards: &["*.toml"],
+    include_file_name: ".include",
+    merge_nested: true,
+    extend_array: false,
+    debug_print: false,
+  }
+  .load::<Config>();
   let _ = std::fs::remove_dir_all(&dir);
 
   let err = res.unwrap_err();
@@ -74,4 +91,10 @@ fn a_cicada_source_which_fails_to_load_is_an_error() {
     err.to_string().contains("cicada://app/secrets.env"),
     "{err}"
   );
+
+  let err = included.unwrap_err();
+  let Error::CicadaLoad { path, .. } = &err else {
+    panic!("expected a cicada load error, got {err}");
+  };
+  assert_eq!(path, Path::new("cicada://app/included.env?env=prod"));
 }

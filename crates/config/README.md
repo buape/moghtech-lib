@@ -4,19 +4,30 @@ Module for comprehensive loading of strongly typed configuration files using `st
 
 - Supports parsing JSON, YAML, TOML, and env files (`.env`, `*.env`).
 - Supports merging final configuration from multiple supplied files / directories.
-- Supports `${ENV_VAR}` and `$(shell_command)` interpolation in values of
+- Supports `${ENV_VAR}` and `$(command)` interpolation in values of
   local toml / yaml / json files (not in env files or in files loaded
-  from Cicada, whose values are secrets taken verbatim).
+  from Cicada, whose values are secrets taken verbatim). `$(command)` runs
+  a single command word (letters, digits, `_`) without arguments, eg.
+  `$(hostname)`; anything else, like `$(cat /run/secrets/db)` or
+  `${VAR:-default}`, is kept as written, with a warning naming the key.
 - Coerces string values into the field's type the way `envy` reads the
   process environment: numbers, booleans, comma separated lists into
   `Vec`s, `Option`, enum variants. Not inside `#[serde(flatten)]` fields
   or untagged / internally tagged enums, which serde buffers as-is.
 
 Priority (later overrides earlier): `paths` in order given. Within a directory,
-its own files (by wildcard, then name), then each path in the include file in
-the order listed, recursively, so includes override the directory's own files.
+its own files (by wildcard, then name; a file matching several wildcards takes
+the last one it matches), then each path in the include file in the order
+listed, recursively, so includes override the directory's own files. A file
+reached twice (listed as a path and found by a directory scan) is loaded once,
+at its later position. A wildcard which doesn't compile is an error
+(`Error::InvalidWildcard`), never a dropped filter.
 
-```rust
+```rust,no_run
+use std::path::Path;
+
+use mogh_config::ConfigLoader;
+
 #[derive(serde::Deserialize)]
 struct Config {
   title: String,
@@ -27,8 +38,8 @@ struct Config {
 
 let config = (ConfigLoader {
   // Read config files from a directory
-  paths: vec![PathBuf::from("./configs")],
-  match_wildcards: vec![String::from("*config*.toml")],
+  paths: &[Path::new("./configs")],
+  match_wildcards: &["*config*.toml"],
   // It won't recurse into subdirectories unless they include '.configinclude' file
   include_file_name: ".configinclude",
   merge_nested: true,
@@ -38,6 +49,15 @@ let config = (ConfigLoader {
 .load::<Config>()
 .expect("Failed to parse config from path");
 ```
+
+Merging: each source merges over the ones before it, and is never dropped
+over a type conflict. With `merge_nested`, two objects merge key by key; with
+`extend_array`, an array extends the one before it. A `null` (a yaml section
+with every line commented out) keeps the object or array before it. Any other
+value replaces the one before it, as it does without those flags, and a value
+the config type can't take fails the final deserialization with its path and
+type (never the value). `mogh_config::merge_objects` keeps its stricter rules
+(a type mismatch is an error) for callers merging anything else.
 
 ## Env files
 
@@ -50,7 +70,8 @@ coerced into the field's type, so the same struct reads a toml file, an
 env file, or both merged. A name with an empty segment cannot nest
 (`.dockerconfigjson`, `A..B`, `A.`), so it is kept whole as one flat key,
 lowercased (`.dockerconfigjson`, `a..b`; reach it with
-`#[serde(rename = ".dockerconfigjson")]`). A name that is both a value and
+`#[serde(rename = ".dockerconfigjson")]`). Nesting stops at 32 segments: a
+longer name is one flat key too. A name that is both a value and
 an object (`DATABASE=x` next to `DATABASE.ADDRESS=y`), or two names equal
 once lowercased (`DB` and `db`), is an error naming the line and both
 names. Values are never interpolated: they are secrets, not templates.
@@ -64,9 +85,10 @@ DATABASE.USERNAME=app
 DATABASE.PASSWORD="hunter2"
 ```
 
-A comma separated value merged onto an array from an earlier source
-extends it under `extend_array` (`HOSTS=b,c` onto `["a"]` gives
-`["a", "b", "c"]`), and replaces it otherwise.
+A comma separated value from an env file merged onto an array from an earlier
+source extends it under `extend_array` (`HOSTS=b,c` onto `["a"]` gives
+`["a", "b", "c"]`), and replaces it otherwise (the final deserialization
+splits it into the list).
 
 List an env file as a path, or match it with a directory wildcard
 (`*.env`, `.env`): a directory scanned without wildcards skips env files,
@@ -81,11 +103,12 @@ so a compose `.env` next to the config files is not read by accident.
   for the environments themselves as an env file. It pulls the Cicada client
   into the build, so it is opt in:
   `mogh_config = { version = "3", features = ["cicada"] }`.
-  Without it a `cicada:` path is an error, not a skipped path. With it, a
-  `cicada:` source which fails to load (`Error::CicadaLoad`: Core unreachable,
-  the device not onboarded or not granted the environments, the file missing)
-  or to parse is an error too, rather than starting the app with its
-  defaults; only a missing or malformed local file is skipped. The loader is
+  A `cicada:` line in an include file is a source like a `cicada:` path.
+  Without the feature a `cicada:` path is an error, not a skipped path. With
+  it, a `cicada:` source which fails to load (`Error::CicadaLoad`: Core
+  unreachable, the device not onboarded or not granted the environments, the
+  file missing) or to parse is an error too, rather than starting the app with
+  its defaults; only a missing or malformed local file is skipped. The loader is
   re-exported as `mogh_config::cicada`, so an application can start its
   background (`cicada::spawn()`, or `CICADA_BACKGROUND=true`) and react to
   configuration changes (`cicada::on_change`, `cicada::subscribe`) without

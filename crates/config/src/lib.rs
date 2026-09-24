@@ -1,8 +1,11 @@
 //! # Mogh Config
 //!
 //! This library is used to parse Core, Periphery, and CLI config files.
-//! It supports interpolating in environment variables (only '${VAR}' syntax),
-//! as well as merging together multiple files into a final configuration object.
+//! It supports interpolating environment variables (`${VAR}`) and
+//! command output (`$(command)`, a single command word without
+//! arguments) into the values of local toml / yaml / json files, as
+//! well as merging together multiple files into a final
+//! configuration object.
 //!
 //! Sources are toml, yaml, json, and env files (`.env`, `*.env`):
 //! flat `NAME=value` entries whose names are lowercased to match
@@ -17,12 +20,12 @@
 //! With the `cicada` feature, `cicada://filesystem/path.yaml?env=a+b`
 //! loads a file from Cicada interpolated with the environments, and
 //! `cicada://.env?env=a+b` the environments themselves as an env
-//! file; the loader is re-exported as [cicada].
+//! file; the loader is re-exported as `cicada`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
-use indexmap::IndexSet;
+use indexmap::IndexMap;
 use serde::de::DeserializeOwned;
 
 mod env_file;
@@ -55,6 +58,21 @@ pub use cicada_loader as cicada;
 
 pub type Result<T> = ::core::result::Result<T, Error>;
 
+/// Compiles the README's examples, so they keep up with the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+/// The key deduping a file reached by several paths (as given,
+/// through a directory scan, an include, a symlink): its canonical
+/// path. A cicada source is its own key.
+fn dedupe_key(path: &Path) -> PathBuf {
+  if load::is_cicada_path(path) {
+    return path.to_path_buf();
+  }
+  path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Set the configuration for loading config files.
 pub struct ConfigLoader<'outer, 'inner> {
   /// Paths to either files or directories
@@ -68,7 +86,14 @@ pub struct ConfigLoader<'outer, 'inner> {
   /// Patterns coming later in the array (higher index) will override
   /// configuration added by earlier patterns, however this is
   /// only relavant within an individual directory. Later `paths`
-  /// and later includes will still have higher priority.
+  /// and later includes will still have higher priority. A file
+  /// matching several patterns takes the priority of the last one,
+  /// so `["*config.*", "*config.local.*"]` applies
+  /// `core.config.local.toml` over `core.config.toml`.
+  ///
+  /// A pattern which doesn't compile is an error
+  /// ([Error::InvalidWildcard]). With no patterns, a directory scan
+  /// loads every file in it except env files.
   pub match_wildcards: &'outer [&'inner str],
   /// The file name to search for `.include` file.
   ///
@@ -77,17 +102,27 @@ pub struct ConfigLoader<'outer, 'inner> {
   /// in the order listed, recursively, and later includes override
   /// earlier ones. Every include overrides the directory's own
   /// files, so a directory can include shared defaults which are
-  /// then refined by later includes.
+  /// then refined by later includes. A `cicada:` line is a source
+  /// like a `cicada:` path (an error without the `cicada` feature).
   pub include_file_name: &'static str,
   /// Whether to merge nested config objects.
   /// Otherwise, the object will be replaced at
   /// the top-level key by the highest priority config file
   /// in which it is specified.
+  ///
+  /// When merging, a `null` (a yaml section with every line
+  /// commented out) keeps the object, and any other value replaces
+  /// it (the final deserialization reports one the config type
+  /// can't take): a source is never dropped over a type conflict.
   pub merge_nested: bool,
   /// Whether to extend array in configuration files.
   /// Otherwise, the array will be replaced at
   /// the top-level key by the highest priority config file
   /// in which it is specified.
+  ///
+  /// When extending, a `null` adds nothing, an env file's comma
+  /// separated value (`HOSTS=b,c`) adds its entries, and any other
+  /// value replaces the array.
   pub extend_array: bool,
   /// Print some extra information on configuation load.
   ///
@@ -114,20 +149,19 @@ impl ConfigLoader<'_, '_> {
       );
     }
 
-    let mut wildcards = Vec::with_capacity(match_wildcards.len());
-
-    for &wc in match_wildcards {
-      match wildcard::Wildcard::new(wc.as_bytes()) {
-        Ok(wc) => wildcards.push(wc),
-        Err(e) => {
-          println!(
-            "{}: Keyword '{}' is invalid wildcard | {e:?}",
-            "ERROR".red(),
-            wc.bold(),
-          );
-        }
-      }
-    }
+    // A pattern which doesn't compile is an error: dropping it
+    // would widen the filter (to every file, with none left).
+    let wildcards = match_wildcards
+      .iter()
+      .map(|&wc| {
+        wildcard::Wildcard::new(wc.as_bytes()).map_err(|e| {
+          Error::InvalidWildcard {
+            pattern: wc.to_string(),
+            message: e.to_string(),
+          }
+        })
+      })
+      .collect::<Result<Vec<_>>>()?;
 
     if debug_print {
       println!(
@@ -137,25 +171,29 @@ impl ConfigLoader<'_, '_> {
       );
     }
 
-    let mut all_files = IndexSet::new();
+    // The files to load in priority order, by the canonical path
+    // (so one file reached as given and through a directory scan is
+    // loaded once), each loaded from the path it was found at,
+    // which names its type (`app.env` may link to a file without
+    // the extension).
+    let mut all_files = IndexMap::<PathBuf, PathBuf>::new();
+    // If the same file comes up again later on, it should be
+    // removed and reinserted so it maintains higher priority.
+    let mut push = |key: PathBuf, path: PathBuf| {
+      all_files.shift_remove(&key);
+      all_files.insert(key, path);
+    };
 
     for &path in paths {
       // Cicada paths shortcut to all_files.
-      // Note. Must compare against the path as a string,
-      // Path::starts_with compares whole components and misses
-      // the `cicada:some/path` (no slash) form.
       #[cfg(feature = "cicada")]
-      if path.to_string_lossy().starts_with("cicada:") {
-        let path = path.to_path_buf();
-        // If the same path comes up again later on, it should be removed and
-        // reinserted so it maintains higher priority.
-        all_files.shift_remove(&path);
-        all_files.insert(path);
+      if load::is_cicada_path(path) {
+        push(path.to_path_buf(), path.to_path_buf());
         continue;
       }
 
       #[cfg(not(feature = "cicada"))]
-      if path.to_string_lossy().starts_with("cicada:") {
+      if load::is_cicada_path(path) {
         return Err(Error::CicadaFeatureDisabled {
           path: path.to_path_buf(),
         });
@@ -188,21 +226,15 @@ impl ConfigLoader<'_, '_> {
           &wildcards,
           include_file_name,
           debug_print,
-        );
+        )?;
         for path in files {
-          // If the same file comes up again later on, it should be
-          // removed and reinserted so it maintains higher priority.
-          all_files.shift_remove(&path);
-          all_files.insert(path);
+          push(dedupe_key(&path), path);
         }
       } else if metadata.is_file() {
-        let path = path.to_path_buf();
-        // If the same path comes up again later on, it should be removed and
-        // reinserted so it maintains higher priority.
-        all_files.shift_remove(&path);
-        all_files.insert(path);
+        push(dedupe_key(path), path.to_path_buf());
       }
     }
+    let all_files = all_files.into_values().collect::<Vec<_>>();
     if debug_print {
       println!(
         "{}: {}: {all_files:?}",
@@ -211,7 +243,7 @@ impl ConfigLoader<'_, '_> {
       );
     }
     load::load_parse_config_files(
-      &all_files.into_iter().collect::<Vec<_>>(),
+      &all_files,
       merge_nested,
       extend_array,
     )

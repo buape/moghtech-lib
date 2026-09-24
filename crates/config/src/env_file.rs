@@ -15,7 +15,15 @@
 //! lowercased to match struct fields, and dots nest:
 //! `DATABASE.ADDRESS=x` fills `database.address`, so a flat set of
 //! secrets can populate a structured config. A name with an empty
-//! segment (`.dockerconfigjson`, `A..B`) stays one flat key.
+//! segment (`.dockerconfigjson`, `A..B`), or with more than 32
+//! segments, stays one flat key.
+
+/// The most `.` separated segments a name nests into. A name with
+/// more stays one flat key: nesting without a bound lets one long
+/// name (a cicada secret's, say) cost memory quadratic in its
+/// length, and overflow the stack of whatever walks the object
+/// next. yaml and json sources stop at 128 levels of their own.
+const MAX_NESTED_SEGMENTS: usize = 32;
 
 /// Where an env file failed to parse. The message never carries a
 /// value, only what was expected.
@@ -64,6 +72,9 @@ pub fn parse_env_file(
 /// `A..B`, `A.`, `.`), so it is kept whole as one flat key,
 /// lowercased (`.dockerconfigjson`, `a..b`): Cicada accepts such
 /// secret names, and one of them must not fail the whole source.
+/// So is a name with more than 32 `.` separated segments: nesting
+/// stops there, so one long name can't cost memory quadratic in its
+/// length or overflow the stack of what walks the object next.
 ///
 /// Errors, with the line and both names involved: a name that is
 /// both a value and an object (`DATABASE=x` next to
@@ -76,13 +87,16 @@ pub fn parse_env_file_object(
   let mut object = serde_json::Map::new();
   // The entry which set each key (a value) or first nested under it
   // (an object), by its dotted path, to name both sides of a
-  // conflict. A nested path never has an empty segment and a flat
-  // key always does, so the two never share a path.
+  // conflict. A nested path never has an empty segment nor more
+  // than MAX_NESTED_SEGMENTS segments, and a flat key always has
+  // one or the other, so the two never share a path.
   let mut origins =
     std::collections::HashMap::<String, (String, usize)>::new();
   for entry in parse_entries(content)? {
     let name = entry.name.to_lowercase();
-    let segments = if name.split('.').any(str::is_empty) {
+    let segments = if name.split('.').any(str::is_empty)
+      || name.split('.').nth(MAX_NESTED_SEGMENTS).is_some()
+    {
       vec![name.as_str()]
     } else {
       name.split('.').collect::<Vec<_>>()
@@ -157,6 +171,7 @@ fn parse_entries(content: &str) -> Result<Vec<Entry>, EnvFileError> {
   // first name.
   let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
   let mut entries: Vec<Entry> = Vec::new();
+  let mut names = std::collections::HashSet::<&str>::new();
   for (idx, raw) in content.lines().enumerate() {
     let number = idx + 1;
     let line = raw.trim();
@@ -178,7 +193,7 @@ fn parse_entries(content: &str) -> Result<Vec<Entry>, EnvFileError> {
     if name.is_empty() {
       return Err(error(number, "missing name before `=`"));
     }
-    if entries.iter().any(|existing| existing.name == name) {
+    if !names.insert(name) {
       return Err(error(
         number,
         format!("duplicate entry for `{name}`"),
@@ -442,6 +457,51 @@ UNQUOTED=$(not run) ${NOT_EXPANDED} # not a comment
         "database": { "address": "db:5432" },
       })
     );
+  }
+
+  /// Nesting stops at [MAX_NESTED_SEGMENTS]: a longer name is one
+  /// flat key, parsed in time and memory linear in its length.
+  #[test]
+  fn names_nest_up_to_the_segment_limit() {
+    let nested = vec!["a"; MAX_NESTED_SEGMENTS].join(".");
+    let object =
+      parse_env_file_object(&format!("{nested}=1")).unwrap();
+    let mut value = &serde_json::Value::Object(object);
+    for _ in 0..MAX_NESTED_SEGMENTS {
+      value = &value["a"];
+    }
+    assert_eq!(value, "1");
+
+    let flat = vec!["a"; MAX_NESTED_SEGMENTS + 1].join(".");
+    let object =
+      parse_env_file_object(&format!("{flat}=1\nA.B=2")).unwrap();
+    assert_eq!(
+      serde_json::Value::Object(object),
+      serde_json::json!({ flat.clone(): "1", "a": { "b": "2" } })
+    );
+
+    // 10k segments (20KB, 300MB of nesting before the limit): one
+    // flat key, fast.
+    let long = vec!["a"; 10_000].join(".");
+    let started = std::time::Instant::now();
+    let object = parse_env_file_object(&format!("{long}=1")).unwrap();
+    assert!(object.contains_key(&long));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+  }
+
+  #[test]
+  fn many_entries_parse_in_linear_time() {
+    let file = (0..100_000)
+      .map(|i| format!("NAME_{i}=value"))
+      .collect::<Vec<_>>()
+      .join("\n");
+    let started = std::time::Instant::now();
+    assert_eq!(parse_env_file(&file).unwrap().len(), 100_000);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // Duplicates are still found.
+    let err =
+      parse_env_file(&format!("{file}\nNAME_7=x")).unwrap_err();
+    assert_eq!(err.line, 100_001);
   }
 
   #[test]

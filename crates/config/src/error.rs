@@ -212,18 +212,27 @@ pub enum Error {
   #[error("Parsed value is not object")]
   ValueIsNotObject,
 
-  /// A `cicada:` config path, without the `cicada` feature to load it.
-  /// An error rather than a skipped path: the app would start with
-  /// defaults where the operator expects their configuration.
+  /// A [crate::ConfigLoader::match_wildcards] pattern which doesn't
+  /// compile. An error rather than a dropped pattern: dropping it
+  /// widens the filter (with none left, a directory scan loads every
+  /// file in it).
+  #[error("Config wildcard '{pattern}' is invalid | {message}")]
+  InvalidWildcard { pattern: String, message: String },
+
+  /// A `cicada:` config path (listed in the paths, or in an include
+  /// file), without the `cicada` feature to load it. An error rather
+  /// than a skipped path: the app would start with defaults where
+  /// the operator expects their configuration.
   #[error(
     "Config path {path:?} is a cicada path, which needs the 'cicada' feature of mogh_config to be enabled"
   )]
   CicadaFeatureDisabled { path: PathBuf },
 
-  /// A `cicada:` config path which failed to load from Cicada (Core
-  /// unreachable, the device not onboarded or not granted the
-  /// environments, the file missing, ...). An error rather than a
-  /// skipped path, like [Error::CicadaFeatureDisabled].
+  /// A `cicada:` config path (listed in the paths, or in an include
+  /// file) which failed to load from Cicada (Core unreachable, the
+  /// device not onboarded or not granted the environments, the file
+  /// missing, ...). An error rather than a skipped path, like
+  /// [Error::CicadaFeatureDisabled].
   #[error("Failed to load cicada config at {path:?} | {message}")]
   CicadaLoad {
     /// The path as listed, `cicada://...`.

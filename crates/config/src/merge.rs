@@ -6,9 +6,12 @@ use crate::{Error, Result};
 /// - Source will overide target.
 /// - Will recurse when field is object if merge_object = true, otherwise object will be replaced.
 /// - Will extend when field is array if extend_array = true, otherwise array will be replaced.
-///   A string source onto an array (an env file's comma separated list,
-///   `HOSTS=a,b`) extends it with the list's entries.
 /// - Will return error when types on source and target fields do not match.
+///
+/// [crate::ConfigLoader] merges its sources with its own, lenient
+/// rules instead (a later source never fails to merge, and env file
+/// lists extend arrays): see [crate::ConfigLoader::merge_nested]
+/// and [crate::ConfigLoader::extend_array].
 pub fn merge_objects(
   mut target: serde_json::Map<String, serde_json::Value>,
   source: serde_json::Map<String, serde_json::Value>,
@@ -56,20 +59,6 @@ pub fn merge_objects(
             target_arr.extend(source_arr);
             target.insert(key, serde_json::Value::Array(target_arr));
           }
-          // An env file source lists values comma separated, the
-          // same syntax the final deserialization splits.
-          serde_json::Value::String(list) => {
-            target_arr.extend(
-              list
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(|entry| {
-                  serde_json::Value::String(entry.to_string())
-                }),
-            );
-            target.insert(key, serde_json::Value::Array(target_arr));
-          }
           _ => {
             return Err(Error::ArrayFieldTypeMismatch {
               key,
@@ -84,6 +73,76 @@ pub fn merge_objects(
     }
   }
   Ok(target)
+}
+
+/// Merges one [crate::ConfigLoader] source over the sources before
+/// it, in place. Unlike [merge_objects] it never fails, so a source
+/// is never dropped over one key (a cicada source full of secrets
+/// included):
+///
+/// - Source overrides target.
+/// - With `merge_nested`, two objects merge key by key. A `null`
+///   (a yaml section with every line commented out) has no keys to
+///   merge, so it keeps the object.
+/// - With `extend_array`, an array extends the array before it, and
+///   a `null` adds nothing. With `split_lists` (an env file source,
+///   whose lists are comma separated strings: `HOSTS=b,c`), a string
+///   extends it with the list's entries.
+/// - Any other value replaces the one before it, as it does without
+///   `merge_nested` / `extend_array`. A value the config type can't
+///   take fails the final deserialization, which names its path and
+///   type (never the value), rather than being skipped here.
+pub(crate) fn merge_source(
+  target: &mut serde_json::Map<String, serde_json::Value>,
+  source: serde_json::Map<String, serde_json::Value>,
+  merge_nested: bool,
+  extend_array: bool,
+  split_lists: bool,
+) {
+  for (key, value) in source {
+    let Some(curr) = target.get_mut(&key) else {
+      target.insert(key, value);
+      continue;
+    };
+    match (curr, value) {
+      (
+        serde_json::Value::Object(target_obj),
+        serde_json::Value::Object(source_obj),
+      ) if merge_nested => {
+        merge_source(
+          target_obj,
+          source_obj,
+          merge_nested,
+          extend_array,
+          split_lists,
+        );
+      }
+      (serde_json::Value::Object(_), serde_json::Value::Null)
+        if merge_nested => {}
+      (
+        serde_json::Value::Array(target_arr),
+        serde_json::Value::Array(source_arr),
+      ) if extend_array => target_arr.extend(source_arr),
+      (serde_json::Value::Array(_), serde_json::Value::Null)
+        if extend_array => {}
+      (
+        serde_json::Value::Array(target_arr),
+        serde_json::Value::String(list),
+      ) if extend_array && split_lists => {
+        // The same syntax the final deserialization splits.
+        target_arr.extend(
+          list
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+              serde_json::Value::String(entry.to_string())
+            }),
+        );
+      }
+      (curr, value) => *curr = value,
+    }
+  }
 }
 
 /// Source will overide target
@@ -208,6 +267,167 @@ mod tests {
       err,
       Error::ArrayFieldTypeMismatch { key, .. } if key == "field"
     ));
+  }
+
+  /// The public merge keeps its contract for callers merging
+  /// something other than config sources (eg. Komodo action args):
+  /// a string or `null` is no list, and `null` is no object.
+  #[test]
+  fn public_merge_does_not_split_strings_onto_arrays() {
+    let target = object(serde_json::json!({ "msg": ["default"] }));
+    let source = object(serde_json::json!({ "msg": "hello, world" }));
+    let err = merge_objects(target, source, true, true).unwrap_err();
+    assert!(matches!(
+      err,
+      Error::ArrayFieldTypeMismatch { key, found: "string" }
+        if key == "msg"
+    ));
+    let target = object(serde_json::json!({ "msg": ["default"] }));
+    let source = object(serde_json::json!({ "msg": null }));
+    assert!(merge_objects(target, source, true, true).is_err());
+    let target = object(serde_json::json!({ "db": { "a": 1 } }));
+    let source = object(serde_json::json!({ "db": null }));
+    assert!(merge_objects(target, source, true, true).is_err());
+  }
+
+  fn merge_source_json(
+    target: serde_json::Value,
+    source: serde_json::Value,
+    merge_nested: bool,
+    extend_array: bool,
+    split_lists: bool,
+  ) -> serde_json::Value {
+    let mut target = object(target);
+    merge_source(
+      &mut target,
+      object(source),
+      merge_nested,
+      extend_array,
+      split_lists,
+    );
+    serde_json::Value::Object(target)
+  }
+
+  /// A yaml section with every line commented out is `null`: it
+  /// has nothing to merge, and the rest of the source still applies.
+  #[test]
+  fn source_null_keeps_objects_and_arrays_when_merging() {
+    let target = serde_json::json!({
+      "port": 1,
+      "database": { "address": "localhost" },
+      "hosts": ["a"],
+    });
+    let source = serde_json::json!({
+      "port": 9000,
+      "database": null,
+      "hosts": null,
+    });
+    assert_eq!(
+      merge_source_json(
+        target.clone(),
+        source.clone(),
+        true,
+        true,
+        false
+      ),
+      serde_json::json!({
+        "port": 9000,
+        "database": { "address": "localhost" },
+        "hosts": ["a"],
+      })
+    );
+    // Without the flags, null replaces like any other value.
+    assert_eq!(
+      merge_source_json(target, source, false, false, false),
+      serde_json::json!({
+        "port": 9000,
+        "database": null,
+        "hosts": null,
+      })
+    );
+  }
+
+  /// A type conflict never drops the source: the later value
+  /// replaces the earlier one (the final deserialization reports it
+  /// if the config type can't take it), and every other key applies.
+  #[test]
+  fn source_type_conflicts_replace_instead_of_dropping_the_source() {
+    let merged = merge_source_json(
+      serde_json::json!({
+        "port": 1,
+        "database": { "address": "localhost" },
+        "ports": [8120],
+      }),
+      serde_json::json!({
+        "port": 9000,
+        "db_password": "secret",
+        "database": "postgres://x",
+        "ports": 8120,
+      }),
+      true,
+      true,
+      true,
+    );
+    assert_eq!(
+      merged,
+      serde_json::json!({
+        "port": 9000,
+        "db_password": "secret",
+        "database": "postgres://x",
+        "ports": 8120,
+      })
+    );
+  }
+
+  /// Only an env file source's string is a list to extend with.
+  #[test]
+  fn only_env_file_strings_extend_arrays() {
+    let target = serde_json::json!({ "hosts": ["a"] });
+    let source = serde_json::json!({ "hosts": "b, c,," });
+    assert_eq!(
+      merge_source_json(
+        target.clone(),
+        source.clone(),
+        true,
+        true,
+        true
+      ),
+      serde_json::json!({ "hosts": ["a", "b", "c"] })
+    );
+    assert_eq!(
+      merge_source_json(
+        target.clone(),
+        source.clone(),
+        true,
+        true,
+        false
+      ),
+      serde_json::json!({ "hosts": "b, c,," })
+    );
+    assert_eq!(
+      merge_source_json(target, source, true, false, true),
+      serde_json::json!({ "hosts": "b, c,," })
+    );
+  }
+
+  #[test]
+  fn source_objects_merge_nested_and_arrays_extend() {
+    assert_eq!(
+      merge_source_json(
+        serde_json::json!({
+          "nested": { "keep": 1, "replace": 1, "list": [1] }
+        }),
+        serde_json::json!({
+          "nested": { "replace": 2, "add": 3, "list": [2] }
+        }),
+        true,
+        true,
+        false,
+      ),
+      serde_json::json!({
+        "nested": { "keep": 1, "replace": 2, "add": 3, "list": [1, 2] }
+      })
+    );
   }
 
   #[test]

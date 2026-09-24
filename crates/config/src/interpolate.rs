@@ -16,7 +16,7 @@ static SHELL: LazyLock<&'static str> = LazyLock::new(|| {
 static ENV_REGEX: LazyLock<Regex> =
   LazyLock::new(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").unwrap());
 
-/// `$(command)` syntax
+/// `$(command)` syntax: a single command word, no arguments.
 static SHELL_REGEX: LazyLock<Regex> =
   LazyLock::new(|| Regex::new(r"\$\(([A-Za-z0-9_]+)\)").unwrap());
 
@@ -25,13 +25,82 @@ static ENV_OR_SHELL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(r"\$\{([A-Za-z0-9_]+)\}|\$\(([A-Za-z0-9_]+)\)").unwrap()
 });
 
+/// `$(...)` / `${...}` with anything inside, to find the ones
+/// the interpolation leaves as written.
+static ANY_INTERPOLATION_REGEX: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"\$\([^)]*\)|\$\{[^}]*\}").unwrap());
+
 /// Whether the string contains anything to interpolate.
 pub fn needs_interpolation(input: &str) -> bool {
   input.contains("${") || input.contains("$(")
 }
 
+/// Whether the string has a `$(...)` / `${...}` which
+/// [interpolate_env_and_shell] keeps as written: a command with
+/// arguments (`$(cat /run/secrets/db)`), shell parameter syntax
+/// (`${VAR:-default}`).
+fn has_unsupported_interpolation(input: &str) -> bool {
+  needs_interpolation(input)
+    && ANY_INTERPOLATION_REGEX.find_iter(input).any(|found| {
+      !ENV_OR_SHELL_REGEX.find(found.as_str()).is_some_and(
+        |supported| {
+          supported.start() == 0 && supported.end() == found.len()
+        },
+      )
+    })
+}
+
+/// The paths (`database.password`, `hosts[1]`) of the string values
+/// with a `$(...)` / `${...}` which [interpolate_env_and_shell]
+/// keeps as written, so the loader can warn about them without
+/// printing the values.
+pub(crate) fn unsupported_interpolations(
+  value: &serde_json::Value,
+) -> Vec<String> {
+  fn walk(
+    value: &serde_json::Value,
+    path: &str,
+    found: &mut Vec<String>,
+  ) {
+    match value {
+      serde_json::Value::String(s) => {
+        if has_unsupported_interpolation(s) {
+          found.push(if path.is_empty() {
+            String::from(".")
+          } else {
+            path.to_string()
+          });
+        }
+      }
+      serde_json::Value::Array(items) => {
+        for (index, item) in items.iter().enumerate() {
+          walk(item, &format!("{path}[{index}]"), found);
+        }
+      }
+      serde_json::Value::Object(map) => {
+        for (key, value) in map {
+          let path = if path.is_empty() {
+            key.clone()
+          } else {
+            format!("{path}.{key}")
+          };
+          walk(value, &path, found);
+        }
+      }
+      _ => {}
+    }
+  }
+  let mut found = Vec::new();
+  walk(value, "", &mut found);
+  found
+}
+
 /// - Supports '${VAR}' -> Env var extended
-/// - Supports '$(shell command)' -> 'echo $(shell command)'
+/// - Supports '$(command)' -> the command's output, for a single
+///   command word (letters, digits, '_') without arguments
+///
+/// Anything else (`$(cat /run/secrets/db)`, `${VAR:-default}`) is
+/// kept as written.
 ///
 /// Each `${VAR}` / `$(command)` in the input is substituted once,
 /// in a single pass. Substituted text is never itself interpolated,
@@ -120,7 +189,8 @@ fn try_get_env_extended(var_name: &str, shell: &str) -> String {
     .unwrap_or_default()
 }
 
-/// - Supports '$(shell command)' -> 'echo $(shell command)'
+/// - Supports '$(command)' -> the command's output, for a single
+///   command word (letters, digits, '_') without arguments
 pub fn interpolate_shell(input: &str, shell: &str) -> String {
   SHELL_REGEX
     .replace_all(input, |caps: &Captures| {
@@ -147,4 +217,45 @@ fn run_shell_command(command: &str, shell: &str) -> String {
     .map(|value| value.trim().to_string())
     .inspect_err(|e| println!("{}: Failed to parse shell stdout for $({command}) as utf-8: {e}", "WARN".yellow()))
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn finds_what_interpolation_keeps_as_written() {
+    for supported in [
+      "$(hostname)",
+      "${HOME}",
+      "a ${A_1} b $(true) c",
+      "plain",
+      "$",
+    ] {
+      assert!(
+        !has_unsupported_interpolation(supported),
+        "{supported}"
+      );
+    }
+    for unsupported in [
+      "$(cat /run/secrets/db)",
+      "${VAR:-default}",
+      "ok ${HOME} not $(echo hi)",
+      "$(cat ${HOME})",
+      "$()",
+    ] {
+      assert!(
+        has_unsupported_interpolation(unsupported),
+        "{unsupported}"
+      );
+    }
+    let mut paths = unsupported_interpolations(&serde_json::json!({
+      "password": "$(cat /run/secrets/db)",
+      "port": "${PORT}",
+      "database": { "uri": "${URI:-x}", "ok": "$(hostname)" },
+      "hosts": ["a", "$(echo b)"],
+    }));
+    paths.sort();
+    assert_eq!(paths, ["database.uri", "hosts[1]", "password"]);
+  }
 }

@@ -871,3 +871,340 @@ fn map_keys_coerce_into_their_types() {
     HashMap::from([(Stage::PreRelease, 1), (Stage::Stable, 3)])
   );
 }
+
+fn try_load<T: serde::de::DeserializeOwned>(
+  paths: &[&Path],
+  match_wildcards: &[&str],
+  merge_nested: bool,
+  extend_array: bool,
+) -> mogh_config::Result<T> {
+  ConfigLoader {
+    paths,
+    match_wildcards,
+    include_file_name: ".include",
+    merge_nested,
+    extend_array,
+    debug_print: false,
+  }
+  .load()
+}
+
+/// A yaml section with every line commented out is `null`: it keeps
+/// the earlier object / array, and the rest of the file applies (the
+/// whole file used to be dropped with a type mismatch).
+#[test]
+fn yaml_null_sections_keep_earlier_values_and_the_rest_applies() {
+  let dir = TestDir::new("yaml_null_section");
+  let base = dir.write(
+    "base.yaml",
+    "port: 1\ndatabase:\n  address: localhost\nhosts:\n  - a\n",
+  );
+  let override_ = dir.write(
+    "override.yaml",
+    "port: 9000\ndatabase:\n  # address: x\nhosts:\n  # - b\n",
+  );
+  let config = load(&[&base, &override_], &[], true, true);
+  assert_eq!(
+    config,
+    serde_json::json!({
+      "port": 9000,
+      "database": { "address": "localhost" },
+      "hosts": ["a"],
+    })
+  );
+  // Without merging, null replaces like any value (as before).
+  let config = load(&[&base, &override_], &[], false, false);
+  assert_eq!(
+    config,
+    serde_json::json!({ "port": 9000, "database": null, "hosts": null })
+  );
+}
+
+/// A value conflicting with an earlier source's type replaces it
+/// rather than dropping the source with every secret in it: the
+/// final deserialization reports it when the config can't take it.
+#[test]
+fn type_conflicts_never_drop_a_source() {
+  #[derive(serde::Deserialize, Debug)]
+  #[allow(dead_code)]
+  struct Database {
+    address: String,
+  }
+  #[derive(serde::Deserialize, Debug)]
+  #[allow(dead_code)]
+  struct Config {
+    port: u16,
+    db_password: String,
+    database: Database,
+  }
+  let dir = TestDir::new("type_conflict_source");
+  let toml = dir.write(
+    "defaults.toml",
+    "port = 1\ndb_password = \"\"\n[database]\naddress = \"localhost\"\n",
+  );
+  let env = dir.write(
+    ".env",
+    "PORT=9000\nDB_PASSWORD=hunter2secret\nDATABASE=postgres://x\n",
+  );
+  let config =
+    try_load::<serde_json::Value>(&[&toml, &env], &[], true, true)
+      .unwrap();
+  assert_eq!(
+    config,
+    serde_json::json!({
+      "port": "9000",
+      "db_password": "hunter2secret",
+      "database": "postgres://x",
+    })
+  );
+  // Typed: an error at the conflicting field, never the defaults.
+  let err =
+    try_load::<Config>(&[&toml, &env], &[], true, true).unwrap_err();
+  assert!(
+    matches!(&err, mogh_config::Error::ParseFinalJson { path, found: Some("string"), .. } if path == "database"),
+    "{err}"
+  );
+  assert!(!err.to_string().contains("hunter2secret"), "{err}");
+  assert!(!err.to_string().contains("postgres"), "{err}");
+
+  // A scalar onto an array under extend_array replaces it too.
+  let a = dir.write("a.toml", "ports = [8120]\nsecret = \"a\"\n");
+  let b = dir.write("b.yaml", "ports: 8121\nsecret: b\n");
+  let config = load(&[&a, &b], &[], true, true);
+  assert_eq!(
+    config,
+    serde_json::json!({ "ports": 8121, "secret": "b" })
+  );
+}
+
+/// Only an env file's string is a comma separated list extending an
+/// array; a toml / yaml / json string replaces it.
+#[test]
+fn only_env_file_lists_extend_arrays() {
+  let dir = TestDir::new("toml_string_onto_array");
+  let a = dir.write("a.toml", "hosts = [\"a\"]\n");
+  let b = dir.write("b.toml", "hosts = \"b, c\"\n");
+  let config = load(&[&a, &b], &[], true, true);
+  assert_eq!(config, serde_json::json!({ "hosts": "b, c" }));
+  let env = dir.write("c.env", "HOSTS=b, c\n");
+  let config = load(&[&a, &env], &[], true, true);
+  assert_eq!(config, serde_json::json!({ "hosts": ["a", "b", "c"] }));
+}
+
+/// An invalid wildcard used to be dropped, and with none left the
+/// directory scan loaded every file in it.
+#[test]
+fn invalid_wildcards_are_an_error() {
+  let dir = TestDir::new("invalid_wildcard");
+  dir.write("app.config.toml", "a = 1");
+  dir.write("package.json", r#"{ "name": "x", "a": 99 }"#);
+  let err = try_load::<serde_json::Value>(
+    &[&dir.0],
+    &["*config\\.toml"],
+    true,
+    false,
+  )
+  .unwrap_err();
+  let mogh_config::Error::InvalidWildcard { pattern, message } = &err
+  else {
+    panic!("expected an invalid wildcard error, got {err}");
+  };
+  assert_eq!(pattern, "*config\\.toml");
+  assert!(!message.is_empty());
+  // One invalid pattern among valid ones is an error too.
+  assert!(matches!(
+    try_load::<serde_json::Value>(
+      &[&dir.0],
+      &["*config.toml", "*config\\.toml"],
+      true,
+      false,
+    ),
+    Err(mogh_config::Error::InvalidWildcard { .. })
+  ));
+  let config = load(&[&dir.0], &["*config.toml"], true, false);
+  assert_eq!(config, serde_json::json!({ "a": 1 }));
+}
+
+/// A file matching several wildcards takes the last one's priority,
+/// so a later, more specific pattern overrides a general one.
+#[test]
+fn overlapping_wildcards_rank_files_by_their_last_match() {
+  let dir = TestDir::new("overlapping_wildcards");
+  dir.write("core.config.toml", "port = 1\nbase = 1");
+  dir.write("core.config.local.toml", "port = 2");
+  let config =
+    load(&[&dir.0], &["*config.*", "*config.local.*"], false, false);
+  assert_eq!(config, serde_json::json!({ "port": 2, "base": 1 }));
+  // The other order puts the general pattern last: base wins.
+  let config =
+    load(&[&dir.0], &["*config.local.*", "*config.*"], false, false);
+  assert_eq!(config, serde_json::json!({ "port": 1, "base": 1 }));
+}
+
+/// A file listed after its directory, through another spelling of
+/// the path (a symlinked directory), is loaded once: under
+/// extend_array its arrays used to apply twice.
+#[cfg(unix)]
+#[test]
+fn a_file_listed_after_its_directory_loads_once() {
+  let dir = TestDir::new("dedupe_real");
+  dir.write("a.toml", "arr = [\"x\"]\nkey = \"a\"");
+  dir.write("z.toml", "key = \"z\"");
+  let link = std::env::temp_dir().join(format!(
+    "mogh_config_test_{}_dedupe_link",
+    std::process::id()
+  ));
+  let _ = std::fs::remove_file(&link);
+  std::os::unix::fs::symlink(&dir.0, &link).unwrap();
+  let file = link.join("a.toml");
+  let config = load(&[&link, &file], &["*.toml"], true, true);
+  let _ = std::fs::remove_file(&link);
+  // Once, and at its later position (over z.toml).
+  assert_eq!(config, serde_json::json!({ "arr": ["x"], "key": "a" }));
+}
+
+/// A listed file is parsed by the name it is listed as, even when it
+/// links to a file named otherwise (a mounted secret).
+#[cfg(unix)]
+#[test]
+fn a_listed_file_is_parsed_by_its_listed_name() {
+  let dir = TestDir::new("listed_name");
+  let secret = dir.write("secret", "PORT=8080\n");
+  let env = dir.0.join("app.env");
+  std::os::unix::fs::symlink(&secret, &env).unwrap();
+  let config = load(&[&env], &[], true, false);
+  assert_eq!(config, serde_json::json!({ "port": "8080" }));
+}
+
+/// A symlinked file listed before a directory scan which also finds
+/// it is loaded once, by its own name: the scan used to replace it
+/// with the link target's canonical path (`secret`, no config
+/// extension), skipping the file as an unsupported type.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_file_found_again_by_a_scan_keeps_its_name() {
+  let dir = TestDir::new("scan_keeps_name");
+  let secret = dir.write("secret", "PORT=8080\n");
+  let env = dir.0.join("app.env");
+  std::os::unix::fs::symlink(&secret, &env).unwrap();
+  for paths in [[env.as_path(), &dir.0], [&dir.0, env.as_path()]] {
+    let config = load(&paths, &["*.env"], true, false);
+    assert_eq!(config, serde_json::json!({ "port": "8080" }));
+  }
+}
+
+/// A symlinked file listed in an include file is loaded by its
+/// listed name: the include used to be replaced with the link
+/// target's canonical path (`secret`, no config extension),
+/// skipping the file as an unsupported type.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_include_keeps_its_name() {
+  let included = TestDir::new("include_keeps_name_target");
+  let secret = included.write("secret", "PORT=8080\n");
+  std::os::unix::fs::symlink(&secret, included.0.join("app.env"))
+    .unwrap();
+  let dir = TestDir::new("include_keeps_name");
+  dir.write("config.toml", "port = 1");
+  // Relative (through '..'), as an include line usually is.
+  dir.write(
+    ".include",
+    &format!(
+      "../{}/app.env\n",
+      included.0.file_name().unwrap().to_str().unwrap()
+    ),
+  );
+  let config = load(&[&dir.0], &["*.toml"], true, false);
+  assert_eq!(config, serde_json::json!({ "port": "8080" }));
+}
+
+/// A `cicada:` line in an include file used to be dropped as a
+/// missing path, silently, with or without the feature.
+#[cfg(not(feature = "cicada"))]
+#[test]
+fn cicada_include_without_the_feature_is_an_error() {
+  let dir = TestDir::new("cicada_include");
+  dir.write("config.toml", "port = 1");
+  dir.write(
+    ".include",
+    "cicada://app/secrets.env?env=prod # the secrets\n",
+  );
+  let err = try_load::<serde_json::Value>(
+    &[&dir.0],
+    &["*.toml"],
+    true,
+    false,
+  )
+  .unwrap_err();
+  let mogh_config::Error::CicadaFeatureDisabled { path } = &err
+  else {
+    panic!("expected a cicada feature error, got {err}");
+  };
+  assert_eq!(path, Path::new("cicada://app/secrets.env?env=prod"));
+}
+
+/// A name with thousands of dots used to nest thousands of levels
+/// deep (quadratic memory), and overflow the stack of a 2MB thread
+/// (a tokio worker's) walking it.
+#[test]
+fn deeply_dotted_env_names_do_not_overflow_the_stack() {
+  #[derive(serde::Deserialize, Debug)]
+  struct Config {
+    port: u16,
+  }
+  let dir = TestDir::new("deep_env_name");
+  let name = vec!["a"; 6_000].join(".");
+  let env = dir.write(".env", &format!("{name}=1\nPORT=8080\n"));
+  let config = std::thread::Builder::new()
+    .stack_size(2 * 1024 * 1024)
+    .spawn(move || {
+      try_load::<Config>(&[&env], &[], true, true).map(|c| c.port)
+    })
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  assert_eq!(config, 8080);
+}
+
+/// Arrays merged under extend_array into a tuple used to keep the
+/// first entries silently: now too many is an error, as in 2.x.
+#[test]
+fn extended_arrays_into_a_tuple_must_fit() {
+  #[derive(serde::Deserialize, Debug)]
+  #[allow(dead_code)]
+  struct Config {
+    pair: (u8, u8),
+  }
+  let dir = TestDir::new("tuple_extend");
+  let a = dir.write("a.toml", "pair = [1, 2]");
+  let b = dir.write("b.toml", "pair = [3, 4]");
+  let err =
+    try_load::<Config>(&[&a, &b], &[], true, true).unwrap_err();
+  assert!(err.to_string().contains("at 'pair'"), "{err}");
+  assert!(err.to_string().contains("fewer elements"), "{err}");
+  let config =
+    try_load::<Config>(&[&a, &b], &[], true, false).unwrap();
+  assert_eq!(config.pair, (3, 4));
+}
+
+/// `$(command)` runs a single command word: a command with
+/// arguments is kept as written (with a warning naming the key),
+/// never run through a shell.
+#[test]
+fn commands_with_arguments_are_kept_as_written() {
+  let dir = TestDir::new("interpolation_arguments");
+  let toml = dir.write(
+    "config.toml",
+    "password = \"$(cat /etc/hostname)\"\nfallback = \"${MOGH_CONFIG_TEST_UNSET:-x}\"\nran = \"$(true)\"",
+  );
+  let config = load(&[&toml], &[], false, false);
+  assert_eq!(
+    config,
+    serde_json::json!({
+      "password": "$(cat /etc/hostname)",
+      "fallback": "${MOGH_CONFIG_TEST_UNSET:-x}",
+      "ran": "",
+    })
+  );
+}
