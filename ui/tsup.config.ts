@@ -2,7 +2,11 @@ import { defineConfig } from "tsup";
 
 export default defineConfig({
   entry: ["src/**/*.{ts,tsx}", "!src/**/*.d.ts"],
-  format: ["esm", "cjs"],
+  // ESM only, for bundlers (see README): the sources import .scss modules
+  // and Vite `?worker`s, and keep extensionless relative imports, so
+  // neither format could load in plain Node. The old CJS build even
+  // resolved its `require("./x")` to the ESM files.
+  format: ["esm"],
   bundle: false,
   shims: true,
   // d.ts emit is handled by `tsc --emitDeclarationOnly` in the build script;
@@ -15,13 +19,17 @@ export default defineConfig({
     "react-dom",
     "react-router-dom",
     "@mantine/core",
+    "@mantine/form",
     "@mantine/hooks",
     "@mantine/notifications",
+    "@tanstack/react-query",
     "@tanstack/react-table",
     "lucide-react",
     "@monaco-editor/react",
     "monaco-editor",
     "monaco-yaml",
+    "mogh_auth_client",
+    "prettier",
     /\.scss$/,
   ],
 });

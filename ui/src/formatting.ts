@@ -75,17 +75,30 @@ export function fmtTimeUntil(ms: number) {
   return "< 1 minute";
 }
 
+/**
+ * UpperCamelCase => Upper Camel Case.
+ *
+ * Input which isn't made of such words only (eg. "OOMKilled",
+ * "exited_1") is returned unchanged, instead of losing the other parts.
+ */
 export function fmtUpperCamelcase(input: string) {
-  return input.match(/[A-Z][a-z]+|[0-9]+/g)?.join(" ") ?? input;
+  const words = /[A-Z][a-z]+|[0-9]+/g;
+  if (input.replace(words, "").replace(/[\s_-]/g, "") !== "") {
+    return input;
+  }
+  return input.match(words)?.join(" ") ?? input;
 }
 
 /// list_all_items => List All Items
 export function fmtSnakeCaseToUpperSpaceCase(snake: string) {
-  if (snake.length === 0) return "";
-  return snake
-    .split("_")
-    .map((item) => item[0].toUpperCase() + item.slice(1))
-    .join(" ");
+  return (
+    snake
+      .split("_")
+      // Leading / trailing / double underscores leave empty parts.
+      .filter((item) => item.length > 0)
+      .map((item) => item[0].toUpperCase() + item.slice(1))
+      .join(" ")
+  );
 }
 
 export const BYTES_PER_KB = 1024;

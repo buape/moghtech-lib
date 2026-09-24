@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor";
+import { TOML_KEY_VALUE_REGEX } from "./toml_key";
 
 /* -------------------------------------------------
  *  Language configuration  (unchanged)
@@ -44,7 +45,7 @@ const toml_language: monaco.languages.IMonarchLanguage = {
 
       /* Tables & array-tables */
       [
-        /^\s*(\[\[)([^[\]]+)(\]\])/,
+        /^(\s*\[\[)([^[\]]+)(\]\])/,
         [
           "punctuation.definition.array.table",
           "entity.other.attribute-name.table.array",
@@ -52,7 +53,7 @@ const toml_language: monaco.languages.IMonarchLanguage = {
         ],
       ],
       [
-        /^\s*(\[)([^[\]]+)(\])/,
+        /^(\s*\[)([^[\]]+)(\])/,
         [
           "punctuation.definition.table",
           "entity.other.attribute-name.table",
@@ -67,10 +68,7 @@ const toml_language: monaco.languages.IMonarchLanguage = {
       ],
 
       /* Key-value pair */
-      [
-        /\s*((?:(?:(?:[A-Za-z0-9_+\-]+)|(?:\"[^\"]+\")|(?:'[^']+'))\s*\.?\s*)+)\s*(=)/,
-        ["", "delimiter"],
-      ],
+      [TOML_KEY_VALUE_REGEX, ["", "delimiter"]],
 
       /* Values */
       { include: "@values" },

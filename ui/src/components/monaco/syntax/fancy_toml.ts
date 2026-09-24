@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor";
+import { TOML_KEY_VALUE_REGEX } from "./toml_key";
 
 /// V2: Toml + Yaml + Env Vars
 const fancy_toml_conf: monaco.languages.LanguageConfiguration = {
@@ -28,7 +29,7 @@ const fancy_toml_conf: monaco.languages.LanguageConfiguration = {
   ],
 };
 
-const fancy_toml_language = <monaco.languages.IMonarchLanguage>{
+const fancy_toml_language: monaco.languages.IMonarchLanguage = {
   defaultToken: "",
   tokenPostfix: ".toml",
 
@@ -41,7 +42,7 @@ const fancy_toml_language = <monaco.languages.IMonarchLanguage>{
 
       // Table Definitions
       [
-        /^\s*(\[\[)([^[\]]+)(\]\])/,
+        /^(\s*\[\[)([^[\]]+)(\]\])/,
         [
           "punctuation.definition.array.table",
           "entity.other.attribute-name.table.array",
@@ -49,7 +50,7 @@ const fancy_toml_language = <monaco.languages.IMonarchLanguage>{
         ],
       ],
       [
-        /^\s*(\[)([^[\]]+)(\])/,
+        /^(\s*\[)([^[\]]+)(\])/,
         [
           "punctuation.definition.table",
           "entity.other.attribute-name.table",
@@ -67,10 +68,7 @@ const fancy_toml_language = <monaco.languages.IMonarchLanguage>{
       ],
 
       // Entry (Key = Value)
-      [
-        /\s*((?:(?:(?:[A-Za-z0-9_+-]+)|(?:\"[^\"]+\")|(?:'[^']+'))\s*\.?\s*)+)\s*(=)/,
-        ["", "delimiter"],
-      ],
+      [TOML_KEY_VALUE_REGEX, ["", "delimiter"]],
 
       // Values (booleans, numbers, dates, strings, arrays)
       { include: "@values" },

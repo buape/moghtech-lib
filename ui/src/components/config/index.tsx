@@ -1,4 +1,5 @@
-import { Fragment, ReactNode, SetStateAction, useMemo } from "react";
+import { Fragment, ReactNode, SetStateAction, useEffect, useMemo } from "react";
+import { useDisclosure } from "@mantine/hooks";
 import { MonacoLanguage } from "../monaco";
 import {
   Anchor,
@@ -11,12 +12,14 @@ import {
   Stack,
   Text,
 } from "@mantine/core";
-import { ConfirmUpdate } from "./confirm";
-import { Bookmark, History } from "lucide-react";
+import { ConfirmUpdateModal } from "./confirm";
+import { confirmDialogOpen } from "./confirm-open";
+import { Bookmark, History, Save } from "lucide-react";
 import { ConfigGroup } from "./group";
 import { UnsavedChanges } from "./unsaved-changes";
 import { ConfigLayout } from "./layout";
 import { SectionProps } from "../section";
+import { useCtrlKeyListener } from "../../hooks";
 
 export * from "./confirm";
 export * from "./group";
@@ -101,6 +104,26 @@ export function Config<T>({
   };
   const onReset = () => setUpdate({});
 
+  // One confirm dialog (and one set of key listeners) per Config, however
+  // many Save buttons the responsive layout below renders.
+  const [confirmOpened, confirm] = useDisclosure();
+  useCtrlKeyListener("Enter", (e) => {
+    if (
+      confirmOpened ||
+      confirmDialogOpen() ||
+      disabled ||
+      !changesMade ||
+      e.defaultPrevented
+    ) {
+      return false;
+    }
+    confirm.open();
+  });
+  // Changes dropped while the dialog is open (eg. by the parent).
+  useEffect(() => {
+    if (!changesMade) confirm.close();
+  }, [changesMade]);
+
   const groups = useMemo(
     () => Object.entries(_groups).filter(([_, groupArgs]) => !!groupArgs),
     [_groups],
@@ -171,55 +194,45 @@ export function Config<T>({
           </Fragment>
         );
       }),
-    [groups],
+    // Everything it reads: `groups` alone would freeze the inputs for
+    // a caller passing a stable `groups` object.
+    [groups, original, update, setUpdate, disabled],
   );
 
-  const SaveOrReset = ({
-    unsavedIndicator,
-    fullWidth,
-  }: {
-    unsavedIndicator?: boolean;
-    fullWidth?: boolean;
-  }) =>
-    changesMade && (
-      <>
-        {unsavedIndicator && <UnsavedChanges fullWidth={fullWidth} />}
-        <Button
-          variant="outline"
-          onClick={onReset}
-          disabled={disabled || !changesMade}
-          leftSection={<History size="1rem" />}
-          fullWidth={fullWidth}
-          w={fullWidth ? undefined : 100}
-        >
-          Reset
-        </Button>
-        <ConfirmUpdate
-          original={original}
-          update={update}
-          onConfirm={onConfirm}
-          disabled={disabled}
-          fileContentsLanguage={fileContentsLanguage}
-          fullWidth={fullWidth}
-          enableFancyToml={enableFancyToml}
-          secretKeys={secretKeys}
-        />
-      </>
-    );
+  const saveOrResetProps = {
+    disabled,
+    onReset,
+    onSave: confirm.open,
+  };
 
   const SaveOrResetComponent = changesMade && (
     <>
       <Group visibleFrom="xs" justify="flex-end">
-        <SaveOrReset unsavedIndicator />
+        <SaveOrReset unsavedIndicator {...saveOrResetProps} />
       </Group>
       <Stack hiddenFrom="xs">
-        <SaveOrReset unsavedIndicator fullWidth />
+        <SaveOrReset unsavedIndicator fullWidth {...saveOrResetProps} />
       </Stack>
     </>
   );
 
+  const ConfirmDialog = (
+    <ConfirmUpdateModal
+      opened={confirmOpened && changesMade}
+      onClose={confirm.close}
+      original={original}
+      update={update}
+      onConfirm={onConfirm}
+      disabled={disabled}
+      fileContentsLanguage={fileContentsLanguage}
+      enableFancyToml={enableFancyToml}
+      secretKeys={secretKeys}
+    />
+  );
+
   return (
     <ConfigLayout SaveOrReset={SaveOrResetComponent} {...sectionProps}>
+      {ConfirmDialog}
       {disableSidebar && (
         <>
           {GroupsComponent}
@@ -283,9 +296,11 @@ export function Config<T>({
               </ScrollArea>
 
               {/** SAVE */}
-              <Stack gap="xs">
-                <SaveOrReset fullWidth />
-              </Stack>
+              {changesMade && (
+                <Stack gap="xs">
+                  <SaveOrReset fullWidth {...saveOrResetProps} />
+                </Stack>
+              )}
             </Stack>
           </Box>
 
@@ -319,5 +334,52 @@ export function Config<T>({
         </Flex>
       )}
     </ConfigLayout>
+  );
+}
+
+/**
+ * The Reset / Save buttons of a `Config`, shown at several responsive
+ * positions (all stay mounted). Save only opens the Config's one
+ * confirm dialog.
+ */
+function SaveOrReset({
+  unsavedIndicator,
+  fullWidth,
+  disabled,
+  onReset,
+  onSave,
+}: {
+  unsavedIndicator?: boolean;
+  fullWidth?: boolean;
+  disabled: boolean;
+  onReset: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <>
+      {unsavedIndicator && <UnsavedChanges fullWidth={fullWidth} />}
+      <Button
+        variant="outline"
+        onClick={onReset}
+        disabled={disabled}
+        leftSection={<History size="1rem" />}
+        fullWidth={fullWidth}
+        w={fullWidth ? undefined : 100}
+      >
+        Reset
+      </Button>
+      <Button
+        leftSection={<Save size="1rem" />}
+        onClick={(e) => {
+          e.stopPropagation();
+          onSave();
+        }}
+        disabled={disabled}
+        fullWidth={fullWidth}
+        w={fullWidth ? undefined : 100}
+      >
+        Save
+      </Button>
+    </>
   );
 }

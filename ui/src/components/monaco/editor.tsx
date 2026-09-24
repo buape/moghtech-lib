@@ -1,6 +1,6 @@
 import "./init";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { DiffEditor, Editor } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import { useViewportSize } from "@mantine/hooks";
@@ -12,6 +12,9 @@ import {
 } from "./common";
 
 const MIN_EDITOR_HEIGHT = 56;
+
+/** Makes each editor's model path unique, see `modelPath`. */
+let editorInstanceCounter = 0;
 
 /** Prettier embeds the full typescript parser - only load it on demand. */
 async function formatWithCursor(
@@ -64,6 +67,7 @@ export function MonacoEditorImpl({
   const dimensions = useViewportSize();
   const [editor, setEditor] =
     useState<monaco.editor.IStandaloneCodeEditor | null>(null);
+  const [instanceId] = useState(() => ++editorInstanceCounter);
 
   useEffect(() => {
     if (!editor) return;
@@ -89,10 +93,15 @@ export function MonacoEditorImpl({
     )
       return;
     if (!editor) return;
-    editor.addCommand(
-      monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
-      async () => {
-        if (!editor) return;
+    // An action (unlike `addCommand`) is bound to this editor only, and
+    // is removed with it / when the language changes.
+    const action = editor.addAction({
+      id: "mogh.format-document",
+      label: "Format Document (Prettier)",
+      keybindings: [
+        monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
+      ],
+      run: async (editor) => {
         const model = editor.getModel();
         if (!model) return;
         const position = editor.getPosition();
@@ -103,11 +112,14 @@ export function MonacoEditorImpl({
           curr,
           beforeOffset,
         );
+        // Disposed / switched model while formatting.
+        if (model.isDisposed() || editor.getModel() !== model) return;
         editor.setValue(formatted);
         editor.setPosition(model.getPositionAt(cursorOffset));
       },
-    );
-  }, [editor]);
+    });
+    return () => action.dispose();
+  }, [editor, language]);
 
   const line_count = value?.split(/\r\n|\r|\n/).length ?? 0;
 
@@ -154,7 +166,7 @@ export function MonacoEditorImpl({
         language={language}
         value={value}
         theme={currentTheme}
-        defaultPath={defaultPath(filename)}
+        defaultPath={modelPath(instanceId, filename)}
         options={options}
         onChange={(v) => onValueChange?.(v ?? "")}
         onMount={(editor) => setEditor(editor)}
@@ -163,12 +175,18 @@ export function MonacoEditorImpl({
   );
 }
 
-function defaultPath(filename?: string) {
+/**
+ * The model uri of an editor showing `filename`. Unique per editor, so
+ * two editors of eg. `app/compose.yaml` and `db/compose.yaml` never share
+ * (and dispose) one model. It ends with the file's base name, which
+ * name based language features match on (eg. a monaco-yaml schema's
+ * `fileMatch` glob). Without a filename monaco makes a unique uri itself.
+ */
+function modelPath(instanceId: number, filename?: string) {
   if (!filename) return undefined;
-  // Extract only the filename part of path,
-  // avoiding critical issue when path starts with '/'
-  const split = filename.split("/");
-  return split[split.length - 1];
+  // Only the base name: a leading '/' would break the uri.
+  const base = filename.split("/").pop() || "file";
+  return `inmemory://mogh-ui/${instanceId}/${encodeURIComponent(base)}`;
 }
 
 const MIN_DIFF_HEIGHT = 100;
@@ -191,6 +209,21 @@ export function MonacoDiffEditorImpl({
 
   const [editor, setEditor] =
     useState<monaco.editor.IStandaloneDiffEditor | null>(null);
+
+  // The subscription outlives renders, so it calls the latest callback.
+  const onModifiedValueChangeRef = useRef(onModifiedValueChange);
+  useEffect(() => {
+    onModifiedValueChangeRef.current = onModifiedValueChange;
+  }, [onModifiedValueChange]);
+
+  useEffect(() => {
+    if (!editor) return;
+    const modifiedEditor = editor.getModifiedEditor();
+    const subscription = modifiedEditor.onDidChangeModelContent(() => {
+      onModifiedValueChangeRef.current?.(modifiedEditor.getValue());
+    });
+    return () => subscription.dispose();
+  }, [editor]);
 
   const original_line_count = original?.split(/\r\n|\r|\n/).length ?? 0;
   const modified_line_count = modified?.split(/\r\n|\r|\n/).length ?? 0;
@@ -232,13 +265,7 @@ export function MonacoDiffEditorImpl({
         modified={modified}
         theme={currentTheme}
         options={options}
-        onMount={(editor) => {
-          const modifiedEditor = editor.getModifiedEditor();
-          modifiedEditor.onDidChangeModelContent((_) => {
-            onModifiedValueChange?.(modifiedEditor.getValue());
-          });
-          setEditor(editor);
-        }}
+        onMount={(editor) => setEditor(editor)}
       />
     </Box>
   );

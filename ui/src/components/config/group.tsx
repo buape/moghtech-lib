@@ -1,7 +1,7 @@
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import { ConfigFieldArgs, ConfigGroupArgs } from ".";
-import { ConfigInput, ConfigSelector, ConfigSwitch } from "./item";
-import { Group, Stack } from "@mantine/core";
+import { ConfigInput, ConfigItem, ConfigSelector, ConfigSwitch } from "./item";
+import { Group, NumberInput, Stack } from "@mantine/core";
 import { CircleQuestionMark } from "lucide-react";
 
 export function ConfigGroup<T>({
@@ -70,17 +70,20 @@ export function ConfigGroup<T>({
 
             case "number":
               return (
-                <ConfigInput
+                <ConfigItem
                   key={key}
                   label={args?.label ?? key}
-                  value={Number(value)}
-                  onValueChange={(value) =>
-                    setUpdate({ [key]: Number(value) } as Partial<T>)
-                  }
-                  disabled={args?.disabled || disabled}
-                  placeholder={args?.placeholder}
                   description={args?.description}
-                />
+                >
+                  <ConfigNumberInput
+                    value={typeof value === "number" ? value : undefined}
+                    onValueChange={(value) =>
+                      setUpdate({ [key]: value } as Partial<T>)
+                    }
+                    disabled={args?.disabled || disabled}
+                    placeholder={args?.placeholder}
+                  />
+                </ConfigItem>
               );
 
             case "boolean":
@@ -110,5 +113,47 @@ export function ConfigGroup<T>({
         }
       })}
     </Stack>
+  );
+}
+
+/**
+ * Only complete numbers reach `onValueChange`: partial input ('' or
+ * '-') stays in the input instead of becoming 0. On blur, the input
+ * shows the stored value again, so it never disagrees with what Save
+ * sends.
+ */
+function ConfigNumberInput({
+  value,
+  onValueChange,
+  disabled,
+  placeholder,
+}: {
+  value: number | undefined;
+  onValueChange: (value: number) => void;
+  disabled: boolean | undefined;
+  placeholder: string | undefined;
+}) {
+  // The text while it isn't the stored number. NumberInput passes
+  // strings for partial input, and for text it keeps as typed
+  // ('1.', '0.10', 14+ digits).
+  const [draft, setDraft] = useState<string>();
+  return (
+    <NumberInput
+      w={{ base: "85%", lg: 400 }}
+      value={draft ?? value ?? ""}
+      onChange={(input) => {
+        setDraft(typeof input === "string" ? input : undefined);
+        const number =
+          typeof input === "number"
+            ? input
+            : input.trim() === ""
+              ? NaN
+              : Number(input);
+        if (Number.isFinite(number)) onValueChange(number);
+      }}
+      onBlur={() => setDraft(undefined)}
+      disabled={disabled}
+      placeholder={placeholder}
+    />
   );
 }

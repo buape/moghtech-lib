@@ -2,9 +2,21 @@ import { useCombobox } from "@mantine/core";
 import { useWindowEvent } from "@mantine/hooks";
 import { useEffect, useState } from "react";
 
+/**
+ * Called on a matching key press. Return exactly `false` when the press
+ * was not handled (eg. the shortcut is currently inactive): the event is
+ * then left alone, so the browser default (eg. Enter activating a
+ * focused button or link) still happens. Any other return value handles
+ * the press, and its default is prevented.
+ *
+ * `e.defaultPrevented` tells whether an earlier listener already
+ * handled this press.
+ */
+export type KeyListenerHandler = (e: KeyboardEvent) => unknown;
+
 export function useKeyListener(
   listenKey: string,
-  onPress: () => void,
+  onPress: KeyListenerHandler,
   extra?: "shift" | "ctrl",
 ) {
   useWindowEvent("keydown", (e) => {
@@ -27,18 +39,25 @@ export function useKeyListener(
           ? e.ctrlKey || e.metaKey
           : true)
     ) {
+      // The handler decides first: a declined press keeps its default.
+      if (onPress(e) === false) return;
       e.preventDefault();
-      onPress();
     }
   });
 }
 
-export function useShiftKeyListener(listenKey: string, onPress: () => void) {
+export function useShiftKeyListener(
+  listenKey: string,
+  onPress: KeyListenerHandler,
+) {
   useKeyListener(listenKey, onPress, "shift");
 }
 
 /** Listens for ctrl (or CMD on mac) + the listenKey */
-export function useCtrlKeyListener(listenKey: string, onPress: () => void) {
+export function useCtrlKeyListener(
+  listenKey: string,
+  onPress: KeyListenerHandler,
+) {
   useKeyListener(listenKey, onPress, "ctrl");
 }
 

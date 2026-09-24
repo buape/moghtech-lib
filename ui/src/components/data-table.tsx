@@ -69,9 +69,26 @@ export type DataTableFeatures = typeof features;
 function loadStoredSorting(tableKey: string): SortingState | null {
   try {
     const stored = localStorage.getItem("data-table-" + tableKey);
-    return stored ? (JSON.parse(stored) as SortingState) : null;
+    if (!stored) return null;
+    const parsed: unknown = JSON.parse(stored);
+    // Anything else (eg. written by another version) is ignored.
+    const valid =
+      Array.isArray(parsed) &&
+      parsed.every(
+        (sort) =>
+          typeof sort?.id === "string" && typeof sort?.desc === "boolean",
+      );
+    return valid ? (parsed as SortingState) : null;
   } catch {
     return null;
+  }
+}
+
+function storeSorting(tableKey: string, sorting: SortingState) {
+  try {
+    localStorage.setItem("data-table-" + tableKey, JSON.stringify(sorting));
+  } catch {
+    // Storage blocked or full: the sorting just isn't remembered.
   }
 }
 
@@ -106,7 +123,11 @@ export interface DataTableProps<
     selectKey: (row: TData) => string;
     onSelect?: (selected: string[]) => void;
     state?: [RowSelectionState, Dispatch<SetStateAction<RowSelectionState>>];
-    disableRow?: boolean | ((row: Row<DataTableFeatures, TData>) => boolean);
+    /**
+     * Which rows can be selected: `false` for none, or a predicate
+     * returning `true` for the selectable rows. Default: all rows.
+     */
+    canSelectRow?: boolean | ((row: Row<DataTableFeatures, TData>) => boolean);
     color?: DefaultMantineColor;
   };
   caption?: string;
@@ -155,6 +176,8 @@ export function DataTable<TData extends RowData, TValue>({
     ? selectOptions.state
     : _internalState;
 
+  const canSelectRow = selectOptions?.canSelectRow;
+
   const table = useTable({
     features,
     data,
@@ -168,11 +191,11 @@ export function DataTable<TData extends RowData, TValue>({
     sortDescFirst,
     onRowSelectionChange: setRowSelection,
     getRowId: selectOptions?.selectKey,
-    enableRowSelection: selectOptions?.disableRow,
+    enableRowSelection: canSelectRow,
   });
 
   useEffect(() => {
-    localStorage.setItem("data-table-" + tableKey, JSON.stringify(sorting));
+    storeSorting(tableKey, sorting);
   }, [tableKey, sorting]);
 
   // Layout effect so the parent receives the initial (persisted) sorting
@@ -203,8 +226,7 @@ export function DataTable<TData extends RowData, TValue>({
             {i === 0 && selectOptions && (
               <Table.Th
                 onClick={() =>
-                  selectOptions.disableRow !== true &&
-                  table.toggleAllRowsSelected()
+                  canSelectRow !== false && table.toggleAllRowsSelected()
                 }
                 style={{
                   cursor: "pointer",
@@ -216,7 +238,7 @@ export function DataTable<TData extends RowData, TValue>({
               >
                 <Checkbox
                   color={selectOptions.color ?? "Neutral"}
-                  disabled={selectOptions.disableRow === true}
+                  disabled={canSelectRow === false}
                   checked={table.getIsAllRowsSelected()}
                   indeterminate={
                     // v9: getIsSomeRowsSelected is true even when all are selected

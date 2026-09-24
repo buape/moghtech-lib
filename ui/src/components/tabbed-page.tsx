@@ -55,7 +55,10 @@ export function TabbedPage<Tab extends string>({
     ? tabs.find(({ tab }) => tabSlug(tab) === querySlug)?.tab
     : undefined;
 
-  const selectedTab = queryTab ?? storedTab;
+  // A stored tab can be gone (eg. renamed in an app update).
+  const selectedTab =
+    queryTab ??
+    (tabs.some(({ tab }) => tab === storedTab) ? storedTab : defaultTab);
   const setSelectedTab = useCallback(
     (tab: Tab) => {
       setStoredTab(tab);

@@ -13,15 +13,18 @@ import {
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
 import * as MoghAuth from "mogh_auth_client";
-import { AlertTriangle, KeyRound } from "lucide-react";
+import { AlertTriangle, ChevronLeft, KeyRound } from "lucide-react";
 import { useEffect, useState } from "react";
+import { useInRouterContext } from "react-router-dom";
 import LoginHeader from "./header";
 import { LoginProviderButton, MAX_HEADER_LOGIN_PROVIDERS } from "./providers";
+import { externalLoginState } from "../external-flow";
 
 export * from "./providers";
 import {
-  authClient,
   BackButton,
+  backtoPath,
+  externalLogin,
   sanitizeQuery,
   useLogin,
   useLoginOptions,
@@ -47,8 +50,9 @@ export function LoginPage({
   /**
    * Whether another user is already signed in, which puts a back button
    * on the form. Pass it from the host app's own session query. Left
-   * out, the login page has to query the api itself, which counts 
-   * against its auth rate limit.
+   * out, the login page has to query the api itself. A token the server
+   * rejects is only sent once, but that request counts against its
+   * auth rate limit.
    */
   alreadyLoggedIn?: boolean;
   onLogin?: () => void;
@@ -64,22 +68,26 @@ export function LoginPage({
   const userId = useUserId({ enabled: _alreadyLoggedIn === undefined });
   const alreadyLoggedIn = _alreadyLoggedIn ?? !!userId.data?.id;
 
-  // Auto-redirect to the configured provider if disableAutoLogin is not set
+  // Auto-redirect to the configured provider if disableAutoLogin is
+  // not set. Not after an external login failed on this page load
+  // (`login_error`, see `useAuthState`): the provider would be asked
+  // again and again, and the user would never see why.
   useEffect(() => {
     if (options?.auto_redirect && !secondFactorPending) {
       const params = new URLSearchParams(location.search);
-      if (!params.has("disableAutoLogin")) {
-        authClient().externalLogin(options.auto_redirect);
+      if (
+        !params.has("disableAutoLogin") &&
+        !params.has("login_error") &&
+        !externalLoginState.failed
+      ) {
+        externalLogin(options.auto_redirect);
       }
     }
   }, [options?.auto_redirect, secondFactorPending]);
 
   // If signing in another user, need to redirect away from /login manually
   const maybeNavigate = location.pathname.startsWith("/login")
-    ? () =>
-        location.replace(
-          new URLSearchParams(location.search).get("backto") ?? "/",
-        )
+    ? () => location.replace(backtoPath())
     : undefined;
 
   const onSuccess = ({ jwt }: MoghAuth.Types.JwtResponse) => {
@@ -265,11 +273,7 @@ export function LoginPage({
               key={localForm.key("password")}
             />
             <Group mt="sm" justify="space-between">
-              {alreadyLoggedIn && (
-                <BackButton
-                  to={new URLSearchParams(location.search).get("backto") ?? "/"}
-                />
-              )}
+              {alreadyLoggedIn && <LoginBackButton />}
               <Group justify="end">
                 {showSignUp && (
                   <Button
@@ -307,11 +311,10 @@ export function LoginPage({
           </>
         )}
 
-        {alreadyLoggedIn && !(options?.local && !secondFactorPending) && (
+        {/* During the second factor, Cancel is the way back. */}
+        {alreadyLoggedIn && !options?.local && !secondFactorPending && (
           <Group>
-            <BackButton
-              to={new URLSearchParams(location.search).get("backto") ?? "/"}
-            />
+            <LoginBackButton />
           </Group>
         )}
 
@@ -411,5 +414,24 @@ export function LoginPage({
         )}
       </Fieldset>
     </Center>
+  );
+}
+
+/**
+ * Back to `backto` (see `backtoPath`), for a user who is already
+ * signed in. The login page is also rendered outside the host app's
+ * router (the second factor after an external login), where a router
+ * link can't be rendered.
+ */
+function LoginBackButton() {
+  const inRouter = useInRouterContext();
+  const to = backtoPath();
+  if (inRouter) {
+    return <BackButton to={to} />;
+  }
+  return (
+    <Button component="a" href={to} leftSection={<ChevronLeft size="1rem" />}>
+      Back
+    </Button>
   );
 }

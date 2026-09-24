@@ -24,6 +24,9 @@ export function deepCompare(a: any, b: any) {
   if (ta === "function") return true;
 
   if (ta === "object") {
+    // An array never equals a plain object with the same entries.
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+
     const ea = Object.entries(a);
     const kb = Object.keys(b);
 
@@ -31,6 +34,9 @@ export function deepCompare(a: any, b: any) {
     if (ea.length !== kb.length) return false;
 
     for (const [key, va] of ea) {
+      // Same keys: `{ a: undefined }` is not `{ b: undefined }`.
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+
       const vb = b[key];
 
       // Early return when any not equal

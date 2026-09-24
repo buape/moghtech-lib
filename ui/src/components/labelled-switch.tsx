@@ -22,6 +22,7 @@ export function LabelledSwitch({
   label,
   groupProps,
   labelProps,
+  disabled,
   ...switchProps
 }: LabelledSwitchProps) {
   return (
@@ -29,13 +30,17 @@ export function LabelledSwitch({
       gap="xs"
       onClick={(e) => {
         e.preventDefault();
+        // The whole group is the click target (the switch ignores
+        // pointer events), so it has to honor `disabled` itself.
+        if (disabled) return;
         onCheckedChange(!checked);
       }}
       className="bordered-light"
       px="xs"
       py={4}
       bdrs="sm"
-      style={{ cursor: "pointer" }}
+      style={{ cursor: disabled ? "not-allowed" : "pointer" }}
+      aria-disabled={disabled || undefined}
       justify="space-between"
       w={{ base: "100%", xs: "fit-content" }}
       {...groupProps}
@@ -45,6 +50,7 @@ export function LabelledSwitch({
       </Text>
       <Switch
         checked={checked}
+        disabled={disabled}
         style={{ pointerEvents: "none" }}
         {...switchProps}
       />

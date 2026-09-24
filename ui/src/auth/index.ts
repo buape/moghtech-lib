@@ -5,7 +5,14 @@ import {
   useQuery,
 } from "@tanstack/react-query";
 import * as MoghAuth from "mogh_auth_client";
-import { sanitizeQueryInner } from "./utils";
+import { useState } from "react";
+import {
+  externalLoginState,
+  markExternalFlow,
+  takeExternalFlowReturn,
+} from "./external-flow";
+import { guardJwt, SEND_REJECTED_ONCE, sendableJwt } from "./rejected-jwt";
+import { backtoPath, sanitizeQueryInner } from "./utils";
 
 export * from "./issuers";
 export * from "./login";
@@ -26,6 +33,33 @@ export function setAuthUrl(url: string) {
 
 export function authClient() {
   return MoghAuth.MoghAuthClient(AUTH_URL, MoghAuth.LOGIN_TOKENS!.jwt());
+}
+
+/**
+ * Log in with an external login provider: redirects to it, like
+ * `authClient().externalLogin`. From the login page the provider
+ * sends the user back to [backtoPath], which never leaves the app,
+ * from anywhere else back to the current page.
+ *
+ * Also notes that this tab started the login, so the reason a failed
+ * login comes back with is shown (see [useAuthState]).
+ *
+ * @param providerSlug The provider `slug` from `GetLoginOptions`.
+ */
+export function externalLogin(providerSlug: string) {
+  // The client builds the redirect from the url's `backto`,
+  // only hand it a checked one.
+  const search = new URLSearchParams(location.search);
+  if (search.has("backto")) {
+    search.set("backto", backtoPath());
+    history.replaceState(
+      history.state,
+      "",
+      `${location.pathname}?${search}${location.hash}`,
+    );
+  }
+  markExternalFlow();
+  authClient().externalLogin(providerSlug);
 }
 
 /**
@@ -52,14 +86,34 @@ export function useLoginOptions() {
 }
 
 /**
+ * Runs a manage query. A token the server refuses with one of
+ * `rejectedOn` isn't sent again by the queries here (`sendableJwt`):
+ * every request which fails auth counts against the server's per IP
+ * auth rate limit, which logging in shares.
+ */
+function manageQuery<T>(
+  rejectedOn: number[],
+  query: (client: ReturnType<typeof authClient>) => Promise<T>,
+): Promise<T> {
+  const jwt = MoghAuth.LOGIN_TOKENS!.jwt();
+  return guardJwt(jwt, rejectedOn, () =>
+    query(MoghAuth.MoghAuthClient(AUTH_URL, jwt)),
+  );
+}
+
+/**
  * List all the external login providers, including disabled ones.
  * Only available to admin users.
  */
 export function useExternalLoginProviders(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["ListExternalLoginProviders"],
-    queryFn: () => authClient().manage("ListExternalLoginProviders", {}),
-    enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
+    queryFn: () =>
+      manageQuery([401], (client) =>
+        client.manage("ListExternalLoginProviders", {}),
+      ),
+    enabled:
+      (options?.enabled ?? true) && sendableJwt(MoghAuth.LOGIN_TOKENS!.jwt()),
     // A user who isn't an admin gets the same answer every time
     retry: false,
   });
@@ -72,8 +126,10 @@ export function useExternalLoginProviders(options?: { enabled?: boolean }) {
 export function useTrustedIssuers(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["ListTrustedIssuers"],
-    queryFn: () => authClient().manage("ListTrustedIssuers", {}),
-    enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
+    queryFn: () =>
+      manageQuery([401], (client) => client.manage("ListTrustedIssuers", {})),
+    enabled:
+      (options?.enabled ?? true) && sendableJwt(MoghAuth.LOGIN_TOKENS!.jwt()),
     // A user who isn't an admin gets the same answer every time
     retry: false,
   });
@@ -94,7 +150,10 @@ export function useLogin<
     ...config,
     mutationKey: [type],
     mutationFn: (params: P) => authClient().login<T, R>(type, params),
-    onError: (e: { result?: { error?: string; trace?: string[] } }, ...args) => {
+    onError: (
+      e: { result?: { error?: string; trace?: string[] } },
+      ...args
+    ) => {
       console.log("Login error:", e);
       const msg = e.result?.error ?? "Unknown error. See console.";
       // Skip the causes the message already shows, eg. a failed
@@ -123,13 +182,19 @@ export function useLogin<
  * Pass `enabled: false` where the host app already knows the answer
  * from its own session query. Every request which fails auth counts
  * against the server's per IP auth rate limit, so a token the server
- * rejects should only ever be sent once.
+ * rejects is only ever sent once: it isn't retried or refetched
+ * (whatever the host's query client defaults), and the query stays
+ * disabled until there is another token.
  */
 export function useUserId(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["GetUserId"],
-    queryFn: () => authClient().manage("GetUserId", {}),
-    enabled: (options?.enabled ?? true) && !!MoghAuth.LOGIN_TOKENS!.jwt(),
+    queryFn: () =>
+      manageQuery([401, 403], (client) => client.manage("GetUserId", {})),
+    enabled:
+      (options?.enabled ?? true) && sendableJwt(MoghAuth.LOGIN_TOKENS!.jwt()),
+    // The server would refuse the token again
+    ...SEND_REJECTED_ONCE,
   });
 }
 
@@ -148,7 +213,10 @@ export function useManageAuth<
     ...config,
     mutationKey: [type],
     mutationFn: (params: P) => authClient().manage<T, R>(type, params),
-    onError: (e: { result?: { error?: string; trace?: string[] } }, ...args) => {
+    onError: (
+      e: { result?: { error?: string; trace?: string[] } },
+      ...args
+    ) => {
       console.log("Manage auth error:", e);
       // Not a failure of the request itself: changes to how the
       // user logs in are only accepted shortly after logging in.
@@ -188,30 +256,100 @@ let jwt_redeem_sent = false;
 let passkey_sent = false;
 let external_error_shown = false;
 
-/// returns whether to show login / loading screen depending on state of exchange token loop
+/** The longest reason from the url shown in the notification. */
+const MAX_EXTERNAL_ERROR_LENGTH = 300;
+
+/**
+ * Removes params from the url without a reload,
+ * which would drop the notifications.
+ */
+function removeQueryParams(...params: string[]) {
+  const search = new URLSearchParams(location.search);
+  for (const param of params) search.delete(param);
+  const query = search.toString();
+  history.replaceState(
+    history.state,
+    "",
+    `${location.pathname}${query.length ? "?" + query : ""}${location.hash}`,
+  );
+}
+
+/**
+ * Handles what an external login redirects back to the app with.
+ * Call it at the top of the app, before (outside) its router:
+ * - `redeem_ready`: redeems the login for a token.
+ * - `passkey`: asks for the passkey, the login's second factor.
+ * - `login_error` / `link_error`: shows why an external login / link
+ *   failed (`AuthImpl::external_login_error_redirect` on the server).
+ *   Anyone can put text in a link, so the server's reason is only
+ *   shown after an external login / link this tab started through
+ *   mogh_ui ([externalLogin], `LoginPage`, `LinkedLogins`), on the
+ *   page load it came back to. Otherwise the notification says the
+ *   login didn't complete, and the text is only logged to the console.
+ *
+ * The first page load after leaving for the provider ends the flow,
+ * whatever it came back with (also a successful login or link, or a
+ * second factor to ask for). So call this on every page of the app.
+ *
+ * Returns whether to show a loader while the token is redeemed
+ * (`jwt_redeem_ready`, false again if that fails), or the login page
+ * for the second factor (`passkey_pending`, `totp`).
+ */
 export function useAuthState() {
+  // A failed redeem falls back to the app, eg. its login page.
+  const [redeemFailed, setRedeemFailed] = useState(false);
   const onSuccess = ({ jwt }: MoghAuth.Types.JwtResponse) => {
     MoghAuth.LOGIN_TOKENS!.add_and_change(jwt);
     sanitizeQueryInner(search);
   };
   const { mutate: redeemJwt } = useLogin("ExchangeForJwt", {
     onSuccess,
+    onError: () => {
+      // Retrying can't help, the server has ended the login.
+      externalLoginState.failed = true;
+      removeQueryParams("redeem_ready");
+      setRedeemFailed(true);
+    },
   });
   const { mutate: completePasskeyLogin } = useLogin("CompletePasskeyLogin", {
     onSuccess,
   });
   const search = new URLSearchParams(location.search);
+  // Whether the tab is back from an external login / link it started.
+  const external_flow_return = takeExternalFlowReturn();
 
+  // A link can carry anything here: a challenge which can't be
+  // read must not crash the app, which renders this on every page.
   const _passkey = search.get("passkey");
-  const passkey = _passkey
-    ? JSON.parse(MoghAuth.Passkey.base64UrlDecode(_passkey))
-    : null;
+  let passkeyRequest:
+    | ReturnType<typeof MoghAuth.Passkey.prepareRequestChallengeResponse>
+    | undefined;
+  if (_passkey) {
+    try {
+      passkeyRequest = MoghAuth.Passkey.prepareRequestChallengeResponse(
+        JSON.parse(MoghAuth.Passkey.base64UrlDecode(_passkey)),
+      );
+    } catch (e) {
+      console.error("Invalid passkey challenge:", e);
+      search.delete("passkey");
+      removeQueryParams("passkey");
+      if (!passkey_sent) {
+        passkey_sent = true;
+        notifications.show({
+          title: "Invalid passkey challenge",
+          message: "Log in again to continue.",
+          color: "red",
+        });
+      }
+    }
+  }
 
   // guard against multiple reqs sent
   // maybe isPending would do this but not sure about with render loop, this for sure will.
-  if (passkey && !passkey_sent) {
+  if (passkeyRequest && !passkey_sent) {
+    passkey_sent = true;
     navigator.credentials
-      .get(MoghAuth.Passkey.prepareRequestChallengeResponse(passkey))
+      .get(passkeyRequest)
       .then((credential) => completePasskeyLogin({ credential }))
       .catch((e) => {
         console.error(e);
@@ -221,30 +359,43 @@ export function useAuthState() {
           color: "red",
         });
       });
-    passkey_sent = true;
   }
 
   // An external login / link which failed comes back with the reason
   // (`AuthImpl::external_login_error_redirect` on the server).
-  const external_error =
-    search.get("login_error") ?? search.get("link_error");
+  const external_error = search.get("login_error") ?? search.get("link_error");
   if (external_error && !external_error_shown) {
     external_error_shown = true;
+    const link = !search.has("login_error");
+    if (!link) {
+      // Don't auto redirect to the provider again, it would loop.
+      externalLoginState.failed = true;
+    }
+    let message: string;
+    if (external_flow_return) {
+      message =
+        external_error.length > MAX_EXTERNAL_ERROR_LENGTH
+          ? external_error.slice(0, MAX_EXTERNAL_ERROR_LENGTH) + "..."
+          : external_error;
+    } else {
+      // Not a flow started here, the text may come from anyone.
+      console.warn(
+        `Unverified ${link ? "link_error" : "login_error"} in the url:`,
+        external_error,
+      );
+      message = link
+        ? "Linking the external login didn't complete."
+        : "The external login didn't complete.";
+    }
     notifications.show({
-      title: search.has("link_error") ? "Failed to link login" : "Login failed",
-      message: external_error,
+      title: link ? "Failed to link login" : "Login failed",
+      message,
       color: "red",
       autoClose: 10_000,
     });
-    // Without a reload, which would drop the notification.
     search.delete("login_error");
     search.delete("link_error");
-    const query = search.toString();
-    history.replaceState(
-      history.state,
-      "",
-      `${location.pathname}${query.length ? "?" + query : ""}`,
-    );
+    removeQueryParams("login_error", "link_error");
   }
 
   const jwt_redeem_ready = search.get("redeem_ready") === "true";
@@ -257,8 +408,8 @@ export function useAuthState() {
   }
 
   return {
-    jwt_redeem_ready,
-    passkey_pending: !!passkey,
+    jwt_redeem_ready: jwt_redeem_ready && !redeemFailed,
+    passkey_pending: !!passkeyRequest,
     totp: search.get("totp") === "true",
   };
 }

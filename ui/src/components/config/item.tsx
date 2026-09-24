@@ -219,7 +219,9 @@ export function ConfigList<T>({
           disabled={inputListProps.disabled}
         >
           {addLabel ??
-            ("Add " + label?.endsWith("s") ? label?.slice(0, -1) : label)}
+            (label
+              ? "Add " + (label.endsWith("s") ? label.slice(0, -1) : label)
+              : "Add")}
         </Button>
       )}
     </ConfigItem>

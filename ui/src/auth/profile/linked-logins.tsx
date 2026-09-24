@@ -12,6 +12,7 @@ import {
   useManageAuth,
 } from "../..";
 import { CloudCog, KeyRound, Plus, Unlink } from "lucide-react";
+import { markExternalFlow } from "../external-flow";
 
 /** An external login linked to the user, as stored by the app. */
 export interface LinkedLogin {
@@ -203,14 +204,17 @@ export function LinkedLogins({
                 <Button
                   // Through the mutation for its error notification
                   onClick={() =>
-                    beginLink({}).then(() =>
+                    beginLink({}).then(() => {
+                      // The reason a failed link comes back
+                      // with is shown (see `useAuthState`).
+                      markExternalFlow();
                       location.replace(
                         authClient().externalLinkUrl(
                           // The url names the provider by its slug
                           method.slug ?? providerId,
                         ),
-                      ),
-                    )
+                      );
+                    })
                   }
                   leftSection={<Plus size="1rem" />}
                   maw={220}

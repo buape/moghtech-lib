@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useDisclosure } from "@mantine/hooks";
 import { Box, Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { Save } from "lucide-react";
@@ -7,6 +7,7 @@ import { MonacoDiffEditor, MonacoLanguage } from "../monaco";
 import { deepCompare } from "../../utils";
 import { fmtSnakeCaseToUpperSpaceCase } from "../../formatting";
 import { useCtrlKeyListener, useKeyListener } from "../../hooks";
+import { confirmDialogOpen, useCountOpenConfirm } from "./confirm-open";
 
 export interface ConfirmUpdateProps<T> {
   original: T;
@@ -17,13 +18,24 @@ export interface ConfirmUpdateProps<T> {
   language?: MonacoLanguage;
   fileContentsLanguage?: MonacoLanguage;
   fullWidth?: boolean;
+  /** Ctrl / Cmd + Enter opens the dialog. Default: true */
   openKeyListener?: boolean;
+  /** Enter in the open dialog confirms. Default: true */
   confirmKeyListener?: boolean;
   enableFancyToml?: boolean;
   /** Fields whose values are never shown, see `ConfigProps.secretKeys`. */
   secretKeys?: (keyof T)[];
 }
 
+/**
+ * A Save button opening a dialog which lists the changes (`update`
+ * against `original`), saved with the dialog's own Save button.
+ *
+ * Keys: Ctrl / Cmd + Enter (outside of text inputs) opens the dialog,
+ * Enter in the open dialog confirms. When several are mounted, only the
+ * first one takes a press, and none opens while a confirm dialog (of
+ * any ConfirmUpdate / Config) is open.
+ */
 export function ConfirmUpdate<T>({
   original,
   update,
@@ -40,80 +52,37 @@ export function ConfirmUpdate<T>({
 }: ConfirmUpdateProps<T>) {
   const [opened, { open, close }] = useDisclosure();
 
-  const handleConfirm = async () => {
-    await onConfirm();
-    close();
-  };
-
-  useKeyListener("Enter", () => {
-    if (!opened || !confirmKeyListener) {
-      return;
-    }
-    handleConfirm();
-  });
-
-  useCtrlKeyListener("Enter", () => {
-    if (opened || !openKeyListener) {
-      return;
+  useCtrlKeyListener("Enter", (e) => {
+    // Declined presses keep their default. `defaultPrevented`: another
+    // ConfirmUpdate on the page already took this one.
+    if (
+      opened ||
+      confirmDialogOpen() ||
+      !openKeyListener ||
+      disabled ||
+      e.defaultPrevented
+    ) {
+      return false;
     }
     open();
   });
 
   return (
     <>
-      <Modal
-        title={<Text size="xl">Confirm Update</Text>}
+      <ConfirmUpdateModal
         opened={opened}
         onClose={close}
-        size="auto"
-        styles={{ content: { overflowY: "hidden" } }}
-      >
-        <Stack
-          gap="xl"
-          w={1400}
-          maw={{
-            base: "calc(100vw - 100px)",
-            xs: "calc(100vw - 150px)",
-            sm: "calc(100vw - 200px)",
-            md: "calc(100vw - 250px)",
-          }}
-          my="lg"
-          style={{ overflowY: "hidden" }}
-        >
-          <Stack
-            mah="min(calc(100vh - 300px), 800px)"
-            style={{ overflowY: "auto" }}
-          >
-            {Object.entries(update)
-              .filter(([key, val]) => !deepCompare((original as any)[key], val))
-              .map(([key, val], i) => (
-                <ConfirmUpdateItem
-                  key={i}
-                  _key={key as any}
-                  val={val as any}
-                  previous={original}
-                  language={language}
-                  fileContentsLanguage={fileContentsLanguage}
-                  enableFancyToml={enableFancyToml}
-                  secret={secretKeys?.includes(key as keyof T)}
-                />
-              ))}
-          </Stack>
-          <Group justify="flex-end">
-            <Button
-              leftSection={<Save size="1rem" />}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleConfirm();
-              }}
-              w={{ base: "100%", xs: 200 }}
-              loading={loading}
-            >
-              Save
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
+        original={original}
+        update={update}
+        onConfirm={onConfirm}
+        loading={loading}
+        disabled={disabled}
+        language={language}
+        fileContentsLanguage={fileContentsLanguage}
+        confirmKeyListener={confirmKeyListener}
+        enableFancyToml={enableFancyToml}
+        secretKeys={secretKeys}
+      />
 
       <Button
         leftSection={<Save size="1rem" />}
@@ -128,6 +97,152 @@ export function ConfirmUpdate<T>({
         Save
       </Button>
     </>
+  );
+}
+
+export interface ConfirmUpdateModalProps<T> {
+  opened: boolean;
+  onClose: () => void;
+  original: T;
+  update: Partial<T>;
+  /**
+   * The dialog closes once this resolves. When it rejects, the dialog
+   * stays open to retry (showing the error is up to `onConfirm`).
+   */
+  onConfirm: () => Promise<unknown>;
+  loading?: boolean;
+  disabled?: boolean;
+  language?: MonacoLanguage;
+  fileContentsLanguage?: MonacoLanguage;
+  /** Enter in the open dialog confirms. Default: true */
+  confirmKeyListener?: boolean;
+  enableFancyToml?: boolean;
+  /** Fields whose values are never shown, see `ConfigProps.secretKeys`. */
+  secretKeys?: (keyof T)[];
+}
+
+/**
+ * The confirm dialog of `ConfirmUpdate`, with its open state controlled
+ * by the caller. For one dialog behind several Save buttons (see
+ * `Config`). Runs one save at a time: presses while a save is in flight
+ * are ignored.
+ */
+export function ConfirmUpdateModal<T>({
+  opened,
+  onClose,
+  original,
+  update,
+  onConfirm,
+  loading,
+  disabled,
+  language,
+  fileContentsLanguage,
+  confirmKeyListener = true,
+  enableFancyToml,
+  secretKeys,
+}: ConfirmUpdateModalProps<T>) {
+  const [saving, setSaving] = useState(false);
+  // State lags a render behind, the ref stops a second press in the
+  // same tick (eg. key repeat) from sending the update again.
+  const inFlight = useRef(false);
+  useCountOpenConfirm(opened);
+
+  const handleConfirm = async () => {
+    if (disabled || inFlight.current) return;
+    inFlight.current = true;
+    setSaving(true);
+    try {
+      await onConfirm();
+      onClose();
+    } catch (e) {
+      console.error("Update not saved:", e);
+    } finally {
+      inFlight.current = false;
+      setSaving(false);
+    }
+  };
+
+  useKeyListener("Enter", (e) => {
+    // Enter on a focused button / link inside the dialog (close, show /
+    // hide, the Save button itself) does what that element does.
+    if (
+      !opened ||
+      !confirmKeyListener ||
+      e.defaultPrevented ||
+      isInteractiveTarget(e.target)
+    ) {
+      return false;
+    }
+    handleConfirm();
+  });
+
+  return (
+    <Modal
+      title={<Text size="xl">Confirm Update</Text>}
+      opened={opened}
+      onClose={onClose}
+      size="auto"
+      styles={{ content: { overflowY: "hidden" } }}
+    >
+      <Stack
+        gap="xl"
+        w={1400}
+        maw={{
+          base: "calc(100vw - 100px)",
+          xs: "calc(100vw - 150px)",
+          sm: "calc(100vw - 200px)",
+          md: "calc(100vw - 250px)",
+        }}
+        my="lg"
+        style={{ overflowY: "hidden" }}
+      >
+        <Stack
+          mah="min(calc(100vh - 300px), 800px)"
+          style={{ overflowY: "auto" }}
+        >
+          {Object.entries(update)
+            .filter(([key, val]) => !deepCompare((original as any)[key], val))
+            .map(([key, val], i) => (
+              <ConfirmUpdateItem
+                key={i}
+                _key={key as any}
+                val={val as any}
+                previous={original}
+                language={language}
+                fileContentsLanguage={fileContentsLanguage}
+                enableFancyToml={enableFancyToml}
+                secret={secretKeys?.includes(key as keyof T)}
+              />
+            ))}
+        </Stack>
+        <Group justify="flex-end">
+          <Button
+            // Focused when the dialog opens, so Enter saves natively.
+            data-autofocus
+            leftSection={<Save size="1rem" />}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleConfirm();
+            }}
+            w={{ base: "100%", xs: 200 }}
+            loading={loading || saving}
+            disabled={disabled}
+          >
+            Save
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
+/** Elements with their own Enter behavior (buttons, links, tabs, ...). */
+function isInteractiveTarget(target: EventTarget | null) {
+  return (
+    target instanceof Element &&
+    !!target.closest(
+      "button, a[href], summary, [role=button], [role=link], [role=tab], [role=menuitem], [role=option]",
+    )
   );
 }
 

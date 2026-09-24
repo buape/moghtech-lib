@@ -48,9 +48,16 @@ export function TextUpdateModal({
   monacoLanguage,
   ...modalProps
 }: TextUpdateModalProps) {
-  const [opened, { open, close }] = useDisclosure();
+  const [opened, { open: _open, close }] = useDisclosure();
+  // The draft while the modal is open.
   const [value, setValue] = useState(_value);
   useEffect(() => setValue(_value), [_value]);
+  // Starts from the current value: a draft closed without Update (or
+  // whose update failed) is dropped.
+  const open = () => {
+    setValue(_value);
+    _open();
+  };
   const onClick = () => {
     onUpdate(value);
     close();
@@ -106,7 +113,7 @@ export function TextUpdateModal({
         </Stack>
       </Modal>
 
-      {target ? target(open) : defaultTarget(open, value)}
+      {target ? target(open) : defaultTarget(open, _value)}
     </>
   );
 }
