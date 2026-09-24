@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, str::FromStr as _};
+use std::{net::SocketAddr, str::FromStr as _, sync::Arc};
 
 use anyhow::Context as _;
 use axum::{
@@ -6,6 +6,11 @@ use axum::{
   http::{HeaderValue, header},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
+use rustls::{
+  ServerConfig as TlsServerConfig,
+  crypto::CryptoProvider,
+  pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
@@ -13,6 +18,8 @@ pub use axum_server;
 pub use mogh_request_ip::TrustedProxies;
 
 // Dev dependencies used by the integration tests only.
+#[cfg(test)]
+use reqwest as _;
 #[cfg(test)]
 use tokio as _;
 #[cfg(test)]
@@ -27,6 +34,9 @@ pub trait ServerConfig {
     "[::]"
   }
   fn port(&self) -> u16;
+  /// Serve https with the PEM [cert][Self::ssl_cert_file] /
+  /// [key][Self::ssl_key_file] files. The rustls crypto provider
+  /// installed as the process default is used, else aws-lc-rs.
   fn ssl_enabled(&self) -> bool {
     false
   }
@@ -78,6 +88,14 @@ pub trait ServerConfig {
   /// empty means private ranges, `all` / `none` / `private`
   /// keywords are supported, else the CIDR ranges given.
   /// Default: [TrustedProxies::private].
+  ///
+  /// ⚠️ The default believes **any** private peer, not only the
+  /// proxy. When public clients can reach the app from a private
+  /// address (a port published through Docker's userland proxy,
+  /// rootless Docker / Podman, Kubernetes SNAT, hosts on the same
+  /// network / VPN), they choose their own ip. Narrow it to the
+  /// proxy address, or [TrustedProxies::None] when nothing is in
+  /// front of the app, see [TrustedProxies::default].
   fn trusted_proxies(&self) -> TrustedProxies {
     TrustedProxies::default()
   }
@@ -158,12 +176,9 @@ pub async fn serve_app(
     // Run the server with TLS (https)
     info!("🔒 Server SSL Enabled");
     info!("Server starting on https://{socket_addr}");
-    let ssl_config = RustlsConfig::from_pem_file(
-      config.ssl_cert_file(),
-      config.ssl_key_file(),
-    )
-    .await
-    .context("Invalid ssl cert / key")?;
+    let ssl_config =
+      rustls_config(config.ssl_cert_file(), config.ssl_key_file())
+        .context("Invalid ssl cert / key")?;
     let mut server =
       axum_server::bind_rustls(socket_addr, ssl_config);
     if let Some(handle) = handle.into() {
@@ -186,4 +201,46 @@ pub async fn serve_app(
       .await
       .context("Failed to start http server")
   }
+}
+
+/// Builds the https config from the PEM cert / key files.
+///
+/// `RustlsConfig::from_pem_file` lets rustls pick the crypto
+/// provider from its crate features, which panics when both
+/// `ring` and `aws-lc-rs` end up in the binary (eg together with
+/// mogh_auth_server). Instead use the provider the app installed
+/// as process default, else aws-lc-rs (what axum-server enables).
+fn rustls_config(
+  cert_file: &str,
+  key_file: &str,
+) -> anyhow::Result<RustlsConfig> {
+  let certs = CertificateDer::pem_file_iter(cert_file)
+    .with_context(|| {
+      format!("Failed to read ssl cert file at {cert_file}")
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .with_context(|| {
+      format!("Failed to parse ssl cert file at {cert_file}")
+    })?;
+  anyhow::ensure!(
+    !certs.is_empty(),
+    "No certificate in ssl cert file at {cert_file}"
+  );
+  let key =
+    PrivateKeyDer::from_pem_file(key_file).with_context(|| {
+      format!("Failed to read ssl key file at {key_file}")
+    })?;
+  let provider =
+    CryptoProvider::get_default().cloned().unwrap_or_else(|| {
+      Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    });
+  let mut config = TlsServerConfig::builder_with_provider(provider)
+    .with_safe_default_protocol_versions()
+    .context("Unsupported TLS crypto provider")?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("Failed to use ssl cert / key")?;
+  // Same as axum-server's own configs.
+  config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+  Ok(RustlsConfig::from_config(Arc::new(config)))
 }
