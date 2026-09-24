@@ -10,6 +10,7 @@ mod common;
 
 mod api_keys;
 mod app_api;
+mod disabled_users;
 mod local_auth;
 mod oidc;
 mod providers;

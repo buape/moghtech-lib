@@ -27,6 +27,7 @@ import {
 } from "mogh_ui";
 import { KeyRound, Plus, Trash, User } from "lucide-react";
 import { useState } from "react";
+import { Types } from "example_client";
 import {
   useInvalidate,
   useRead,
@@ -145,6 +146,11 @@ function Credentials({
   );
 }
 
+const KEY_KIND_LABEL: Record<Types.ApiKeyKind, string> = {
+  [Types.ApiKeyKind.ApiKey]: "Api Key",
+  [Types.ApiKeyKind.SigningKey]: "Signing Key",
+};
+
 function ApiKeys() {
   const keys = useRead("ListApiKeys", {});
   const invalidate = useInvalidate();
@@ -156,7 +162,7 @@ function ApiKeys() {
   const { mutate: deleteKey } = useManageAuth("DeleteApiKey", {
     onSuccess: onDeleted,
   });
-  const { mutate: deleteKeyV2 } = useManageAuth("DeleteApiKeyV2", {
+  const { mutate: deleteSigningKey } = useManageAuth("DeleteSigningKey", {
     onSuccess: onDeleted,
   });
   return (
@@ -183,7 +189,7 @@ function ApiKeys() {
                 <Text fw="bold">{key.name}</Text>
               </Table.Td>
               <Table.Td>
-                <Badge>{key.kind}</Badge>
+                <Badge>{KEY_KIND_LABEL[key.kind]}</Badge>
               </Table.Td>
               <Table.Td>
                 <Code>{key.key.slice(0, 16)}...</Code>
@@ -201,9 +207,9 @@ function ApiKeys() {
                     color="red"
                     aria-label={`Delete api key ${key.name}`}
                     onClick={() =>
-                      key.kind === "V1"
+                      key.kind === Types.ApiKeyKind.ApiKey
                         ? deleteKey({ key: key.key })
-                        : deleteKeyV2({ public_key: key.key })
+                        : deleteSigningKey({ public_key: key.key })
                     }
                   >
                     <Trash size="1rem" />
@@ -228,7 +234,7 @@ function NewApiKeyModal({
 }) {
   const invalidate = useInvalidate();
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<"V1" | "V2">("V1");
+  const [kind, setKind] = useState<Types.ApiKeyKind>(Types.ApiKeyKind.ApiKey);
   // Shown once, the server doesn't keep them.
   const [created, setCreated] = useState<{ label: string; value: string }[]>();
   const onSuccess = () => invalidate(["ListApiKeys"], ["GetStats"]);
@@ -241,7 +247,7 @@ function NewApiKeyModal({
       ]);
     },
   });
-  const { mutate: createV2 } = useManageAuth("CreateApiKeyV2", {
+  const { mutate: createSigningKey } = useManageAuth("CreateSigningKey", {
     onSuccess: ({ private_key }) => {
       onSuccess();
       setCreated([{ label: "Private Key", value: private_key ?? "" }]);
@@ -283,19 +289,22 @@ function NewApiKeyModal({
           />
           <SegmentedControl
             value={kind}
-            onChange={(kind) => setKind(kind as "V1" | "V2")}
+            onChange={(kind) => setKind(kind as Types.ApiKeyKind)}
             data={[
-              { value: "V1", label: "Key + Secret" },
-              { value: "V2", label: "Signed requests (key pair)" },
+              { value: Types.ApiKeyKind.ApiKey, label: "Key + Secret" },
+              {
+                value: Types.ApiKeyKind.SigningKey,
+                label: "Signing Key (key pair)",
+              },
             ]}
           />
           <Group justify="end">
             <Button
               disabled={!name}
               onClick={() =>
-                kind === "V1"
+                kind === Types.ApiKeyKind.ApiKey
                   ? create({ name, expires: 0, cidr_whitelist: [] })
-                  : createV2({
+                  : createSigningKey({
                       name,
                       expires: 0,
                       cidr_whitelist: [],

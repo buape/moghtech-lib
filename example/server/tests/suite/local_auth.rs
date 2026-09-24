@@ -433,3 +433,108 @@ async fn manage_api_requires_valid_credentials() {
     );
   }
 }
+
+/// bcrypt only uses the first 72 bytes of a password: longer ones
+/// would log in with anything sharing them, so they are refused.
+#[tokio::test]
+async fn passwords_longer_than_bcrypt_uses_are_refused() {
+  let app = TestApp::spawn().await;
+  for password in [
+    "a".repeat(73),
+    // 25 characters, 75 bytes
+    "密".repeat(25),
+  ] {
+    let res = app
+      .client()
+      .login(SignUpLocalUser {
+        username: "admin".into(),
+        password: password.clone(),
+      })
+      .await;
+    assert_eq!(status_of(res), StatusCode::BAD_REQUEST, "{password}");
+  }
+
+  // 72 bytes is fine, and all of them count.
+  let longest = "密".repeat(24);
+  let admin = app
+    .client()
+    .login(SignUpLocalUser {
+      username: "admin".into(),
+      password: longest.clone(),
+    })
+    .await
+    .unwrap();
+  let admin = app.client().with_auth(ClientAuth::Jwt(admin.jwt));
+  let prefix = app
+    .client()
+    .login(LoginLocalUser {
+      username: "admin".into(),
+      password: "密".repeat(23),
+    })
+    .await;
+  assert_eq!(status_of(prefix), StatusCode::UNAUTHORIZED);
+  app
+    .client()
+    .login(LoginLocalUser {
+      username: "admin".into(),
+      password: longest,
+    })
+    .await
+    .unwrap();
+
+  // Updating the password is checked the same way.
+  let res = admin
+    .manage(UpdatePassword {
+      password: "é".repeat(37),
+    })
+    .await;
+  assert_eq!(status_of(res), StatusCode::BAD_REQUEST);
+}
+
+/// Wrong passwords sent at once get no more guesses than the
+/// rate limit allows, they don't all run before any is counted.
+#[tokio::test]
+async fn concurrent_wrong_passwords_are_bounded_by_the_rate_limit() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    rate_limit: Some((5, 60)),
+    ..Default::default()
+  })
+  .await;
+  app.sign_up("admin").await;
+
+  let mut requests = tokio::task::JoinSet::new();
+  for i in 0..20 {
+    let client = app.client();
+    requests.spawn(async move {
+      status_of(
+        client
+          .login(LoginLocalUser {
+            username: "admin".into(),
+            password: format!("wrong-password-{i}"),
+          })
+          .await,
+      )
+    });
+  }
+  let statuses = requests.join_all().await;
+  let checked = statuses
+    .iter()
+    .filter(|status| **status == StatusCode::UNAUTHORIZED)
+    .count();
+  let refused = statuses
+    .iter()
+    .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
+    .count();
+  assert_eq!(checked, 5, "{statuses:?}");
+  assert_eq!(refused, 15, "{statuses:?}");
+
+  // The right password is refused as well now.
+  let res = app
+    .client()
+    .login(LoginLocalUser {
+      username: "admin".into(),
+      password: PASSWORD.into(),
+    })
+    .await;
+  assert_eq!(status_of(res), StatusCode::TOO_MANY_REQUESTS);
+}

@@ -8,7 +8,10 @@ use example_client::{
       CompleteTotpLogin, ExchangeExternalForJwt, ExchangeForJwt,
       JwtOrTwoFactor,
     },
-    manage::{BeginTotpEnrollment, ConfirmTotpEnrollment},
+    manage::{
+      BeginTotpEnrollment, ConfirmTotpEnrollment, CreateApiKey,
+      UpdatePassword,
+    },
     token::{
       TOKEN_TYPE_ACCESS_TOKEN, TOKEN_TYPE_ID_TOKEN, TOKEN_TYPE_JWT,
     },
@@ -18,7 +21,7 @@ use example_mock_idp::{MintToken, Signer};
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::common::*;
+use crate::{common::*, reauth::assert_reauthentication_required};
 
 fn exchange_options(
   token_exchange: serde_json::Value,
@@ -353,6 +356,107 @@ async fn second_factor_is_not_skipped_by_the_exchange() {
     .unwrap()
     .jwt;
   get_user(&client.with_auth(ClientAuth::Jwt(jwt))).await;
+}
+
+/// A provider token can be exchanged again until it expires. The app
+/// token counts as a login when the provider authenticated the user,
+/// so a leaked old one (or one refreshed without a login) gets the
+/// app, but not the account: the reauthentication window applies.
+#[tokio::test]
+async fn an_old_provider_token_is_not_a_recent_login() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    env: vec![(
+      "EXAMPLE_REAUTHENTICATION_WINDOW_SECONDS".into(),
+      "60".into(),
+    )],
+    // No limit on the token age, the default.
+    ..exchange_options(json!({ "enabled": true }))
+  })
+  .await;
+  sign_up_alice(&app).await;
+  let now = unix_timestamp_ms() / 1000;
+
+  let old_tokens = [
+    (
+      "issued 10 minutes ago, valid for another hour",
+      app.idp.mint(MintToken {
+        issued_ago: 600,
+        expires_in: 3600,
+        ..alice_token(&app)
+      }),
+    ),
+    (
+      "issued now, for a login 10 minutes ago",
+      app.idp.mint(MintToken {
+        claims: json!({ "auth_time": now - 600 })
+          .as_object()
+          .unwrap()
+          .clone(),
+        ..alice_token(&app)
+      }),
+    ),
+  ];
+  let key = || CreateApiKey {
+    name: "backdoor".into(),
+    expires: 0,
+    cidr_whitelist: Vec::new(),
+  };
+  let password = || UpdatePassword {
+    password: "attacker-password".into(),
+  };
+  for (why, token) in old_tokens {
+    let res = app
+      .token_exchange(&token, TOKEN_TYPE_ID_TOKEN)
+      .await
+      .unwrap();
+    let from_token =
+      app.client().with_auth(ClientAuth::Jwt(res.access_token));
+    let client = app.client();
+    let JwtOrTwoFactor::Jwt(jwt) = client
+      .login(ExchangeExternalForJwt { token })
+      .await
+      .unwrap()
+    else {
+      panic!("{why}: expected a jwt");
+    };
+    let from_login = client.with_auth(ClientAuth::Jwt(jwt.jwt));
+    for client in [from_token, from_login] {
+      // The app, yes
+      get_user(&client).await;
+      // The account, no
+      assert_reauthentication_required(
+        client.manage(key()).await,
+        &format!("CreateApiKey ({why})"),
+      );
+      assert_reauthentication_required(
+        client.manage(password()).await,
+        &format!("UpdatePassword ({why})"),
+      );
+    }
+  }
+
+  // A freshly issued token is a recent login.
+  let fresh = app.idp.mint(alice_token(&app));
+  let res = app
+    .token_exchange(&fresh, TOKEN_TYPE_ID_TOKEN)
+    .await
+    .unwrap();
+  let client =
+    app.client().with_auth(ClientAuth::Jwt(res.access_token));
+  client.manage(key()).await.unwrap();
+  let login = app.client();
+  let JwtOrTwoFactor::Jwt(jwt) = login
+    .login(ExchangeExternalForJwt { token: fresh })
+    .await
+    .unwrap()
+  else {
+    panic!("expected a jwt");
+  };
+  login
+    .with_auth(ClientAuth::Jwt(jwt.jwt))
+    .manage(password())
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

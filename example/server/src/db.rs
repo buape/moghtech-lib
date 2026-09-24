@@ -363,6 +363,43 @@ pub async fn create_user(user: NewUser) -> anyhow::Result<String> {
   Ok(id)
 }
 
+/// Inserts the user of a workload rule, unless the rule has a user
+/// already, or the username is taken: the insert then does nothing.
+/// Returns whether the user was inserted.
+///
+/// Exchanges of one rule run concurrently (a CI matrix starting), and
+/// several of them can find no user and get here. The unique index
+/// `users_workload` makes all but one of them do nothing, where a
+/// plain insert would fail them.
+pub async fn insert_workload_user(
+  user: NewUser,
+) -> anyhow::Result<bool> {
+  let Some((issuer_id, rule_id)) = user.workload else {
+    return Err(anyhow!("A workload user needs its issuer and rule"));
+  };
+  let now = unix_timestamp_ms();
+  let res = sqlx::query(
+    "INSERT INTO users
+      (id, username, password, enabled, admin,
+       workload_issuer_id, workload_rule_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT DO NOTHING",
+  )
+  .bind(new_id())
+  .bind(&user.username)
+  .bind(&user.hashed_password)
+  .bind(user.enabled)
+  .bind(user.admin)
+  .bind(issuer_id)
+  .bind(rule_id)
+  .bind(now)
+  .bind(now)
+  .execute(db())
+  .await
+  .context("Failed to create workload user")?;
+  Ok(res.rows_affected() == 1)
+}
+
 /// The columns of a user which can be updated on their own.
 pub enum UserUpdate {
   Username(String),
@@ -375,7 +412,6 @@ pub enum UserUpdate {
     secret: String,
     hashed_recovery_codes: Vec<String>,
   },
-  TotpRecoveryCodes(Vec<String>),
   ExternalSkip2fa(bool),
   CidrWhitelist(Vec<String>),
   WorkloadLastSubject(String),
@@ -464,14 +500,6 @@ pub async fn update_user(
       .bind(id)
       .execute(db())
       .await
-    }
-    UserUpdate::TotpRecoveryCodes(hashed_recovery_codes) => {
-      sqlx::query(sqlx::AssertSqlSafe(query("totp_recovery_codes")))
-        .bind(to_json(&hashed_recovery_codes)?)
-        .bind(now)
-        .bind(id)
-        .execute(db())
-        .await
     }
     UserUpdate::ExternalSkip2fa(skip) => {
       sqlx::query(sqlx::AssertSqlSafe(query("external_skip_2fa")))
@@ -615,7 +643,7 @@ struct ApiKeyRow {
 
 pub struct DbApiKey {
   pub api_key: ApiKey,
-  /// bcrypt hash (V1 only).
+  /// bcrypt hash (api keys only, empty for signing keys).
   pub hashed_secret: String,
 }
 
@@ -861,6 +889,37 @@ pub async fn consume_totp_step(
   .execute(db())
   .await
   .context("Failed to clean up TOTP steps")?;
+  Ok(res.rows_affected() == 1)
+}
+
+/// Removes a used recovery code (its hash) of the user, returning
+/// whether it was still there. One conditional statement, so of two
+/// logins using the same code at once (on any instance) only one
+/// removes it, and removing one code never writes back another which
+/// was just removed.
+pub async fn remove_totp_recovery_code(
+  user_id: &str,
+  hashed_code: &str,
+) -> anyhow::Result<bool> {
+  let res = sqlx::query(
+    "UPDATE users
+     SET totp_recovery_codes = (
+       SELECT json_group_array(code.value)
+       FROM json_each(users.totp_recovery_codes) AS code
+       WHERE code.value != ?
+     ), updated_at = ?
+     WHERE id = ? AND EXISTS (
+       SELECT 1 FROM json_each(users.totp_recovery_codes) AS code
+       WHERE code.value = ?
+     )",
+  )
+  .bind(hashed_code)
+  .bind(unix_timestamp_ms())
+  .bind(user_id)
+  .bind(hashed_code)
+  .execute(db())
+  .await
+  .context("Failed to remove TOTP recovery code")?;
   Ok(res.rows_affected() == 1)
 }
 

@@ -49,7 +49,25 @@ async fn serves_the_ui_with_client_side_routing() {
   let route = get("/notes/123?tab=1").await;
   assert_eq!(route.status(), StatusCode::OK);
   assert_eq!(route.headers()["etag"], etag.as_str());
+  // Revalidated on every load, so an upgrade is picked up.
+  assert_eq!(route.headers()["cache-control"], "no-cache");
   assert!(route.text().await.unwrap().contains("example ui"));
+  // Revalidating gets the full index, never an empty 200.
+  for (name, value) in
+    [("if-none-match", "*"), ("if-none-match", etag.as_str())]
+  {
+    let revalidated = reqwest
+      .get(format!("{}/notes/123", app.address))
+      .header(name, value)
+      .send()
+      .await
+      .unwrap();
+    assert_eq!(revalidated.status(), StatusCode::OK, "{value}");
+    assert!(
+      revalidated.text().await.unwrap().contains("example ui"),
+      "{value}"
+    );
+  }
 
   let asset = get("/assets/app.js").await;
   assert_eq!(asset.status(), StatusCode::OK);

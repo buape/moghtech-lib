@@ -11,8 +11,8 @@ use example_client::{
   },
   auth::api::manage::{
     BeginExternalLoginLink, BeginPasskeyEnrollment,
-    BeginTotpEnrollment, CreateApiKey, CreateApiKeyV2,
-    CreateExternalLoginProvider, DeleteApiKey, GetUserId,
+    BeginTotpEnrollment, CreateApiKey, CreateExternalLoginProvider,
+    CreateSigningKey, DeleteApiKey, GetUserId,
     ListExternalLoginProviders, REAUTHENTICATION_REQUIRED,
     UnlinkLocalLogin, UpdateExternalSkip2fa, UpdatePassword,
     UpdateUsername,
@@ -57,7 +57,7 @@ fn attacker_sso() -> CreateExternalLoginProvider {
   }
 }
 
-fn assert_reauthentication_required<T>(
+pub(crate) fn assert_reauthentication_required<T>(
   res: anyhow::Result<T>,
   what: &str,
 ) {
@@ -130,14 +130,14 @@ async fn assert_all_sensitive_requests_refused(
   );
   assert_reauthentication_required(
     client
-      .manage(CreateApiKeyV2 {
+      .manage(CreateSigningKey {
         name: "backdoor".into(),
         expires: 0,
         cidr_whitelist: Vec::new(),
         public_key: String::new(),
       })
       .await,
-    "CreateApiKeyV2",
+    "CreateSigningKey",
   );
 }
 

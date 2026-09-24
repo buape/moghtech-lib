@@ -17,7 +17,7 @@ use mogh_auth_server::{
   AuthImpl, DynFuture, RequestAuthentication,
   api_key::{AuthApiKey, BoxAuthApiKey},
   middleware::{
-    get_user_from_request_authentication, verify_api_key_secret,
+    get_user_from_request_authentication, verify_api_key_secret_async,
   },
   provider::{
     external::ExternalLoginInfo, jwt::JwtProvider,
@@ -81,6 +81,10 @@ impl AuthUserImpl for AuthUser {
 
   fn external_skip_2fa(&self) -> bool {
     self.0.external_skip_2fa
+  }
+
+  fn is_enabled(&self) -> bool {
+    self.0.enabled
   }
 
   fn is_admin(&self) -> bool {
@@ -520,27 +524,7 @@ impl AuthImpl for ExampleAuthImpl {
       .await?
       {
         Some(user) => user,
-        None => {
-          // Never the 'first user is admin' signup logic.
-          let id = db::create_user(NewUser {
-            username: workload_username(&identity).await?,
-            hashed_password: String::new(),
-            enabled: true,
-            admin: identity.admin,
-            workload: Some((
-              identity.issuer_id.clone(),
-              identity.rule_id.clone(),
-            )),
-          })
-          .await?;
-          info!(
-            user_id = id,
-            issuer_id = identity.issuer_id,
-            rule_id = identity.rule_id,
-            "Created workload user"
-          );
-          get_user(&id).await?
-        }
+        None => create_workload_user(&identity).await?,
       };
       // The rule is the full definition of what the user can do.
       db::update_user(&user.id, UserUpdate::Admin(identity.admin))
@@ -634,24 +618,25 @@ impl AuthImpl for ExampleAuthImpl {
     })
   }
 
+  /// One conditional update, so a code is only used once
+  /// across instances.
   fn remove_totp_recovery_code(
     &self,
     user_id: String,
     hashed_code: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
-      let user = get_user(&user_id).await?;
-      let remaining = user
-        .hashed_totp_recovery_codes
-        .into_iter()
-        .filter(|code| code != &hashed_code)
-        .collect();
-      db::update_user(
-        &user_id,
-        UserUpdate::TotpRecoveryCodes(remaining),
-      )
-      .await
-      .map_err(Into::into)
+      // Conditional: a code another login (on any instance)
+      // used up in the meantime is refused.
+      if db::remove_totp_recovery_code(&user_id, &hashed_code).await?
+      {
+        Ok(())
+      } else {
+        Err(
+          anyhow!("Invalid recovery code")
+            .status_code(StatusCode::UNAUTHORIZED),
+        )
+      }
     })
   }
 
@@ -691,7 +676,7 @@ impl AuthImpl for ExampleAuthImpl {
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
       db::create_api_key(
-        &new_api_key(user_id, body, key, ApiKeyKind::V1),
+        &new_api_key(user_id, body, key, ApiKeyKind::ApiKey),
         &hashed_secret,
       )
       .await
@@ -705,13 +690,16 @@ impl AuthImpl for ExampleAuthImpl {
     secret: String,
   ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
     Box::pin(async move {
-      let api_key = db::find_api_key(&key, ApiKeyKind::V1).await?;
+      let api_key =
+        db::find_api_key(&key, ApiKeyKind::ApiKey).await?;
       // Also runs for unknown keys, so timing doesn't reveal them.
-      verify_api_key_secret(
+      // Off the async runtime, bcrypt takes a while.
+      verify_api_key_secret_async(
         &ExampleAuthImpl,
-        &secret,
-        api_key.as_ref().map(|key| key.hashed_secret.as_str()),
-      )?;
+        secret,
+        api_key.as_ref().map(|key| key.hashed_secret.clone()),
+      )
+      .await?;
       let api_key = api_key
         .context("Invalid client credentials")
         .status_code(StatusCode::UNAUTHORIZED)?;
@@ -731,7 +719,7 @@ impl AuthImpl for ExampleAuthImpl {
     key: String,
   ) -> DynFuture<mogh_error::Result<String>> {
     // Includes expired keys, so they can be deleted.
-    Box::pin(api_key_owner_id(key, ApiKeyKind::V1))
+    Box::pin(api_key_owner_id(key, ApiKeyKind::ApiKey))
   }
 
   fn delete_api_key(
@@ -739,17 +727,21 @@ impl AuthImpl for ExampleAuthImpl {
     key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
-      db::delete_api_key(&key, ApiKeyKind::V1)
+      db::delete_api_key(&key, ApiKeyKind::ApiKey)
         .await
         .map_err(Into::into)
     })
   }
 
+  // ================
+  // = SIGNING KEYS =
+  // ================
+
   fn server_private_key(&self) -> Option<&RotatableKeyPair> {
     Some(core_keys())
   }
 
-  fn create_api_key_v2(
+  fn create_signing_key(
     &self,
     user_id: String,
     body: CreateApiKey,
@@ -757,7 +749,12 @@ impl AuthImpl for ExampleAuthImpl {
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
       db::create_api_key(
-        &new_api_key(user_id, body, public_key, ApiKeyKind::V2),
+        &new_api_key(
+          user_id,
+          body,
+          public_key,
+          ApiKeyKind::SigningKey,
+        ),
         "",
       )
       .await
@@ -765,15 +762,16 @@ impl AuthImpl for ExampleAuthImpl {
     })
   }
 
-  fn get_api_key_v2(
+  fn get_signing_key(
     &self,
     public_key: String,
   ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
     Box::pin(async move {
-      let api_key = db::find_api_key(&public_key, ApiKeyKind::V2)
-        .await?
-        .context("Invalid client credentials")
-        .status_code(StatusCode::UNAUTHORIZED)?;
+      let api_key =
+        db::find_api_key(&public_key, ApiKeyKind::SigningKey)
+          .await?
+          .context("Invalid client credentials")
+          .status_code(StatusCode::UNAUTHORIZED)?;
       check_not_expired(&api_key)?;
       Ok(
         AuthApiKey {
@@ -785,19 +783,19 @@ impl AuthImpl for ExampleAuthImpl {
     })
   }
 
-  fn get_api_key_v2_owner_id(
+  fn get_signing_key_owner_id(
     &self,
     public_key: String,
   ) -> DynFuture<mogh_error::Result<String>> {
-    Box::pin(api_key_owner_id(public_key, ApiKeyKind::V2))
+    Box::pin(api_key_owner_id(public_key, ApiKeyKind::SigningKey))
   }
 
-  fn delete_api_key_v2(
+  fn delete_signing_key(
     &self,
     public_key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
-      db::delete_api_key(&public_key, ApiKeyKind::V2)
+      db::delete_api_key(&public_key, ApiKeyKind::SigningKey)
         .await
         .map_err(Into::into)
     })
@@ -844,22 +842,68 @@ fn check_not_expired(
   Ok(())
 }
 
-/// `workload-{rule name}`, made unique if it is taken.
-async fn workload_username(
+/// Creates the user of a workload rule, or returns the one another
+/// exchange of the rule created at the same time.
+///
+/// [AuthImpl::get_or_create_workload_user] runs concurrently for the
+/// same rule (a CI matrix starting), across instances of the app as
+/// well. The insert does nothing if the rule has a user by then, and
+/// the user is read back either way. When nothing was inserted and the
+/// rule still has no user, the username was taken: the next is tried.
+async fn create_workload_user(
   identity: &WorkloadIdentity,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<DbUser> {
+  for username in workload_usernames(identity) {
+    // Never the 'first user is admin' signup logic.
+    let created = db::insert_workload_user(NewUser {
+      username,
+      hashed_password: String::new(),
+      enabled: true,
+      admin: identity.admin,
+      workload: Some((
+        identity.issuer_id.clone(),
+        identity.rule_id.clone(),
+      )),
+    })
+    .await?;
+    let Some(user) =
+      db::find_workload_user(&identity.issuer_id, &identity.rule_id)
+        .await?
+    else {
+      continue;
+    };
+    if created {
+      info!(
+        user_id = user.id,
+        issuer_id = identity.issuer_id,
+        rule_id = identity.rule_id,
+        "Created workload user"
+      );
+    }
+    return Ok(user);
+  }
+  Err(anyhow!(
+    "Failed to create the user of workload rule '{}', its usernames are taken",
+    identity.rule_name
+  ))
+}
+
+/// `workload-{rule name}`, then made unique with the rule id, the issuer
+/// id and finally at random, for when a username is taken.
+fn workload_usernames(identity: &WorkloadIdentity) -> [String; 4] {
   let name = identity
     .rule_name
     .chars()
     .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
     .collect::<String>()
     .to_lowercase();
-  let mut username = format!("workload-{name}");
-  if db::find_user_with_username(&username).await?.is_some() {
-    username.push('-');
-    username.push_str(&identity.rule_id);
-  }
-  Ok(username)
+  let base = format!("workload-{name}");
+  [
+    base.clone(),
+    format!("{base}-{}", identity.rule_id),
+    format!("{base}-{}-{}", identity.issuer_id, identity.rule_id),
+    format!("{base}-{}", db::new_id()),
+  ]
 }
 
 async fn cached_login_providers()

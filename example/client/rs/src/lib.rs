@@ -36,8 +36,8 @@ pub enum ClientAuth {
   Jwt(String),
   /// `X-API-KEY` / `X-API-SECRET`
   ApiKey { key: String, secret: String },
-  /// `X-API-SIGNATURE` / `X-API-TIMESTAMP`, signed with
-  /// the private key for the server public key.
+  /// A signing key: `X-API-SIGNATURE` / `X-API-TIMESTAMP`, signed
+  /// with its private key for the server public key.
   PrivateKey {
     private_key: String,
     server_public_key: String,
@@ -157,7 +157,9 @@ impl ExampleClient {
     self.post("/auth/manage", T::req_type(), &request).await
   }
 
-  /// Adds the credential headers for a request to `path`.
+  /// Adds the credential headers for a `method` request to `path`
+  /// (the path and query the server receives). A signature (signing
+  /// key) covers the body, so set it on `request` before.
   pub fn authenticate(
     &self,
     method: &reqwest::Method,
@@ -177,16 +179,25 @@ impl ExampleClient {
         private_key,
         server_public_key,
       } => {
-        let mut request = request;
-        for (header, value) in signed_request_headers(
+        let (client, request) = request.build_split();
+        let mut request = request.context("Invalid request")?;
+        let headers = signed_request_headers(
           private_key,
           server_public_key,
           method.as_str(),
           path,
-        )? {
-          request = request.header(header, value);
+          request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .unwrap_or_default(),
+        )?;
+        for (header, value) in headers {
+          request.headers_mut().insert(
+            header,
+            value.parse().context("Invalid signature header")?,
+          );
         }
-        request
+        reqwest::RequestBuilder::from_parts(client, request)
       }
     };
     Ok(request)

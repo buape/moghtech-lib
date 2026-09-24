@@ -49,7 +49,7 @@ pub struct GetCoreInfoResponse {
   pub app_name: String,
   pub host: String,
   /// The server public key, which clients using
-  /// V2 api keys sign their requests for.
+  /// signing keys sign their requests for.
   pub public_key: String,
 }
 

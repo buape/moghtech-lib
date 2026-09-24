@@ -57,7 +57,7 @@ pub struct User {
   pub updated_at: I64,
 }
 
-/// How an api key authenticates.
+/// The kind of an [ApiKey]: how it authenticates.
 #[typeshare]
 #[derive(
   Debug,
@@ -71,17 +71,18 @@ pub struct User {
   EnumString,
 )]
 pub enum ApiKeyKind {
-  /// `X-API-KEY` / `X-API-SECRET`
-  V1,
-  /// `X-API-SIGNATURE` / `X-API-TIMESTAMP`, signed with a private key.
-  V2,
+  /// An api key: `X-API-KEY` / `X-API-SECRET`.
+  ApiKey,
+  /// A signing key: `X-API-SIGNATURE` / `X-API-TIMESTAMP`, signed
+  /// with its private key.
+  SigningKey,
 }
 
-/// An api key of a user. Never includes the secret.
+/// An api key or signing key of a user. Never includes the secret.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiKey {
-  /// The key (V1) or public key (V2).
+  /// The key (api key) or public key (signing key).
   pub key: String,
   pub kind: ApiKeyKind,
   pub user_id: String,

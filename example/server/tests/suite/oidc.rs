@@ -104,6 +104,19 @@ async fn taken_usernames_get_a_suffix() {
   assert!(!user.admin);
 }
 
+/// External sign ups are held to the app's username rule.
+#[tokio::test]
+async fn usernames_follow_the_username_rule() {
+  let app = TestApp::spawn_with(oidc_app_options(json!({}))).await;
+  app.idp.upsert_user(IdpUser {
+    sub: "alice-sub".into(),
+    preferred_username: Some("Alice Smith".into()),
+    ..Default::default()
+  });
+  let alice = oidc_login(&app, "alice").await;
+  assert_eq!(get_user(&alice).await.username, "Alice-Smith");
+}
+
 #[tokio::test]
 async fn redirects_back_to_the_app_only() {
   let app = TestApp::spawn_with(oidc_app_options(json!({}))).await;
@@ -126,6 +139,17 @@ async fn redirects_back_to_the_app_only() {
     ),
     (
       "//evil.example".to_string(),
+      format!("{}?redeem_ready=true", app.address),
+    ),
+    // The app reads the query, which goes before the fragment.
+    (
+      "/notes#tab".to_string(),
+      format!("{}/notes?redeem_ready=true#tab", app.address),
+    ),
+    // Stored on the session by an unauthenticated request:
+    // one which is too long is dropped.
+    (
+      format!("/{}", "a".repeat(10 * 1024)),
       format!("{}?redeem_ready=true", app.address),
     ),
   ] {
@@ -268,9 +292,11 @@ async fn link_and_unlink_a_login() {
   let admin_id = get_user(&admin).await.id;
 
   // Linking needs the signed in user to begin it on the session.
+  // Without that the request is no link: it fails to the login page.
   let link_url = format!("{}/auth/external/oidc/link", app.address);
   let landed = follow_external_flow(&admin, &link_url).await;
-  let error = external_error(&landed, "link_error");
+  assert_eq!(landed.path(), "/login");
+  let error = external_error(&landed, "login_error");
   assert!(error.contains("not been initiated"), "{error}");
 
   app.idp.set_auto_user(Some("alice-sub"));
@@ -539,4 +565,102 @@ async fn unreachable_provider_fails_without_taking_the_app_down() {
   assert!(app.logs().contains("127.0.0.1:9"));
   // Local login is unaffected.
   app.sign_up("admin").await;
+}
+
+/// The link begun on the session is used up by the first link
+/// request, even a failed one: it can't be completed later.
+#[tokio::test]
+async fn a_failed_link_uses_up_the_begun_link() {
+  let app = TestApp::spawn_with(oidc_app_options(json!({}))).await;
+  app.add_idp_user("alice", &[]);
+  app.idp.set_auto_user(Some("alice-sub"));
+  let admin = app.sign_up("admin").await;
+
+  admin.manage(BeginExternalLoginLink {}).await.unwrap();
+  let landed = follow_external_flow(
+    &admin,
+    &format!("{}/auth/external/unknown/link", app.address),
+  )
+  .await;
+  assert_eq!(landed.path(), "/profile");
+  external_error(&landed, "link_error");
+
+  let landed = follow_external_flow(
+    &admin,
+    &format!("{}/auth/external/oidc/link", app.address),
+  )
+  .await;
+  let error = external_error(&landed, "login_error");
+  assert!(error.contains("not been initiated"), "{error}");
+  assert!(get_user(&admin).await.linked_logins.is_empty());
+}
+
+/// A link denied at the provider goes back to where links are
+/// managed, and uses up the attempt.
+#[tokio::test]
+async fn denied_link_goes_back_to_the_link_page() {
+  let app = TestApp::spawn_with(oidc_app_options(json!({}))).await;
+  let admin = app.sign_up("admin").await;
+  admin.manage(BeginExternalLoginLink {}).await.unwrap();
+  // Up to the provider's login page.
+  let res = admin
+    .reqwest
+    .get(format!("{}/auth/oidc/link", app.address))
+    .send()
+    .await
+    .unwrap();
+  assert!(res.status().is_redirection());
+
+  let callback = format!(
+    "{}/auth/oidc/callback?error=access_denied&state=x",
+    app.address
+  );
+  let landed = follow_external_flow(&admin, &callback).await;
+  assert_eq!(landed.path(), "/profile");
+  let error = external_error(&landed, "link_error");
+  assert!(error.contains("access_denied"), "{error}");
+
+  let landed = follow_external_flow(&admin, &callback).await;
+  assert_eq!(landed.path(), "/login");
+  let error = external_error(&landed, "login_error");
+  assert!(error.contains("not been initiated"), "{error}");
+}
+
+/// The external routes are plain GETs, which any web page the user
+/// visits can send from their browser. Requests which name an unknown
+/// provider, or a flow never started on the session, are refused
+/// without counting against the ip: they can't lock it out.
+#[tokio::test]
+async fn cross_site_requests_do_not_lock_out_the_ip() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    rate_limit: Some((2, 60)),
+    ..oidc_app_options(json!({}))
+  })
+  .await;
+  let admin = app.sign_up("admin").await;
+  let client = app.client();
+  for _ in 0..3 {
+    for path in [
+      "/auth/external/unknown/login",
+      "/auth/github/login",
+      "/auth/external/unknown/link",
+      "/auth/oidc/link",
+      "/auth/oidc/callback?state=x&code=y",
+      "/auth/oidc/callback?error=access_denied",
+      "/auth/external/unknown/callback?state=x&code=y",
+    ] {
+      let landed = follow_external_flow(
+        &client,
+        &format!("{}{path}", app.address),
+      )
+      .await;
+      let error = external_error(&landed, "login_error");
+      assert!(!error.contains("Too many"), "{path}: {error}");
+    }
+  }
+  // Credentials from the same ip are still accepted.
+  get_user(&admin).await;
+  app.log_in("admin").await;
+  app.add_idp_user("alice", &[]);
+  oidc_login(&app, "alice").await;
 }

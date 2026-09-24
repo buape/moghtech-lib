@@ -241,6 +241,28 @@ async fn tokens_have_to_match_a_rule() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
     assert_eq!(error.error, "invalid_grant", "{why}");
   }
+  // `alg: none` with the claims of a matching token, and those
+  // claims under the signature of another token.
+  let valid = app.idp.mint(ci_token(release_claims()));
+  let claims = valid.split('.').nth(1).unwrap();
+  let other = app.idp.mint(ci_token(json!({ "repository_id": "1" })));
+  let (header, _) = other.split_once('.').unwrap();
+  let signature = other.rsplit('.').next().unwrap();
+  for (why, token) in [
+    // {"alg":"none","typ":"JWT"}
+    (
+      "unsigned",
+      format!("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.{claims}."),
+    ),
+    ("tampered", format!("{header}.{claims}.{signature}")),
+  ] {
+    let (status, error) = app
+      .token_exchange(&token, TOKEN_TYPE_JWT)
+      .await
+      .expect_err(why);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+    assert_eq!(error.error, "invalid_grant", "{why}");
+  }
   // No users were created for refused tokens.
   assert_eq!(admin.read(ListUsers {}).await.unwrap().len(), 1);
 }
@@ -334,6 +356,21 @@ async fn unsafe_issuers_and_rules_are_refused() {
         &app,
         vec![WorkloadRule {
           claims: vec![claim("repository_id", "*")],
+          ..deploy_rule()
+        }],
+      ),
+    ),
+    (
+      // Every token of the issuer for the audience has it, and
+      // on a public platform anybody can request one.
+      "a rule on the audience only",
+      issuer(
+        &app,
+        vec![WorkloadRule {
+          claims: vec![
+            claim("aud", AUDIENCE),
+            claim("iss", "https://*"),
+          ],
           ..deploy_rule()
         }],
       ),
@@ -608,6 +645,82 @@ async fn fetched_keys_are_cached() {
   }
   // They shared one load of the key set.
   assert_eq!(app.idp.jwks_requests(), 1);
+}
+
+/// A CI matrix starting: many jobs exchange their first token for a
+/// rule at once, while its user doesn't exist yet. All of them get
+/// a token, and all of them act as the one user of the rule. The
+/// app creates it once, even with its first username taken.
+#[tokio::test]
+async fn concurrent_first_exchanges_share_one_user() {
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+  // Takes the username the workload user would get.
+  app.sign_up("workload-deploy").await;
+  admin
+    .manage(CreateTrustedIssuer {
+      issuer: issuer(&app, vec![deploy_rule()]),
+    })
+    .await
+    .unwrap();
+  // Load the keys first (a token matching no rule), so the
+  // exchanges below meet at the user, not at the key load.
+  let (status, _) = app
+    .token_exchange(
+      &app.idp.mint(ci_token(json!({ "repository_id": "1" }))),
+      TOKEN_TYPE_JWT,
+    )
+    .await
+    .unwrap_err();
+  assert_eq!(status, StatusCode::BAD_REQUEST);
+
+  // Every job has its connection open, and they all
+  // exchange at the same moment.
+  const JOBS: usize = 24;
+  let start = std::sync::Arc::new(tokio::sync::Barrier::new(JOBS));
+  let mut exchanges = Vec::new();
+  for _ in 0..JOBS {
+    let reqwest = reqwest::Client::new();
+    reqwest
+      .get(format!("{}/version", app.address))
+      .send()
+      .await
+      .unwrap();
+    let token = app.idp.mint(ci_token(release_claims()));
+    let address = app.address.clone();
+    let start = start.clone();
+    exchanges.push(tokio::spawn(async move {
+      start.wait().await;
+      example_client::auth::request::token_exchange(
+        &reqwest,
+        &format!("{address}/auth"),
+        &example_client::auth::api::token::TokenExchangeRequest::jwt(
+          token,
+        ),
+      )
+      .await
+    }));
+  }
+  let mut user_ids = Vec::new();
+  for exchange in exchanges {
+    let res = exchange.await.unwrap().unwrap();
+    let workload =
+      app.client().with_auth(ClientAuth::Jwt(res.access_token));
+    user_ids
+      .push(workload.read(GetRequestInfo {}).await.unwrap().user_id);
+  }
+  user_ids.dedup();
+  assert_eq!(user_ids.len(), 1, "{user_ids:?}");
+
+  let users = admin.read(ListUsers {}).await.unwrap();
+  let workloads = users
+    .iter()
+    .filter(|user| user.workload.is_some())
+    .collect::<Vec<_>>();
+  assert_eq!(workloads.len(), 1);
+  assert_eq!(workloads[0].id, user_ids[0]);
+  assert!(workloads[0].username.starts_with("workload-deploy-"));
+  assert!(!app.logs().contains("Token exchange failed"));
 }
 
 async fn token_exchange(

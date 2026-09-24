@@ -89,8 +89,8 @@ impl Resolve<ExecuteArgs> for GenerateKeyPair {
   ) -> Result<Self::Response, Self::Error> {
     let keys = EncodedKeyPair::generate(PkiKind::OneWay)?;
     Ok(GenerateKeyPairResponse {
-      private_key: keys.private().to_string(),
-      public_key: keys.public().to_string(),
+      private_key: keys.private.into_inner(),
+      public_key: keys.public.into_inner(),
     })
   }
 }

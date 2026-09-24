@@ -44,7 +44,8 @@ envy = "0.4.2"
 
 [dev-dependencies]
 example_mock_idp = { path = "../mock_idp" }
-reqwest = { workspace = true, features = ["cookies"] }
+# http2: request signatures over HTTP/2 (api_keys suite).
+reqwest = { workspace = true, features = ["cookies", "http2"] }
 totp-rs.workspace = true
 tempfile = "3"
 

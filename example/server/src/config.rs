@@ -88,7 +88,7 @@ pub struct CoreConfig {
   /// Base64url 32 byte key to encrypt secrets in the database with.
   /// If empty, one is generated next to the database.
   pub encryption_key: String,
-  /// The server private key for V2 api keys, or `file:<path>`
+  /// The server private key for signing keys, or `file:<path>`
   /// to generate / load it from a file.
   pub private_key: String,
 
@@ -307,7 +307,8 @@ fn load_config() -> anyhow::Result<CoreConfig> {
   })
 }
 
-/// The server key pair, which V2 api key requests are signed for.
+/// The server key pair, which requests with a signing key are signed
+/// for.
 /// Call on startup so the server fails without a valid private key.
 pub fn core_keys() -> &'static RotatableKeyPair {
   static CORE_KEYS: OnceLock<RotatableKeyPair> = OnceLock::new();

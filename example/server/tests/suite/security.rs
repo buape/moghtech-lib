@@ -71,6 +71,40 @@ async fn failed_logins_are_rate_limited_by_ip() {
 }
 
 #[tokio::test]
+async fn ipv6_clients_are_rate_limited_per_64() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    rate_limit: Some((2, 60)),
+    ..Default::default()
+  })
+  .await;
+  app.sign_up("admin").await;
+  let from = |ip: &str| {
+    app.client().with_header("x-forwarded-for", ip).unwrap()
+  };
+  let right_password = || LoginLocalUser {
+    username: "admin".into(),
+    password: PASSWORD.into(),
+  };
+
+  // A client moving to a fresh address in its /64 for every guess
+  // keeps using up the same budget.
+  for ip in ["2001:db8:1:2::1", "2001:db8:1:2::2"] {
+    let res = from(ip).login(wrong_password("admin")).await;
+    assert_eq!(status_of(res), StatusCode::UNAUTHORIZED);
+  }
+  let res =
+    from("2001:db8:1:2:ffff::3").login(right_password()).await;
+  assert_eq!(status_of(res), StatusCode::TOO_MANY_REQUESTS);
+
+  // The next /64 is another client.
+  let res = from("2001:db8:1:3::1")
+    .login(right_password())
+    .await
+    .unwrap();
+  assert!(matches!(res, JwtOrTwoFactor::Jwt(_)));
+}
+
+#[tokio::test]
 async fn successful_requests_are_never_rate_limited() {
   let app = TestApp::spawn_with(TestAppOptions {
     rate_limit: Some((2, 60)),
@@ -215,6 +249,42 @@ async fn forwarded_ip_is_taken_from_trusted_proxies_only() {
 }
 
 #[tokio::test]
+async fn real_ip_is_taken_from_the_nearest_proxy_line() {
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+
+  // A proxy (loopback is trusted by default) which sets X-Real-IP.
+  let info = admin
+    .with_header("x-real-ip", "203.0.113.7")
+    .unwrap()
+    .read(GetRequestInfo {})
+    .await
+    .unwrap();
+  assert_eq!(info.ip, "203.0.113.7");
+
+  // A proxy which adds its own line after the one the client sent:
+  // the nearest (last) line is the client, not the first.
+  let mut added = admin.clone();
+  for line in ["10.9.9.9", "203.0.113.7"] {
+    added.headers.append("x-real-ip", line.parse().unwrap());
+  }
+  let info = added.read(GetRequestInfo {}).await.unwrap();
+  assert_eq!(info.ip, "203.0.113.7");
+
+  // X-Forwarded-For takes precedence, which is why the proxy must
+  // set it too: a client-sent one passed through would win.
+  let info = admin
+    .with_header("x-forwarded-for", "10.0.0.7")
+    .unwrap()
+    .with_header("x-real-ip", "203.0.113.7")
+    .unwrap()
+    .read(GetRequestInfo {})
+    .await
+    .unwrap();
+  assert_eq!(info.ip, "10.0.0.7");
+}
+
+#[tokio::test]
 async fn user_cidr_whitelist_applies_to_logins_and_requests() {
   let app = TestApp::spawn().await;
   let admin = app.sign_up("admin").await;
@@ -241,7 +311,8 @@ async fn user_cidr_whitelist_applies_to_logins_and_requests() {
     .manage(example_client::auth::api::manage::GetUserId {})
     .await;
   assert_eq!(status_of(res), StatusCode::FORBIDDEN);
-  // ... and neither is the password.
+  // ... and neither is the password. The answer is the same as for
+  // a wrong one, so from elsewhere it doesn't confirm the password.
   let res = app
     .client()
     .login(LoginLocalUser {
@@ -249,10 +320,27 @@ async fn user_cidr_whitelist_applies_to_logins_and_requests() {
       password: PASSWORD.into(),
     })
     .await;
-  assert_eq!(status_of(res), StatusCode::FORBIDDEN);
-  // A wrong password doesn't reveal the whitelist.
-  let res = app.client().login(wrong_password("admin")).await;
-  assert_eq!(status_of(res), StatusCode::UNAUTHORIZED);
+  let Err(right) = res else {
+    panic!("Expected the login to fail");
+  };
+  let wrong = app
+    .client()
+    .login(wrong_password("admin"))
+    .await
+    .unwrap_err();
+  assert_eq!(
+    example_client::error_status(&right),
+    Some(StatusCode::UNAUTHORIZED)
+  );
+  assert_eq!(
+    example_client::error_status(&wrong),
+    Some(StatusCode::UNAUTHORIZED)
+  );
+  assert_eq!(
+    right.root_cause().to_string(),
+    wrong.root_cause().to_string()
+  );
+  assert!(app.logs().contains("outside the user's cidr whitelist"));
 
   // From the office everything works.
   let from_office =

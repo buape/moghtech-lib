@@ -75,17 +75,20 @@ export interface User {
 /** Response for [GetUser]. */
 export type GetUserResponse = User;
 
-/** How an api key authenticates. */
+/** The kind of an [ApiKey]: how it authenticates. */
 export enum ApiKeyKind {
-	/** `X-API-KEY` / `X-API-SECRET` */
-	V1 = "V1",
-	/** `X-API-SIGNATURE` / `X-API-TIMESTAMP`, signed with a private key. */
-	V2 = "V2",
+	/** An api key: `X-API-KEY` / `X-API-SECRET`. */
+	ApiKey = "ApiKey",
+	/**
+	 * A signing key: `X-API-SIGNATURE` / `X-API-TIMESTAMP`, signed
+	 * with its private key.
+	 */
+	SigningKey = "SigningKey",
 }
 
-/** An api key of a user. Never includes the secret. */
+/** An api key or signing key of a user. Never includes the secret. */
 export interface ApiKey {
-	/** The key (V1) or public key (V2). */
+	/** The key (api key) or public key (signing key). */
 	key: string;
 	kind: ApiKeyKind;
 	user_id: string;
@@ -149,7 +152,7 @@ export interface DeleteUser {
 }
 
 /**
- * Generate a key pair, eg. to create a V2 api key with.
+ * Generate a key pair, eg. to create a signing key with.
  * Response: [GenerateKeyPairResponse].
  */
 export interface GenerateKeyPair {
@@ -176,7 +179,7 @@ export interface GetCoreInfoResponse {
 	host: string;
 	/**
 	 * The server public key, which clients using
-	 * V2 api keys sign their requests for.
+	 * signing keys sign their requests for.
 	 */
 	public_key: string;
 }

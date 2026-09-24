@@ -273,6 +273,261 @@ async fn locked_usernames_cannot_enroll() {
   assert_eq!(status_of(res), StatusCode::UNAUTHORIZED);
 }
 
+/// The failed codes of a user are bounded however many are sent at
+/// once, and whatever the session (first factor) or client ip they
+/// come with: `mogh_auth_server::api::login::totp::MAX_SECOND_FACTOR_FAILURES`.
+#[tokio::test]
+async fn concurrent_codes_are_bounded_per_user() {
+  const MAX_SECOND_FACTOR_FAILURES: usize = 10;
+  // The ip rate limit is disabled, the user's limit applies anyway.
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+  let enrolled = enroll(&admin).await;
+  let valid = [
+    enrolled.totp.generate_current().to_string(),
+    next_code(&enrolled.totp),
+  ];
+  let wrong = ["000000", "111111", "222222"]
+    .into_iter()
+    .find(|code| !valid.iter().any(|valid| valid == code))
+    .unwrap();
+
+  // 30 codes at once, 5 on each of 6 logins (below the
+  // attempts of one login).
+  let mut requests = tokio::task::JoinSet::new();
+  for _ in 0..6 {
+    let client = begin_login(&app, "admin").await;
+    for _ in 0..5 {
+      let client = client.clone();
+      requests.spawn(async move {
+        status_of(
+          client
+            .login(CompleteTotpLogin { code: wrong.into() })
+            .await,
+        )
+      });
+    }
+  }
+  let statuses = requests.join_all().await;
+  let checked = statuses
+    .iter()
+    .filter(|status| **status == StatusCode::UNAUTHORIZED)
+    .count();
+  let refused = statuses
+    .iter()
+    .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
+    .count();
+  assert_eq!(checked, MAX_SECOND_FACTOR_FAILURES, "{statuses:?}");
+  assert_eq!(
+    refused,
+    30 - MAX_SECOND_FACTOR_FAILURES,
+    "{statuses:?}"
+  );
+
+  // Used up: the right code is refused too, from another
+  // login and client ip, with TOTP and recovery codes alike.
+  let client = begin_login(&app, "admin")
+    .await
+    .with_header("x-forwarded-for", "203.0.113.7")
+    .unwrap();
+  let e = client
+    .login(CompleteTotpLogin {
+      code: next_code(&enrolled.totp),
+    })
+    .await
+    .unwrap_err();
+  assert_eq!(
+    example_client::error_status(&e),
+    Some(StatusCode::TOO_MANY_REQUESTS)
+  );
+  assert!(format!("{e:#}").contains("Try again in"), "{e:#}");
+  let res = client
+    .login(CompleteTotpRecoveryLogin {
+      code: enrolled.recovery_codes[0].clone(),
+    })
+    .await;
+  assert_eq!(status_of(res), StatusCode::TOO_MANY_REQUESTS);
+
+  // Other users are not affected.
+  let other = app.sign_up("other").await;
+  let other_enrolled = enroll(&other).await;
+  let client = begin_login(&app, "other").await;
+  client
+    .login(CompleteTotpLogin {
+      code: next_code(&other_enrolled.totp),
+    })
+    .await
+    .unwrap();
+}
+
+/// The same recovery code sent twice at once, on two logins,
+/// logs in only once.
+#[tokio::test]
+async fn a_recovery_code_used_twice_at_once_logs_in_once() {
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+  let enrolled = enroll(&admin).await;
+  let code = enrolled.recovery_codes[0].clone();
+
+  let first = begin_login(&app, "admin").await;
+  let second = begin_login(&app, "admin").await;
+  let (first, second) = tokio::join!(
+    first.login(CompleteTotpRecoveryLogin { code: code.clone() }),
+    second.login(CompleteTotpRecoveryLogin { code: code.clone() }),
+  );
+  assert!(
+    first.is_ok() != second.is_ok(),
+    "The code logged in {} times",
+    first.is_ok() as u8 + second.is_ok() as u8
+  );
+}
+
+/// An enrollment begun by one user can't be confirmed by another
+/// on the same cookie jar (session): the manage api authenticates
+/// by the Authorization header, the enrollment rides on the cookie.
+/// Neither can a locked user (a shared demo) be enrolled this way.
+#[tokio::test]
+async fn enrollment_is_confirmed_by_the_user_who_began_it() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    config: json!({ "lock_login_credentials_for": ["demo"] }),
+    ..Default::default()
+  })
+  .await;
+  let attacker = app.sign_up("attacker").await;
+  app.sign_up("demo").await;
+  app.sign_up("other").await;
+
+  /// Logs in `username` on the cookie jar of `client`.
+  async fn log_in_on(
+    client: &ExampleClient,
+    username: &str,
+  ) -> ExampleClient {
+    let res = client
+      .login(LoginLocalUser {
+        username: username.into(),
+        password: PASSWORD.into(),
+      })
+      .await
+      .unwrap();
+    let JwtOrTwoFactor::Jwt(jwt) = res else {
+      panic!("Expected a jwt, got {res:?}");
+    };
+    client.with_auth(ClientAuth::Jwt(jwt.jwt))
+  }
+
+  for victim in ["demo", "other"] {
+    let enrollment =
+      attacker.manage(BeginTotpEnrollment {}).await.unwrap();
+    let totp = totp_from_uri(&enrollment.uri);
+    let as_victim = log_in_on(&attacker, victim).await;
+    let res = as_victim
+      .manage(ConfirmTotpEnrollment {
+        code: totp.generate_current().to_string(),
+      })
+      .await;
+    assert_eq!(status_of(res), StatusCode::UNAUTHORIZED, "{victim}");
+    assert!(!get_user(&as_victim).await.totp_enrolled, "{victim}");
+    // The victim still logs in with the password alone.
+    app.log_in(victim).await;
+  }
+
+  // The refused enrollment is gone, the attacker has to begin again.
+  let enrollment =
+    attacker.manage(BeginTotpEnrollment {}).await.unwrap();
+  let totp = totp_from_uri(&enrollment.uri);
+  let as_other = log_in_on(&attacker, "other").await;
+  as_other
+    .manage(ConfirmTotpEnrollment {
+      code: totp.generate_current().to_string(),
+    })
+    .await
+    .unwrap_err();
+  let res = attacker
+    .manage(ConfirmTotpEnrollment {
+      code: totp.generate_current().to_string(),
+    })
+    .await;
+  assert_eq!(status_of(res), StatusCode::UNAUTHORIZED);
+  // Begun and confirmed by the same user, it works.
+  enroll(&attacker).await;
+  assert!(get_user(&attacker).await.totp_enrolled);
+}
+
+/// Passing the password gives the login a new session id, so a
+/// session planted in the browser beforehand (session fixation)
+/// can't send the codes of the user who logs in on it.
+#[tokio::test]
+async fn first_factor_gets_a_new_session_id() {
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+  let enrolled = enroll(&admin).await;
+  let attacker = app.sign_up("attacker").await;
+  enroll(&attacker).await;
+
+  // Without a cookie store: the cookies are set by hand.
+  let reqwest = reqwest::Client::new();
+  let login = |variant: &str, cookie: Option<&str>, body| {
+    let request = reqwest
+      .post(format!("{}/auth/login/{variant}", app.address))
+      .json(&body);
+    match cookie {
+      Some(cookie) => request.header("cookie", cookie),
+      None => request,
+    }
+    .send()
+  };
+  let credentials = |username: &str| json!({ "username": username, "password": PASSWORD });
+
+  // A live session of the attacker: their own first factor.
+  let res = login("LoginLocalUser", None, credentials("attacker"))
+    .await
+    .unwrap();
+  assert!(res.status().is_success());
+  let planted = session_cookie(&res);
+
+  // The victim's browser was made to carry it (eg by a sibling
+  // subdomain), and they log in with their password.
+  let res =
+    login("LoginLocalUser", Some(&planted), credentials("admin"))
+      .await
+      .unwrap();
+  assert!(res.status().is_success());
+  let cycled = session_cookie(&res);
+  assert_ne!(cycled, planted);
+
+  // The planted session holds no login of the victim.
+  let code = json!({ "code": next_code(&enrolled.totp) });
+  let res = login("CompleteTotpLogin", Some(&planted), code.clone())
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+  let body = res.text().await.unwrap();
+  assert!(body.contains("not been initiated"), "{body}");
+
+  // The victim's own cookie completes it.
+  let res = login("CompleteTotpLogin", Some(&cycled), code)
+    .await
+    .unwrap();
+  assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+}
+
+/// `name=value` of the session cookie a response sets.
+fn session_cookie(res: &reqwest::Response) -> String {
+  res
+    .headers()
+    .get_all("set-cookie")
+    .iter()
+    .map(|value| value.to_str().unwrap())
+    .find(|cookie| {
+      cookie.starts_with("id=") || cookie.starts_with("__Host-id=")
+    })
+    .expect("No session cookie set")
+    .split(';')
+    .next()
+    .unwrap()
+    .to_string()
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
   haystack
     .windows(needle.len())

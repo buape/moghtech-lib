@@ -18,14 +18,14 @@ test suites which run against it. It has two jobs:
 | [client/ts](client/ts) | The typescript client: `read` / `write` / `execute` / `auth`, typed by request name. |
 | [server](server) | `example_server`: axum + sqlx (sqlite). `src/auth.rs` is the `AuthImpl`, `src/api` the resolver api, `migrations` the schema. |
 | [server/tests/suite](server/tests/suite) | The api test suite (rust), see [Tests](#tests). |
-| [mock_idp](mock_idp) | `example_mock_idp`: a mock OIDC provider / token issuer for the tests. ⚠️ Test only, its signing keys are in this repo. |
+| [mock_idp](mock_idp) | `example_mock_idp`: a mock OIDC provider / token issuer for the tests. ⚠️ Test only, the keys it signs tokens with are in this repo. |
 | [ui](ui) | The React UI, and the browser tests in `ui/e2e` (playwright). |
 
 Which crate is used where:
 
 | Crate | Used for |
 | --- | --- |
-| `mogh_auth_server` / `mogh_auth_client` | Everything under `/auth`: local login, OIDC, passkey + TOTP 2FA, api keys (V1 secret, V2 signed requests), stored login providers, token exchange, workload identity. App side in `server/src/auth.rs`. |
+| `mogh_auth_server` / `mogh_auth_client` | Everything under `/auth`: local login, OIDC, passkey + TOTP 2FA, api keys (key + secret) and signing keys (signed requests), stored login providers, token exchange, workload identity. App side in `server/src/auth.rs`. |
 | `mogh_resolver` | The request types in `client/rs/src/api`, resolved in `server/src/api`. |
 | `mogh_server` | Serving, security headers, CORS, sessions, static UI hosting (`server/src/api/mod.rs`). |
 | `mogh_config` / `mogh_secret_file` | Config files + env overrides + `_FILE` secrets (`server/src/config.rs`). |
@@ -33,7 +33,7 @@ Which crate is used where:
 | `mogh_error` | Error responses with status codes, everywhere. |
 | `mogh_rate_limit` / `mogh_request_ip` | Auth rate limiters (`server/src/state.rs`), client ip, cidr whitelists. |
 | `mogh_encryption` | Secrets at rest: TOTP secrets, passkeys, provider client secrets, notes (`server/src/crypto.rs`), and `SealText` / `OpenText`. |
-| `mogh_pki` | The server key pair for V2 api keys, `GenerateKeyPair`. |
+| `mogh_pki` | The server key pair for signing keys, `GenerateKeyPair`. |
 | `mogh_cache` | Cached login providers / trusted issuers, and the `GetStats` timeout cache. |
 | `mogh_validations` | Note titles, groups, `ValidateString`. |
 
@@ -104,7 +104,7 @@ config and key files) plus an in process mock identity provider, see
 | --- | --- |
 | `local_auth` | Signup / login, validation, registration settings, locked usernames, credential updates |
 | `two_factor` | TOTP enrollment + login, retries, replay across restarts, recovery codes |
-| `api_keys` | V1 + V2 keys, signature binding, expiry, cidr whitelists, ownership |
+| `api_keys` | Api keys + signing keys, signature binding, expiry, cidr whitelists, ownership |
 | `oidc` | Signup / login / linking through the provider, groups, allowed + admin groups, 2FA, callback + redirect checks, failures sent back to the login page |
 | `providers` | Admin managed login providers: secrets, validation, static providers, restarts |
 | `token_exchange` | RFC 8693 exchange for users, rejected tokens, rate limiting, second factor |
