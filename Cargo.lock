@@ -647,9 +647,9 @@ dependencies = [
  "chrono",
  "futures-util",
  "http",
- "mogh_auth_client",
+ "mogh_auth_client 4.2.1",
  "mogh_error",
- "mogh_pki",
+ "mogh_pki 1.3.0",
  "mogh_resolver",
  "rand 0.10.3",
  "reqwest 0.13.5",
@@ -1252,7 +1252,7 @@ name = "example_client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "mogh_auth_client",
+ "mogh_auth_client 5.0.0",
  "mogh_error",
  "mogh_resolver",
  "reqwest 0.13.5",
@@ -1287,14 +1287,14 @@ dependencies = [
  "envy",
  "example_client",
  "example_mock_idp",
- "mogh_auth_client",
+ "mogh_auth_client 5.0.0",
  "mogh_auth_server",
  "mogh_cache",
  "mogh_config",
  "mogh_encryption",
  "mogh_error",
  "mogh_logger",
- "mogh_pki",
+ "mogh_pki 2.0.0",
  "mogh_rate_limit",
  "mogh_request_ip",
  "mogh_resolver",
@@ -2296,14 +2296,33 @@ dependencies = [
 [[package]]
 name = "mogh_auth_client"
 version = "4.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "568cf9d3e7a754774426c918e5acc5b0be1a2ac808c3ec4895303500e0476cb2"
 dependencies = [
  "anyhow",
  "mogh_error",
- "mogh_pki",
  "mogh_resolver",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "strum",
+ "typeshare",
+ "webauthn-rs",
+ "zeroize",
+]
+
+[[package]]
+name = "mogh_auth_client"
+version = "5.0.0"
+dependencies = [
+ "anyhow",
+ "mogh_error",
+ "mogh_pki 2.0.0",
+ "mogh_resolver",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "strum",
  "typeshare",
  "utoipa",
@@ -2313,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_auth_server"
-version = "4.2.4"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2321,9 +2340,9 @@ dependencies = [
  "chrono",
  "data-encoding",
  "jsonwebtoken",
- "mogh_auth_client",
+ "mogh_auth_client 5.0.0",
  "mogh_error",
- "mogh_pki",
+ "mogh_pki 2.0.0",
  "mogh_rate_limit",
  "mogh_request_ip",
  "mogh_resolver",
@@ -2349,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_cache"
-version = "1.1.4"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "tokio",
@@ -2389,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_error"
-version = "1.0.6"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2400,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_logger"
-version = "1.4.2"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -2417,6 +2436,25 @@ dependencies = [
 [[package]]
 name = "mogh_pki"
 version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecd1fabebc5843ada55a02b78e9fcca6b6ada09c336b8f0728bb1abfdacc38af"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "data-encoding",
+ "der",
+ "mogh_secret_file",
+ "pem-rfc7468 1.0.0",
+ "pkcs8",
+ "snow",
+ "spki",
+ "subtle",
+ "tracing",
+]
+
+[[package]]
+name = "mogh_pki"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2433,16 +2471,17 @@ dependencies = [
  "spki",
  "strum",
  "subtle",
+ "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
 name = "mogh_rate_limit"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "axum",
- "mogh_cache",
  "mogh_error",
  "mogh_request_ip",
  "tokio",
@@ -2450,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_request_ip"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2477,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "mogh_secret_file"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2485,13 +2524,16 @@ dependencies = [
 
 [[package]]
 name = "mogh_server"
-version = "1.7.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "axum-server",
  "data-encoding",
  "mogh_request_ip",
+ "reqwest 0.13.5",
+ "rustls",
  "sha2 0.11.0",
  "tokio",
  "tower",
@@ -3408,6 +3450,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
