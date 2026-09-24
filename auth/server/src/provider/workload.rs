@@ -23,6 +23,7 @@ use crate::{
     load_cache::LoadCache,
     token_exchange::{TokenVerificationKeys, issuers_match},
   },
+  validations::redact_url_credentials,
 };
 
 /// Fetched keys are reused for 5min, so a rotation at the issuer is picked up.
@@ -192,15 +193,20 @@ fn http_client() -> &'static reqwest::Client {
 }
 
 /// Reads at most [MAX_JWKS_LENGTH], whatever the server sends.
+///
+/// The management api refuses urls with credentials, but issuers
+/// configured elsewhere (static ones, rows stored before) may still
+/// carry them: errors name the url without them.
 async fn fetch_text(url: &str) -> anyhow::Result<String> {
+  let shown = redact_url_credentials(url);
   let mut response = http_client()
     .get(url)
     .send()
     .await
-    .with_context(|| format!("Failed to reach {url}"))?
+    .with_context(|| format!("Failed to reach {shown}"))?
     .error_for_status()
-    .with_context(|| format!("Request to {url} failed"))?;
-  let too_large = || anyhow!("Response of {url} is too large");
+    .with_context(|| format!("Request to {shown} failed"))?;
+  let too_large = || anyhow!("Response of {shown} is too large");
   if response
     .content_length()
     .is_some_and(|length| length > MAX_JWKS_LENGTH as u64)
@@ -211,15 +217,16 @@ async fn fetch_text(url: &str) -> anyhow::Result<String> {
   while let Some(chunk) = response
     .chunk()
     .await
-    .with_context(|| format!("Failed to read response of {url}"))?
+    .with_context(|| format!("Failed to read response of {shown}"))?
   {
     if body.len() + chunk.len() > MAX_JWKS_LENGTH {
       return Err(too_large());
     }
     body.extend_from_slice(&chunk);
   }
-  String::from_utf8(body)
-    .with_context(|| format!("Response of {url} is not valid UTF-8"))
+  String::from_utf8(body).with_context(|| {
+    format!("Response of {shown} is not valid UTF-8")
+  })
 }
 
 /// The part of OpenID discovery workload issuers publish. They have
@@ -714,6 +721,62 @@ mod tests {
       .unwrap_err();
       assert!(format!("{err:#}").contains("too large"), "{err:#}");
     }
+  }
+
+  /// Issuers configured outside the management api may still have
+  /// credentials in their urls, errors (which get logged) never show them.
+  #[tokio::test]
+  async fn test_fetch_errors_hide_url_credentials() {
+    let address = serve_issuer(None).await;
+    let with_credentials =
+      address.replace("http://", "http://user:hunter2@");
+    // Nothing listens there anymore
+    let closed = {
+      let listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+      format!(
+        "http://user:hunter2@{}",
+        listener.local_addr().unwrap()
+      )
+    };
+    for (id, issuer, keys) in [
+      (
+        "fetch-credentials-unreachable",
+        closed.clone(),
+        TrustedIssuerKeys::JwksUri(format!("{closed}/keys")),
+      ),
+      (
+        "fetch-credentials-missing",
+        address.clone(),
+        TrustedIssuerKeys::JwksUri(format!(
+          "{with_credentials}/missing"
+        )),
+      ),
+      (
+        "fetch-credentials-not-keys",
+        address.clone(),
+        TrustedIssuerKeys::JwksUri(format!(
+          "{with_credentials}/.well-known/openid-configuration"
+        )),
+      ),
+      (
+        "fetch-credentials-discovery",
+        closed.clone(),
+        TrustedIssuerKeys::Discovery {},
+      ),
+    ] {
+      let issuer = fetched_issuer(id, &issuer, keys);
+      let err = load_verification_keys(&issuer).await.err().unwrap();
+      for shown in [format!("{err:#}"), format!("{err:?}")] {
+        assert!(!shown.contains("hunter2"), "{id}: {shown}");
+      }
+    }
+    let err =
+      fetch_text(&format!("{closed}/keys")).await.unwrap_err();
+    assert!(
+      format!("{err:#}").contains("Failed to reach http://***@"),
+      "{err:#}"
+    );
   }
 
   #[test]

@@ -1,7 +1,7 @@
 //! Management of the external login providers stored by the app.
 //! Admin only, see [AuthUserImpl::is_admin].
 
-use anyhow::{Context as _, anyhow};
+use anyhow::anyhow;
 use axum::http::StatusCode;
 use mogh_auth_client::{
   api::manage::{
@@ -29,6 +29,7 @@ use crate::{
   },
   rand::random_string,
   user::AuthUserImpl,
+  validations::validate_public_http_url,
 };
 
 const MAX_PROVIDER_NAME_LENGTH: usize = 100;
@@ -129,15 +130,6 @@ async fn validate_provider_slug<I: AuthImpl + ?Sized>(
   Ok(slug)
 }
 
-fn validate_http_url(field: &str, url: &str) -> anyhow::Result<()> {
-  let parsed = reqwest::Url::parse(url)
-    .with_context(|| format!("'{field}' is not a valid URL"))?;
-  if !matches!(parsed.scheme(), "http" | "https") {
-    return Err(anyhow!("'{field}' must be an http(s) URL"));
-  }
-  Ok(())
-}
-
 fn validate_config(
   config: &ExternalLoginProviderConfig,
 ) -> mogh_error::Result<()> {
@@ -152,12 +144,15 @@ fn validate_config(
   match config {
     ExternalLoginProviderConfig::Oidc(config) => {
       if !config.provider.is_empty() {
-        validate_http_url("provider", &config.provider)
+        validate_public_http_url("provider", &config.provider)
           .status_code(StatusCode::BAD_REQUEST)?;
       }
       if !config.redirect_host.is_empty() {
-        validate_http_url("redirect_host", &config.redirect_host)
-          .status_code(StatusCode::BAD_REQUEST)?;
+        validate_public_http_url(
+          "redirect_host",
+          &config.redirect_host,
+        )
+        .status_code(StatusCode::BAD_REQUEST)?;
       }
     }
     // Unlike OIDC (public clients using PKCE), these can't work
@@ -922,12 +917,96 @@ mod tests {
       provider: "javascript:alert(1)".into(),
       ..Default::default()
     });
-    for request in [bad_name, bad_url, create_request(REDACTED)] {
+    // Credentials in the urls would be stored and logged in plain text
+    let oidc_request = |provider: &str, redirect_host: &str| {
+      let mut request = create_request("secret");
+      request.config =
+        ExternalLoginProviderConfig::Oidc(OidcConfig {
+          enabled: true,
+          provider: provider.into(),
+          redirect_host: redirect_host.into(),
+          client_id: "client-id".into(),
+          ..Default::default()
+        });
+      request
+    };
+    for request in [
+      bad_name,
+      bad_url,
+      create_request(REDACTED),
+      oidc_request("https://user:pass@idp.example.com", ""),
+      oidc_request("https://user@idp.example.com", ""),
+      oidc_request("https://:pass@idp.example.com", ""),
+      oidc_request(
+        "https://idp.example.com",
+        "https://user:pass@app.example.com",
+      ),
+      oidc_request(
+        "https://idp.example.com",
+        "ftp://app.example.com",
+      ),
+    ] {
       let err =
         create_provider(&auth, &ADMIN, request).await.unwrap_err();
       assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
     assert!(auth.stored.lock().unwrap().is_empty());
+
+    // The error names the field, not the credentials
+    for (request, field) in [
+      (
+        oidc_request("https://user:hunter2@idp.example.com", ""),
+        "provider",
+      ),
+      (
+        oidc_request(
+          "https://idp.example.com",
+          "https://user:hunter2@app.example.com",
+        ),
+        "redirect_host",
+      ),
+    ] {
+      let err =
+        create_provider(&auth, &ADMIN, request).await.unwrap_err();
+      let message = format!("{:#}", err.error);
+      assert!(
+        message
+          .contains(&format!("'{field}' must not carry credentials")),
+        "{message}"
+      );
+      assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    // Updates are validated the same way
+    let id = create_provider(
+      &auth,
+      &ADMIN,
+      oidc_request(
+        "https://idp.example.com",
+        "https://app.example.com",
+      ),
+    )
+    .await
+    .unwrap()
+    .provider
+    .id;
+    let err = update_provider(
+      &auth,
+      &ADMIN,
+      update_request(
+        &id,
+        oidc_config("https://user:pass@idp.example.com", "secret"),
+      ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    let stored = auth.stored.lock().unwrap();
+    let ExternalLoginProviderConfig::Oidc(config) = &stored[0].config
+    else {
+      panic!("not an OIDC provider");
+    };
+    assert_eq!(config.provider, "https://idp.example.com");
   }
 
   #[tokio::test]

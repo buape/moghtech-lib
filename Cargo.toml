@@ -18,7 +18,7 @@ repository = "https://github.com/moghtech/lib"
 [workspace.dependencies]
 # MOGH API
 mogh_auth_client = "4.2.1"
-mogh_auth_server = "4.2.3"
+mogh_auth_server = "4.2.4"
 
 # MOGH
 mogh_cache = "1.1.4"

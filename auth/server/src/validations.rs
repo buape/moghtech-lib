@@ -1,7 +1,7 @@
 //! Default username / password / api key validations.
 //! These can be overridden on AuthImpl.
 
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use mogh_validations::{StringValidator, StringValidatorMatches};
 use subtle::ConstantTimeEq as _;
 
@@ -60,9 +60,137 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
   a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// Whether the url carries credentials in its authority
+/// (`scheme://user:password@host`): a username, or any password.
+pub fn url_has_credentials(url: &reqwest::Url) -> bool {
+  !url.username().is_empty() || url.password().is_some()
+}
+
+/// Validate a url the app uses without authentication, such as
+/// an OIDC issuer / discovery endpoint, a JWKS url or a redirect host.
+///
+/// - Parses as a url
+/// - Has the `http` or `https` scheme
+/// - Carries no credentials ([url_has_credentials]): these would be
+///   stored and shown in plain text with the url, sent along with
+///   every request to it, and end up in error messages and logs.
+///
+/// `field` names the url in the error, and nothing of the url
+/// itself is in it.
+pub fn validate_public_http_url(
+  field: &str,
+  url: &str,
+) -> anyhow::Result<()> {
+  let parsed = reqwest::Url::parse(url)
+    .with_context(|| format!("'{field}' is not a valid URL"))?;
+  if !matches!(parsed.scheme(), "http" | "https") {
+    return Err(anyhow!("'{field}' must be an http(s) URL"));
+  }
+  if url_has_credentials(&parsed) {
+    return Err(anyhow!(
+      "'{field}' must not carry credentials (scheme://user:password@host): \
+      it is used without authentication, and credentials in a url \
+      would be stored and logged in plain text"
+    ));
+  }
+  Ok(())
+}
+
+/// The url with any credentials in its authority replaced by `***`,
+/// for error messages and logs. Urls without credentials are returned
+/// unchanged. Works on urls which don't parse too, by removing
+/// everything up to the last `@` of the authority.
+pub fn redact_url_credentials(url: &str) -> String {
+  if let Ok(mut parsed) = reqwest::Url::parse(url) {
+    if !url_has_credentials(&parsed) {
+      return url.to_string();
+    }
+    if parsed.set_username("***").is_ok()
+      && parsed.set_password(None).is_ok()
+    {
+      return parsed.into();
+    }
+  }
+  let Some(start) = url.find("://").map(|index| index + 3) else {
+    return url.to_string();
+  };
+  let rest = &url[start..];
+  let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+  match rest[..end].rfind('@') {
+    Some(at) => format!("{}***@{}", &url[..start], &rest[at + 1..]),
+    None => url.to_string(),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn test_validate_public_http_url() {
+    for url in [
+      "https://issuer.example.com",
+      "http://localhost:8080/keys?v=2",
+      // An '@' outside of the authority is not a credential
+      "https://example.com/users/@me",
+      "https://example.com/keys?owner=a@b",
+    ] {
+      assert!(validate_public_http_url("url", url).is_ok(), "{url}");
+    }
+    for url in [
+      "not a url",
+      "ftp://issuer.example.com",
+      "javascript:alert(1)",
+      "https://user:password@issuer.example.com",
+      "https://user@issuer.example.com",
+      "https://:password@issuer.example.com",
+      "https://user:@issuer.example.com/keys",
+      "http:user:password@issuer.example.com",
+    ] {
+      assert!(validate_public_http_url("url", url).is_err(), "{url}");
+    }
+    let err = validate_public_http_url(
+      "keys url",
+      "https://user:hunter2@issuer.example.com/keys",
+    )
+    .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("'keys url' must not carry credentials"));
+    assert!(!err.contains("hunter2"), "{err}");
+  }
+
+  #[test]
+  fn test_redact_url_credentials() {
+    for (url, redacted) in [
+      (
+        "https://user:hunter2@issuer.example.com/keys",
+        "https://***@issuer.example.com/keys",
+      ),
+      (
+        "http://user@localhost:8080/.well-known/openid-configuration",
+        "http://***@localhost:8080/.well-known/openid-configuration",
+      ),
+      (
+        "https://:hunter2@issuer.example.com",
+        "https://***@issuer.example.com/",
+      ),
+      // Unchanged without credentials, even when not normalized
+      ("https://issuer.example.com", "https://issuer.example.com"),
+      (
+        "https://example.com/users/@me",
+        "https://example.com/users/@me",
+      ),
+      // Not parseable (space in the host), stripped all the same
+      (
+        "https://user:hunter2@bad host/keys",
+        "https://***@bad host/keys",
+      ),
+      ("https://a@b:hunter2@bad host", "https://***@bad host"),
+      ("not a url", "not a url"),
+    ] {
+      assert_eq!(redact_url_credentials(url), redacted, "{url}");
+    }
+  }
 
   #[test]
   fn test_constant_time_eq() {

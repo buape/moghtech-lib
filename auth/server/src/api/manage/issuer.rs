@@ -26,6 +26,7 @@ use crate::{
   },
   rand::random_string,
   user::AuthUserImpl,
+  validations::validate_public_http_url,
 };
 
 const MAX_NAME_LENGTH: usize = 100;
@@ -66,19 +67,15 @@ fn validate_name(
   Ok(name.to_string())
 }
 
+/// Credentials are refused, not supported: the discovery document
+/// and the keys are public, and credentials in the url would be
+/// stored, listed and logged in plain text.
 fn validate_http_url(
   field: &str,
   url: &str,
 ) -> mogh_error::Result<()> {
-  let parsed = reqwest::Url::parse(url)
-    .with_context(|| format!("'{field}' is not a valid URL"))
-    .status_code(StatusCode::BAD_REQUEST)?;
-  if !matches!(parsed.scheme(), "http" | "https") {
-    return Err(bad_request(format!(
-      "'{field}' must be an http(s) URL"
-    )));
-  }
-  Ok(())
+  validate_public_http_url(field, url)
+    .status_code(StatusCode::BAD_REQUEST)
 }
 
 /// Trimmed, without empty entries or duplicates.
@@ -637,6 +634,23 @@ mod tests {
       // An audience is what ties the token to this app
       invalid(|i| i.audiences = vec!["  ".into()]),
       invalid(|i| i.keys = TrustedIssuerKeys::JwksUri("nope".into())),
+      // Credentials would be stored, listed and logged in plain text
+      invalid(|i| {
+        i.issuer = "https://user:pass@issuer.example.com".into()
+      }),
+      invalid(|i| {
+        i.issuer = "https://user@issuer.example.com".into()
+      }),
+      invalid(|i| {
+        i.keys = TrustedIssuerKeys::JwksUri(
+          "https://user:pass@issuer.example.com/keys".into(),
+        )
+      }),
+      invalid(|i| {
+        i.keys = TrustedIssuerKeys::JwksUri(
+          "https://:pass@issuer.example.com/keys".into(),
+        )
+      }),
       invalid(|i| i.keys = TrustedIssuerKeys::Static("{}".into())),
       // A rule accepting every token of the issuer
       invalid(|i| i.rules[0].claims.clear()),
@@ -657,6 +671,39 @@ mod tests {
       assert_eq!(err.status, StatusCode::BAD_REQUEST, "{issuer:?}");
     }
     assert!(auth.stored.lock().unwrap().is_empty());
+
+    // The error names the field, not the credentials
+    let err = create_issuer(
+      &auth,
+      &ADMIN,
+      invalid(|i| {
+        i.keys = TrustedIssuerKeys::JwksUri(
+          "https://user:hunter2@issuer.example.com/keys".into(),
+        )
+      }),
+    )
+    .await
+    .unwrap_err();
+    let message = format!("{:#}", err.error);
+    assert!(
+      message.contains("'keys url' must not carry credentials"),
+      "{message}"
+    );
+    assert!(!message.contains("hunter2"), "{message}");
+
+    // Updates are validated the same way
+    let created = create_issuer(&auth, &ADMIN, issuer(Vec::new()))
+      .await
+      .unwrap()
+      .issuer;
+    let mut update = created.clone();
+    update.keys = TrustedIssuerKeys::JwksUri(
+      "https://user:pass@issuer.example.com/keys".into(),
+    );
+    let err = update_issuer(&auth, &ADMIN, update).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(auth.stored.lock().unwrap()[0].keys, created.keys);
+    delete_issuer(&auth, &ADMIN, &created.id).await.unwrap();
 
     // Narrow wildcards and static keys are fine
     let mut valid = issuer(vec![rule("", "Deploy")]);

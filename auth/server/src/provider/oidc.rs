@@ -17,7 +17,10 @@ use openidconnect::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::provider::token_exchange::TokenVerificationKeys;
+use crate::{
+  provider::token_exchange::TokenVerificationKeys,
+  validations::url_has_credentials,
+};
 
 pub use openidconnect::SubjectIdentifier;
 
@@ -96,6 +99,18 @@ impl OidcProvider {
     if !config.enabled() {
       return Err(anyhow!(
         "OIDC provider is disabled or not configured."
+      ));
+    }
+
+    // Refused by the management api. Configured elsewhere, they
+    // would be sent to the discovery endpoint, and end up in the
+    // errors of the discovery (eg. the issuer mismatch, as the
+    // provider's issuer can't carry them).
+    if Url::parse(&config.provider)
+      .is_ok_and(|url| url_has_credentials(&url))
+    {
+      return Err(anyhow!(
+        "OIDC 'provider' url must not carry credentials (scheme://user:password@host)"
       ));
     }
 
@@ -853,6 +868,32 @@ mod tests {
         )
         .is_err()
     );
+  }
+
+  #[tokio::test]
+  async fn test_provider_url_with_credentials_is_refused() {
+    // Refused before any request: nothing listens there
+    let listener =
+      std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let config = OidcConfig {
+      enabled: true,
+      provider: format!("http://user:hunter2@{address}"),
+      client_id: "client-id".to_string(),
+      ..Default::default()
+    };
+    let err = OidcProvider::new(
+      "test",
+      "https://app.example.com/auth/oidc/callback".to_string(),
+      &config,
+    )
+    .await
+    .err()
+    .unwrap();
+    let err = format!("{err:#}");
+    assert!(err.contains("must not carry credentials"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
   }
 
   #[test]
