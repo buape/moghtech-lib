@@ -8,6 +8,17 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Prevents simultaneous / rapid fire access to an action,
 /// returning the cached result instead in these situations.
+///
+/// A caller takes the entry for its key with
+/// [get_lock](TimeoutCache::get_lock), locks it for the length of
+/// the action, and reuses [CacheEntry::res] while
+/// [CacheEntry::last_ts] is recent enough.
+///
+/// Entries stay until removed. When keys come from request input
+/// (eg an image name), call [prune](TimeoutCache::prune) from a
+/// periodic task to keep the map bounded. An entry a caller still
+/// holds is never removed, so eviction cannot let a second caller
+/// run the same action at the same time.
 #[derive(Default)]
 pub struct TimeoutCache<K, Res>(
   Mutex<HashMap<K, Arc<Mutex<CacheEntry<Res>>>>>,
@@ -23,8 +34,77 @@ impl<K: Eq + Hash, Res: Default> TimeoutCache<K, Res> {
   }
 }
 
+impl<K: Eq + Hash, Res> TimeoutCache<K, Res> {
+  /// The number of cached keys.
+  pub async fn len(&self) -> usize {
+    self.0.lock().await.len()
+  }
+
+  pub async fn is_empty(&self) -> bool {
+    self.0.lock().await.is_empty()
+  }
+
+  /// Removes the entry for `key`, unless a caller still holds it
+  /// (between [get_lock](TimeoutCache::get_lock) and dropping the
+  /// handle). Returns whether an entry was removed.
+  pub async fn remove(&self, key: &K) -> bool {
+    let mut map = self.0.lock().await;
+    match map.get(key) {
+      Some(entry) if !is_held(entry) => {
+        map.remove(key);
+        true
+      }
+      _ => false,
+    }
+  }
+
+  /// Keeps only the entries `keep` returns true for. Entries a
+  /// caller still holds are always kept, without calling `keep`.
+  pub async fn retain(
+    &self,
+    mut keep: impl FnMut(&K, &CacheEntry<Res>) -> bool,
+  ) {
+    self.0.lock().await.retain(|key, entry| {
+      if is_held(entry) {
+        return true;
+      }
+      // Nobody else can reach an unheld entry, the lock is free.
+      match entry.try_lock() {
+        Ok(entry) => keep(key, &entry),
+        Err(_) => true,
+      }
+    });
+  }
+
+  /// Removes the entries no caller holds whose
+  /// [last_ts](CacheEntry::last_ts) is before `older_than` (same
+  /// unit, eg `now - timeout` in unix ms). Returns how many were
+  /// removed.
+  pub async fn prune(&self, older_than: i64) -> usize {
+    let mut removed = 0;
+    self
+      .retain(|_, entry| {
+        let keep = entry.last_ts >= older_than;
+        if !keep {
+          removed += 1;
+        }
+        keep
+      })
+      .await;
+    removed
+  }
+}
+
+/// Whether a caller holds a handle to the entry. Only called under
+/// the map lock, where no new handle can be taken, so a count that
+/// reads as unheld stays unheld.
+fn is_held<Res>(entry: &Arc<Mutex<CacheEntry<Res>>>) -> bool {
+  Arc::strong_count(entry) > 1 || Arc::weak_count(entry) > 0
+}
+
 pub struct CacheEntry<Res> {
-  /// The last cached ts
+  /// The last cached ts, in the unit the caller passes to
+  /// [set](CacheEntry::set) (0 until the first set).
   pub last_ts: i64,
   /// The last cached result
   pub res: anyhow::Result<Res>,
@@ -189,9 +269,44 @@ impl<T: Clone> CloneVecCache<T> {
   pub async fn retain(&self, keep: impl FnMut(&T) -> bool) {
     self.0.write().await.retain(keep);
   }
+
+  /// Returns the first item matching `find`, or inserts and returns
+  /// `make()` when none does. Both happen under one write lock, so
+  /// concurrent callers insert at most once.
+  ///
+  /// `make` must build an item `find` matches (eg one carrying the
+  /// id `find` compares), otherwise the next call misses again and
+  /// inserts another item. Debug builds assert this.
+  pub async fn find_or_insert_with(
+    &self,
+    mut find: impl FnMut(&T) -> bool,
+    make: impl FnOnce() -> T,
+  ) -> T {
+    let mut cache = self.0.write().await;
+    if let Some(item) = cache.iter().find(|item| find(item)) {
+      return item.clone();
+    }
+    let item = make();
+    debug_assert!(
+      find(&item),
+      "CloneVecCache::find_or_insert_with: the inserted item does not match 'find'"
+    );
+    cache.push(item.clone());
+    item
+  }
 }
 
 impl<T: Clone + Default> CloneVecCache<T> {
+  /// Returns the first item matching `find`, or inserts and returns
+  /// `T::default()` when none does.
+  ///
+  /// Only idempotent when `T::default()` itself matches `find`.
+  /// A keyed `find` (eg `|t| t.id == id`) never matches the default,
+  /// so every call inserts another default and returns it instead
+  /// of an item with that key.
+  #[deprecated(
+    note = "T::default() rarely matches a keyed 'find', so every miss inserts another default: use 'find_or_insert_with'"
+  )]
   pub async fn find_or_insert_default(
     &self,
     find: impl FnMut(&&T) -> bool,
@@ -323,6 +438,87 @@ mod tests {
     assert_eq!(format!("{cloned:#}"), "outer: inner");
   }
 
+  /// Sets the entry for `key` to a result cached at `ts`.
+  async fn set_at(
+    cache: &TimeoutCache<&str, u64>,
+    key: &'static str,
+    ts: i64,
+  ) {
+    cache.get_lock(key).await.lock().await.set(&Ok(1), ts);
+  }
+
+  #[tokio::test]
+  async fn timeout_cache_prune_drops_stale_unheld_entries() {
+    let cache = TimeoutCache::<&str, u64>::default();
+    set_at(&cache, "stale", 100).await;
+    set_at(&cache, "fresh", 300).await;
+    set_at(&cache, "held", 100).await;
+    set_at(&cache, "locked", 100).await;
+    // A caller between get_lock and dropping the handle.
+    let held = cache.get_lock("held").await;
+    // A caller mid action, holding the entry lock.
+    let locked = cache.get_lock("locked").await;
+    let guard = locked.lock().await;
+    assert_eq!(cache.len().await, 4);
+
+    assert_eq!(cache.prune(200).await, 1);
+    assert_eq!(cache.len().await, 3);
+    // The stale entry is gone: the next caller starts over.
+    let entry = cache.get_lock("stale").await;
+    assert_eq!(entry.lock().await.last_ts, 0);
+    drop(entry);
+    // Held entries survive, so a second caller still waits on the
+    // same one instead of running the action alongside.
+    assert!(Arc::ptr_eq(&held, &cache.get_lock("held").await));
+    assert!(Arc::ptr_eq(&locked, &cache.get_lock("locked").await));
+
+    drop(guard);
+    drop(locked);
+    drop(held);
+    // "stale" (recreated at 0) + "held" + "locked".
+    assert_eq!(cache.prune(200).await, 3);
+    assert_eq!(cache.len().await, 1);
+    assert!(!cache.is_empty().await);
+  }
+
+  #[tokio::test]
+  async fn timeout_cache_remove_skips_held_entry() {
+    let cache = TimeoutCache::<&str, u64>::default();
+    assert!(!cache.remove(&"missing").await);
+    let held = cache.get_lock("key").await;
+    held.lock().await.set(&Ok(7), 100);
+    assert!(!cache.remove(&"key").await);
+    assert!(Arc::ptr_eq(&held, &cache.get_lock("key").await));
+    // A weak handle can come back, it counts as held too.
+    let weak = Arc::downgrade(&held);
+    drop(held);
+    assert!(!cache.remove(&"key").await);
+    drop(weak);
+    assert!(cache.remove(&"key").await);
+    assert!(cache.is_empty().await);
+    assert_eq!(cache.get_lock("key").await.lock().await.last_ts, 0);
+  }
+
+  #[tokio::test]
+  async fn timeout_cache_retain() {
+    let cache = TimeoutCache::<&str, u64>::default();
+    set_at(&cache, "a", 1).await;
+    set_at(&cache, "b", 2).await;
+    let held = cache.get_lock("c").await;
+    let mut seen = Vec::new();
+    cache
+      .retain(|key, entry| {
+        seen.push(*key);
+        entry.last_ts == 2
+      })
+      .await;
+    seen.sort();
+    // The held entry isn't offered to 'keep', and stays.
+    assert_eq!(seen, vec!["a", "b"]);
+    assert_eq!(cache.len().await, 2);
+    assert!(Arc::ptr_eq(&held, &cache.get_lock("c").await));
+  }
+
   #[tokio::test]
   async fn clone_cache_insert_get_remove() {
     let cache = CloneCache::<String, u64>::default();
@@ -420,6 +616,7 @@ mod tests {
   }
 
   #[tokio::test]
+  #[allow(deprecated)]
   async fn clone_vec_cache_find_or_insert_default() {
     let cache = CloneVecCache::<u64>::default();
     assert_eq!(cache.find_or_insert_default(|&&v| v == 0).await, 0);
@@ -428,6 +625,84 @@ mod tests {
     cache.insert(|&v| v == 9, 9).await;
     assert_eq!(cache.find_or_insert_default(|&&v| v == 9).await, 9);
     assert_eq!(cache.list().await.len(), 2);
+  }
+
+  #[derive(Clone, Debug, Default, PartialEq)]
+  struct Named {
+    name: &'static str,
+    hits: u64,
+  }
+
+  /// With a keyed `find`, the item `make` builds carries the key,
+  /// so repeat calls find it rather than inserting again (unlike
+  /// `find_or_insert_default`, whose default has no name).
+  #[tokio::test]
+  async fn clone_vec_cache_find_or_insert_with_keyed() {
+    let cache = CloneVecCache::<Named>::default();
+    let make = || Named { name: "a", hits: 0 };
+    for _ in 0..3 {
+      let item =
+        cache.find_or_insert_with(|t| t.name == "a", make).await;
+      assert_eq!(item.name, "a");
+    }
+    assert_eq!(cache.list().await.len(), 1);
+    // An existing match is returned as is, make isn't called.
+    cache
+      .insert(|t| t.name == "a", Named { name: "a", hits: 5 })
+      .await;
+    let item = cache
+      .find_or_insert_with(
+        |t| t.name == "a",
+        || unreachable!("the item exists"),
+      )
+      .await;
+    assert_eq!(item.hits, 5);
+    // Another key inserts its own item.
+    let item = cache
+      .find_or_insert_with(
+        |t| t.name == "b",
+        || Named { name: "b", hits: 1 },
+      )
+      .await;
+    assert_eq!(item, Named { name: "b", hits: 1 });
+    assert_eq!(cache.list().await.len(), 2);
+  }
+
+  #[tokio::test]
+  async fn clone_vec_cache_find_or_insert_with_only_inserts_once() {
+    let cache = Arc::new(CloneVecCache::<Named>::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+      let cache = cache.clone();
+      let calls = calls.clone();
+      handles.push(tokio::spawn(async move {
+        cache
+          .find_or_insert_with(
+            |t| t.name == "a",
+            || {
+              calls.fetch_add(1, Ordering::SeqCst);
+              Named { name: "a", hits: 0 }
+            },
+          )
+          .await
+      }));
+    }
+    for handle in handles {
+      assert_eq!(handle.await.unwrap().name, "a");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.list().await.len(), 1);
+  }
+
+  #[cfg(debug_assertions)]
+  #[tokio::test]
+  #[should_panic(expected = "does not match 'find'")]
+  async fn clone_vec_cache_find_or_insert_with_asserts_match() {
+    let cache = CloneVecCache::<Named>::default();
+    cache
+      .find_or_insert_with(|t| t.name == "a", Named::default)
+      .await;
   }
 
   #[tokio::test]
