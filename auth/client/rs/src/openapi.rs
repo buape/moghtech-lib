@@ -17,6 +17,7 @@ mod auth {
     auth::token_exchange,
     auth::complete_passkey_login,
     auth::complete_totp_login,
+    auth::complete_totp_recovery_login,
     // ==========
     // = MANAGE =
     // ==========
@@ -51,8 +52,9 @@ mod auth {
     // Api key
     auth::create_api_key,
     auth::delete_api_key,
-    auth::create_api_key_v2,
-    auth::delete_api_key_v2,
+    // Signing key
+    auth::create_signing_key,
+    auth::delete_signing_key,
     // =============
     // = PROVIDERS =
     // =============
@@ -79,6 +81,7 @@ mod auth {
   modifiers(&AddSecurityHeaders),
   security(
     ("api-key" = [], "api-secret" = []),
+    ("api-signature" = [], "api-timestamp" = []),
     ("jwt" = [])
   )
 )]
@@ -94,6 +97,9 @@ impl utoipa::Modify for AddSecurityHeaders {
     schema.add_security_schemes_from_iter([
       ("api-key", header_security_scheme("X-Api-Key")),
       ("api-secret", header_security_scheme("X-Api-Secret")),
+      // Signing key, see [crate::signature].
+      ("api-signature", header_security_scheme("X-Api-Signature")),
+      ("api-timestamp", header_security_scheme("X-Api-Timestamp")),
       ("jwt", header_security_scheme("Authorization")),
     ]);
   }
@@ -107,4 +113,75 @@ fn header_security_scheme(
       utoipa::openapi::security::ApiKeyValue::new(header),
     ),
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_spec_paths() {
+    let spec = serde_json::to_value(MoghAuthApi::openapi()).unwrap();
+    let paths = spec["paths"].as_object().unwrap();
+    assert!(paths.contains_key("/login/CompleteTotpRecoveryLogin"));
+    assert!(paths.contains_key("/external/{slug}/login"));
+
+    for (path, item) in paths {
+      for (method, operation) in item.as_object().unwrap() {
+        let params = operation["parameters"]
+          .as_array()
+          .cloned()
+          .unwrap_or_default();
+        // Exactly the `{segments}` of the path are path parameters.
+        let mut declared = params
+          .iter()
+          .filter(|param| param["in"] == "path")
+          .map(|param| param["name"].as_str().unwrap().to_string())
+          .collect::<Vec<_>>();
+        declared.sort();
+        let mut segments = path
+          .split('/')
+          .filter_map(|segment| {
+            segment.strip_prefix('{')?.strip_suffix('}')
+          })
+          .map(str::to_string)
+          .collect::<Vec<_>>();
+        segments.sort();
+        assert_eq!(declared, segments, "{method} {path}");
+        // The query parameters are all optional.
+        for param in &params {
+          if param["in"] == "query" {
+            assert_ne!(param["required"], true, "{method} {path}");
+          }
+        }
+
+        // Only the manage api needs credentials.
+        let security = &operation["security"];
+        if path.starts_with("/manage/") {
+          assert!(security.is_null(), "{method} {path}: {security}");
+        } else {
+          assert_eq!(
+            security,
+            &serde_json::json!([{}]),
+            "{method} {path}"
+          );
+        }
+      }
+    }
+
+    let schemes =
+      spec["components"]["securitySchemes"].as_object().unwrap();
+    for scheme in spec["security"].as_array().unwrap() {
+      for name in scheme.as_object().unwrap().keys() {
+        assert!(schemes.contains_key(name), "{name}");
+      }
+    }
+    for (scheme, header) in [
+      ("api-signature", crate::signature::API_SIGNATURE_HEADER),
+      ("api-timestamp", crate::signature::API_TIMESTAMP_HEADER),
+    ] {
+      let name = schemes[scheme]["name"].as_str().unwrap();
+      assert!(name.eq_ignore_ascii_case(header), "{name}");
+    }
+  }
 }

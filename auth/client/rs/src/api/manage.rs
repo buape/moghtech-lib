@@ -13,7 +13,7 @@ use crate::{
   api::NoData,
   config::{
     ExternalLoginProvider, ExternalLoginProviderConfig,
-    TokenExchangeConfig, TrustedIssuer,
+    TokenExchangeConfig, TrustedIssuer, empty_or_redacted,
   },
   passkey::{CreationChallengeResponse, RegisterPublicKeyCredential},
 };
@@ -25,9 +25,11 @@ pub trait MoghAuthManageRequest: HasResponse {}
 /// The error message of a request refused with `403 Forbidden` because
 /// it needs a recent login starts with this. Requests which change how a
 /// user (or anyone, for the admin requests) can log in are only accepted
-/// with a token issued a short while ago, so a token which leaked isn't
-/// enough to take over the account. Clients should send the user to
-/// log in again, and retry.
+/// with a token from a login a short while ago, so a token which leaked
+/// isn't enough to take over the account. For a token from a token
+/// exchange, the login is when the user authenticated at the provider
+/// (the provider token's `auth_time`, else when it was issued).
+/// Clients should send the user to log in again, and retry.
 pub const REAUTHENTICATION_REQUIRED: &str =
   "Reauthentication required";
 
@@ -117,13 +119,22 @@ fn update_password() {}
 /// Update the calling user's password.
 /// Response: [NoData].
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[derive(Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthManageRequest)]
 #[response(UpdatePasswordResponse)]
 #[error(mogh_error::Error)]
 pub struct UpdatePassword {
   pub password: String,
+}
+
+/// The password is redacted.
+impl std::fmt::Debug for UpdatePassword {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("UpdatePassword")
+      .field("password", &empty_or_redacted(&self.password))
+      .finish()
+  }
 }
 
 #[typeshare]
@@ -260,13 +271,23 @@ pub struct BeginTotpEnrollment {}
 
 /// Response for [BeginTotpEnrollment].
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct BeginTotpEnrollmentResponse {
   /// TOTP enrollment URI for manual addition to password manager.
   pub uri: String,
   /// Base64 encoded PNG embeddable in HTML to display uri QR code.
   pub png: String,
+}
+
+/// Both fields carry the TOTP secret, and are redacted.
+impl std::fmt::Debug for BeginTotpEnrollmentResponse {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("BeginTotpEnrollmentResponse")
+      .field("uri", &empty_or_redacted(&self.uri))
+      .field("png", &empty_or_redacted(&self.png))
+      .finish()
+  }
 }
 
 //
@@ -289,7 +310,7 @@ fn confirm_totp_enrollment() {}
 /// Confirm enrollment flow for TOTP 2FA auth support
 /// Response: [ConfirmTotpEnrollmentResponse]
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[derive(Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthManageRequest)]
 #[response(ConfirmTotpEnrollmentResponse)]
@@ -298,12 +319,33 @@ pub struct ConfirmTotpEnrollment {
   pub code: String,
 }
 
+/// The code is redacted.
+impl std::fmt::Debug for ConfirmTotpEnrollment {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ConfirmTotpEnrollment")
+      .field("code", &empty_or_redacted(&self.code))
+      .finish()
+  }
+}
+
 /// Response for [ConfirmTotpEnrollment].
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ConfirmTotpEnrollmentResponse {
   pub recovery_codes: Vec<String>,
+}
+
+/// Only the number of recovery codes is shown.
+impl std::fmt::Debug for ConfirmTotpEnrollmentResponse {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ConfirmTotpEnrollmentResponse")
+      .field(
+        "recovery_codes",
+        &format_args!("[{} redacted]", self.recovery_codes.len()),
+      )
+      .finish()
+  }
 }
 
 //
@@ -357,8 +399,11 @@ fn begin_external_login_link() {}
 /// Begin linking flow for an external login. Response: [NoData].
 ///
 /// First call this method when authenticated, then redirect the
-/// user to `/auth/external/{provider_id}/link`, using a provider id
-/// from [GetLoginOptions][crate::api::login::GetLoginOptions].
+/// user to `/external/{slug}/link` relative to the auth api path
+/// (eg. `/auth/external/{slug}/link`), using the provider `slug`
+/// from [GetLoginOptions][crate::api::login::GetLoginOptions]
+/// (see [LoginOptionsProvider][crate::api::login::LoginOptionsProvider]).
+/// The slug is not the provider id.
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -561,6 +606,11 @@ fn update_external_login_provider() {}
 ///   Pass `clear_client_secret` to remove it instead.
 /// - An empty slug keeps the existing one. Changing it changes the
 ///   redirect URI registered at the provider.
+/// - ⚠️ Users stay linked to the provider by its id and their user id
+///   (subject) at the provider. Pointing an OIDC provider at another
+///   identity provider (issuer) lets that one's users log in to the
+///   accounts linked with the same subject. Create a new provider
+///   instead, unless the same identity provider only moved.
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -861,7 +911,7 @@ pub struct CreateApiKey {
 
 /// Response for [CreateApiKey].
 #[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct CreateApiKeyResponse {
   /// X-API-KEY
@@ -872,6 +922,16 @@ pub struct CreateApiKeyResponse {
   /// Note.
   /// There is no way to get the secret again after it is distributed in this response
   pub secret: String,
+}
+
+/// The secret is redacted.
+impl std::fmt::Debug for CreateApiKeyResponse {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CreateApiKeyResponse")
+      .field("key", &self.key)
+      .field("secret", &empty_or_redacted(&self.secret))
+      .finish()
+  }
 }
 
 //
@@ -914,36 +974,39 @@ pub type DeleteApiKeyResponse = NoData;
 #[cfg(feature = "utoipa")]
 #[utoipa::path(
   post,
-  path = "/manage/CreateApiKeyV2",
-  description = "Create an api key (v2) for the calling user.",
-  request_body(content = CreateApiKeyV2),
+  path = "/manage/CreateSigningKey",
+  description = "Create a signing key for the calling user: a key pair whose public key the server stores, and whose private key signs the requests.",
+  request_body(content = CreateSigningKey),
   responses(
-    (status = 200, description = "The private key, if one was generated.", body = CreateApiKeyV2Response),
-    (status = 400, description = "Invalid api key name", body = mogh_error::Serror),
+    (status = 200, description = "The private key, if one was generated.", body = CreateSigningKeyResponse),
+    (status = 400, description = "Invalid signing key name, cidr whitelist or public key", body = mogh_error::Serror),
+    (status = 409, description = "The public key is already in use.", body = mogh_error::Serror),
     (status = 500, description = "Failed", body = mogh_error::Serror),
   ),
 )]
-fn create_api_key_v2() {}
+fn create_signing_key() {}
 
-/// Create an API key (v2) for the calling user.
-/// Response: [CreateApiKeyV2Response].
+/// Create a signing key for the calling user: a key pair whose
+/// public key the server stores, and whose private key signs the
+/// requests (see [crate::signature]).
+/// Response: [CreateSigningKeyResponse].
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthManageRequest)]
-#[response(CreateApiKeyV2Response)]
+#[response(CreateSigningKeyResponse)]
 #[error(mogh_error::Error)]
-pub struct CreateApiKeyV2 {
-  /// The name for the api key.
+pub struct CreateSigningKey {
+  /// The name for the signing key.
   pub name: String,
 
-  /// A unix timestamp in millseconds specifying api key expire time.
-  /// Default is 0, which means no expiry.
+  /// A unix timestamp in millseconds specifying signing key expire
+  /// time. Default is 0, which means no expiry.
   #[serde(default)]
   pub expires: U64,
 
   /// Whitelist of CIDR ranges (eg `10.0.0.0/8`) or ip addresses
-  /// from which requests using this api key are accepted.
+  /// from which requests signed with this key are accepted.
   /// Empty (the default) means all ips are allowed.
   #[serde(default)]
   pub cidr_whitelist: Vec<String>,
@@ -955,11 +1018,11 @@ pub struct CreateApiKeyV2 {
   pub public_key: String,
 }
 
-/// Response for [CreateApiKeyV2].
+/// Response for [CreateSigningKey].
 #[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-pub struct CreateApiKeyV2Response {
+pub struct CreateSigningKeyResponse {
   /// Used to sign requests for authentication
   /// without transmitting the key itself.
   ///
@@ -970,39 +1033,51 @@ pub struct CreateApiKeyV2Response {
   pub private_key: Option<String>,
 }
 
+/// The private key is redacted.
+impl std::fmt::Debug for CreateSigningKeyResponse {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CreateSigningKeyResponse")
+      .field(
+        "private_key",
+        &self.private_key.as_deref().map(empty_or_redacted),
+      )
+      .finish()
+  }
+}
+
 //
 
 #[allow(unused)]
 #[cfg(feature = "utoipa")]
 #[utoipa::path(
   post,
-  path = "/manage/DeleteApiKeyV2",
-  description = "Delete an api key (v2) for the calling user.",
-  request_body(content = DeleteApiKeyV2),
+  path = "/manage/DeleteSigningKey",
+  description = "Delete a signing key for the calling user.",
+  request_body(content = DeleteSigningKey),
   responses(
-    (status = 200, description = "Api key deleted.", body = DeleteApiKeyV2Response),
-    (status = 400, description = "Invalid api key name", body = mogh_error::Serror),
+    (status = 200, description = "Signing key deleted.", body = DeleteSigningKeyResponse),
+    (status = 404, description = "Signing key not found.", body = mogh_error::Serror),
     (status = 500, description = "Failed", body = mogh_error::Serror),
   ),
 )]
-fn delete_api_key_v2() {}
+fn delete_signing_key() {}
 
-/// Delete an API key (v2) for the calling user.
+/// Delete a signing key for the calling user.
 /// Response: [NoData].
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthManageRequest)]
-#[response(DeleteApiKeyV2Response)]
+#[response(DeleteSigningKeyResponse)]
 #[error(mogh_error::Error)]
-pub struct DeleteApiKeyV2 {
-  /// The public key of the api key to delete.
+pub struct DeleteSigningKey {
+  /// The public key of the signing key to delete.
   pub public_key: String,
 }
 
-/// Response for [DeleteApiKeyV2].
+/// Response for [DeleteSigningKey].
 #[typeshare]
-pub type DeleteApiKeyV2Response = NoData;
+pub type DeleteSigningKeyResponse = NoData;
 
 #[cfg(test)]
 mod tests {
@@ -1079,8 +1154,8 @@ mod tests {
     );
     assert_eq!(CreateApiKey::req_type(), "CreateApiKey");
     assert_eq!(DeleteApiKey::req_type(), "DeleteApiKey");
-    assert_eq!(CreateApiKeyV2::req_type(), "CreateApiKeyV2");
-    assert_eq!(DeleteApiKeyV2::req_type(), "DeleteApiKeyV2");
+    assert_eq!(CreateSigningKey::req_type(), "CreateSigningKey");
+    assert_eq!(DeleteSigningKey::req_type(), "DeleteSigningKey");
   }
 
   #[test]
@@ -1135,15 +1210,15 @@ mod tests {
   }
 
   #[test]
-  fn test_create_api_key_v2_defaults() {
+  fn test_create_signing_key_defaults() {
     // `expires` and `public_key` may both be omitted.
-    let req: CreateApiKeyV2 =
+    let req: CreateSigningKey =
       serde_json::from_value(json!({ "name": "key-name" })).unwrap();
     assert_eq!(req.name, "key-name");
     assert_eq!(req.expires, 0);
     assert!(req.cidr_whitelist.is_empty());
     assert!(req.public_key.is_empty());
-    let req: CreateApiKeyV2 = serde_json::from_value(json!({
+    let req: CreateSigningKey = serde_json::from_value(json!({
       "name": "key-name",
       "cidr_whitelist": ["10.0.0.0/8", "::1"]
     }))
@@ -1162,13 +1237,13 @@ mod tests {
   }
 
   #[test]
-  fn test_create_api_key_v2_response_wire_format() {
-    let value = serde_json::to_value(CreateApiKeyV2Response {
+  fn test_create_signing_key_response_wire_format() {
+    let value = serde_json::to_value(CreateSigningKeyResponse {
       private_key: None,
     })
     .unwrap();
     assert_eq!(value, json!({ "private_key": null }));
-    let res: CreateApiKeyV2Response =
+    let res: CreateSigningKeyResponse =
       serde_json::from_value(json!({ "private_key": "pk-contents" }))
         .unwrap();
     assert_eq!(res.private_key.as_deref(), Some("pk-contents"));
@@ -1232,6 +1307,63 @@ mod tests {
     })
     .unwrap();
     assert_eq!(value, json!({ "external_skip_2fa": true }));
+  }
+
+  #[test]
+  fn test_debug_redacts_secrets() {
+    let debug = format!(
+      "{:?}",
+      UpdatePassword {
+        password: "hunter2".into()
+      }
+    );
+    assert!(!debug.contains("hunter2"), "{debug}");
+    let debug = format!(
+      "{:?}",
+      ConfirmTotpEnrollment {
+        code: "123456".into()
+      }
+    );
+    assert!(!debug.contains("123456"), "{debug}");
+
+    let enrollment = BeginTotpEnrollmentResponse {
+      uri: "otpauth://totp/app:alice?secret=JBSWY3DPEHPK3PXP".into(),
+      png: "iVBORw0KGgoAAAANSUhEUg".into(),
+    };
+    let debug = format!("{enrollment:?}");
+    assert!(!debug.contains("JBSWY3DPEHPK3PXP"), "{debug}");
+    assert!(!debug.contains("iVBORw0KGgo"), "{debug}");
+
+    let recovery = ConfirmTotpEnrollmentResponse {
+      recovery_codes: vec!["code-one".into(), "code-two".into()],
+    };
+    let debug = format!("{recovery:?}");
+    assert!(!debug.contains("code-one"), "{debug}");
+    assert!(debug.contains("[2 redacted]"), "{debug}");
+    assert_eq!(
+      serde_json::to_value(&recovery).unwrap(),
+      json!({ "recovery_codes": ["code-one", "code-two"] })
+    );
+
+    let api_key = CreateApiKeyResponse {
+      key: "K_abc_K".into(),
+      secret: "S_s3cr3t_S".into(),
+    };
+    let debug = format!("{api_key:?}");
+    assert!(!debug.contains("s3cr3t"), "{debug}");
+    assert!(debug.contains("K_abc_K"), "{debug}");
+
+    let debug = format!(
+      "{:?}",
+      CreateSigningKeyResponse {
+        private_key: Some("MC4CAQAwBQYDK2VuBCIEI".into()),
+      }
+    );
+    assert!(!debug.contains("MC4CAQAw"), "{debug}");
+    assert!(debug.contains("Some"), "{debug}");
+    let debug =
+      format!("{:?}", CreateSigningKeyResponse { private_key: None });
+    assert!(debug.contains("None"), "{debug}");
   }
 
   #[test]

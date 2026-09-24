@@ -43,7 +43,8 @@ impl ExternalLoginKind {
   /// A provider using the reserved id of its kind keeps the
   /// original login / callback paths (eg. `/oidc/callback`),
   /// so redirect URIs already registered at the provider keep working.
-  /// All other providers use `/external/{id}/callback`.
+  /// All other providers use `/external/{slug}/callback`,
+  /// see [ExternalLoginProvider::slug].
   pub fn reserved_id(&self) -> &'static str {
     match self {
       ExternalLoginKind::Oidc => "oidc",
@@ -60,8 +61,10 @@ impl ExternalLoginKind {
 #[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ExternalLoginProvider {
-  /// The unique id of the provider. Part of the login / callback urls,
-  /// and stored alongside the external user id on linked users.
+  /// The unique id of the provider, stored alongside the external
+  /// user id on linked users. The login / callback urls name the
+  /// provider by its [slug][ExternalLoginProvider::slug] instead,
+  /// which is the id only for providers without a slug.
   ///
   /// External user ids are only unique per provider,
   /// so an id must never be reused for another provider.

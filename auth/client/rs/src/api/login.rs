@@ -9,17 +9,26 @@ use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
 use crate::{
-  config::ExternalLoginKind,
+  config::{ExternalLoginKind, empty_or_redacted},
   passkey::{PublicKeyCredential, RequestChallengeResponse},
 };
 
 /// JSON containing a jwt authentication token.
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct JwtResponse {
   /// A token the user can use to authenticate their requests.
   pub jwt: String,
+}
+
+/// The jwt is redacted.
+impl std::fmt::Debug for JwtResponse {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("JwtResponse")
+      .field("jwt", &empty_or_redacted(&self.jwt))
+      .finish()
+  }
 }
 
 /// JSON containing either an authentication token or the required 2fa auth check.
@@ -75,6 +84,7 @@ pub trait MoghAuthLoginRequest: HasResponse {}
 #[utoipa::path(
   post,
   path = "/login/GetLoginOptions",
+  security(()),
   description = "Get the available options to login, eg. local and external providers.",
   request_body(content = GetLoginOptions),
   responses(
@@ -117,6 +127,7 @@ pub struct GetLoginOptionsResponse {
 #[utoipa::path(
   post,
   path = "/login/ExchangeForJwt",
+  security(()),
   description = "Retrieve a JWT after completing third party login flows.",
   request_body(content = ExchangeForJwt),
   responses(
@@ -148,6 +159,7 @@ pub type ExchangeForJwtResponse = JwtResponse;
 #[utoipa::path(
   post,
   path = "/login/SignUpLocalUser",
+  security(()),
   description = "Sign up a new local user account.",
   request_body(content = SignUpLocalUser),
   responses(
@@ -161,7 +173,7 @@ fn sign_up_local_user() {}
 /// Sign up a new local user account.
 /// Response: [SignUpLocalUserResponse].
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[derive(Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthLoginRequest)]
 #[response(SignUpLocalUserResponse)]
@@ -172,6 +184,16 @@ pub struct SignUpLocalUser {
   /// The password for the new user.
   /// This cannot be retreived later.
   pub password: String,
+}
+
+/// The password is redacted.
+impl std::fmt::Debug for SignUpLocalUser {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SignUpLocalUser")
+      .field("username", &self.username)
+      .field("password", &empty_or_redacted(&self.password))
+      .finish()
+  }
 }
 
 /// Response for [SignUpLocalUser].
@@ -185,6 +207,7 @@ pub type SignUpLocalUserResponse = JwtResponse;
 #[utoipa::path(
   post,
   path = "/login/ExchangeExternalForJwt",
+  security(()),
   description = "Exchange a token issued by an external login provider for a JWT, without sending the user through the browser.",
   request_body(content = ExchangeExternalForJwt),
   responses(
@@ -241,6 +264,7 @@ pub type ExchangeExternalForJwtResponse = JwtOrTwoFactor;
 #[utoipa::path(
   post,
   path = "/login/LoginLocalUser",
+  security(()),
   description = "Login as a local user.",
   request_body(content = LoginLocalUser),
   responses(
@@ -253,7 +277,7 @@ fn login_local_user() {}
 
 /// Login as a local user.
 #[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[derive(Serialize, Deserialize, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthLoginRequest)]
 #[response(LoginLocalUserResponse)]
@@ -263,6 +287,16 @@ pub struct LoginLocalUser {
   pub username: String,
   /// The user's password
   pub password: String,
+}
+
+/// The password is redacted.
+impl std::fmt::Debug for LoginLocalUser {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("LoginLocalUser")
+      .field("username", &self.username)
+      .field("password", &empty_or_redacted(&self.password))
+      .finish()
+  }
 }
 
 /// The response for [LoginLocalUser]
@@ -276,6 +310,7 @@ pub type LoginLocalUserResponse = JwtOrTwoFactor;
 #[utoipa::path(
   post,
   path = "/login/CompletePasskeyLogin",
+  security(()),
   description = "Complete login using passkey as second factor.",
   request_body(content = CompletePasskeyLogin),
   responses(
@@ -309,6 +344,7 @@ pub type CompletePasskeyLoginResponse = JwtResponse;
 #[utoipa::path(
   post,
   path = "/login/CompleteTotpLogin",
+  security(()),
   description = "Complete login using TOTP code as second factor.",
   request_body(content = CompleteTotpLogin),
   responses(
@@ -322,7 +358,7 @@ fn complete_totp_login() {}
 /// Complete login using TOTP code as second factor.
 /// Response: [CompleteTotpLoginResponse].
 #[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[derive(Serialize, Deserialize, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthLoginRequest)]
 #[response(CompleteTotpLoginResponse)]
@@ -330,6 +366,15 @@ fn complete_totp_login() {}
 pub struct CompleteTotpLogin {
   /// The time dependent totp code for user.
   pub code: String,
+}
+
+/// The code is redacted.
+impl std::fmt::Debug for CompleteTotpLogin {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CompleteTotpLogin")
+      .field("code", &empty_or_redacted(&self.code))
+      .finish()
+  }
 }
 
 /// Response for [CompleteTotpLogin].
@@ -343,6 +388,7 @@ pub type CompleteTotpLoginResponse = JwtResponse;
 #[utoipa::path(
   post,
   path = "/login/CompleteTotpRecoveryLogin",
+  security(()),
   description = "Complete login using a TOTP recovery code as second factor.",
   request_body(content = CompleteTotpRecoveryLogin),
   responses(
@@ -357,7 +403,7 @@ fn complete_totp_recovery_login() {}
 /// Each recovery code can only be used once.
 /// Response: [CompleteTotpRecoveryLoginResponse].
 #[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[derive(Serialize, Deserialize, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(MoghAuthLoginRequest)]
 #[response(CompleteTotpRecoveryLoginResponse)]
@@ -365,6 +411,15 @@ fn complete_totp_recovery_login() {}
 pub struct CompleteTotpRecoveryLogin {
   /// One of the recovery codes issued at TOTP enrollment.
   pub code: String,
+}
+
+/// The code is redacted.
+impl std::fmt::Debug for CompleteTotpRecoveryLogin {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CompleteTotpRecoveryLogin")
+      .field("code", &empty_or_redacted(&self.code))
+      .finish()
+  }
 }
 
 /// Response for [CompleteTotpRecoveryLogin].
@@ -494,6 +549,60 @@ mod tests {
     assert_eq!(
       ExchangeExternalForJwt::req_type(),
       "ExchangeExternalForJwt"
+    );
+  }
+
+  #[test]
+  fn test_debug_redacts_secrets() {
+    let jwt = JwtResponse {
+      jwt: "secret.app.jwt".into(),
+    };
+    let debug = format!("{:?}", JwtOrTwoFactor::Jwt(jwt.clone()));
+    assert!(!debug.contains("secret.app.jwt"), "{debug}");
+    assert_eq!(
+      serde_json::to_value(&jwt).unwrap(),
+      json!({ "jwt": "secret.app.jwt" })
+    );
+
+    let login = LoginLocalUser {
+      username: "alice".into(),
+      password: "hunter2".into(),
+    };
+    let debug = format!("{login:?}");
+    assert!(!debug.contains("hunter2"), "{debug}");
+    assert!(debug.contains("alice"), "{debug}");
+    let sign_up = SignUpLocalUser {
+      username: "alice".into(),
+      password: "hunter2".into(),
+    };
+    let debug = format!("{sign_up:?}");
+    assert!(!debug.contains("hunter2"), "{debug}");
+    assert!(debug.contains("alice"), "{debug}");
+    // An empty password is shown as such.
+    let debug = format!(
+      "{:?}",
+      LoginLocalUser {
+        username: "alice".into(),
+        password: String::new(),
+      }
+    );
+    assert!(debug.contains(r#"password: """#), "{debug}");
+
+    let debug = format!(
+      "{:?}",
+      CompleteTotpLogin {
+        code: "123456".into()
+      }
+    );
+    assert!(!debug.contains("123456"), "{debug}");
+    let recovery = CompleteTotpRecoveryLogin {
+      code: "recovery-code".into(),
+    };
+    let debug = format!("{recovery:?}");
+    assert!(!debug.contains("recovery-code"), "{debug}");
+    assert_eq!(
+      serde_json::to_value(&recovery).unwrap(),
+      json!({ "code": "recovery-code" })
     );
   }
 

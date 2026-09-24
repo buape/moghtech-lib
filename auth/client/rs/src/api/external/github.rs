@@ -2,9 +2,10 @@
 #[utoipa::path(
   get,
   path = "/github/login",
+  security(()),
   description = "Login using Github",
   params(
-    ("redirect", description = "Optional path to redirect back to after login.")
+    ("redirect" = Option<String>, Query, description = "Optional path to redirect back to after login.")
   ),
   responses(
     (status = 303, description = "Redirect to Github for login"),
@@ -18,6 +19,7 @@ fn github_login() {}
 #[utoipa::path(
   get,
   path = "/github/link",
+  security(()),
   description = "Link existing account to Github user",
   responses(
     (status = 303, description = "Redirect to Github for link"),
@@ -31,11 +33,12 @@ fn github_link() {}
 #[utoipa::path(
   get,
   path = "/github/callback",
+  security(()),
   description = "Callback to finish Github login",
   params(
-    ("state", description = "Callback state."),
-    ("code", description = "Callback code."),
-    ("error", description = "Callback error.")
+    ("state" = Option<String>, Query, description = "Callback state."),
+    ("code" = Option<String>, Query, description = "Callback code."),
+    ("error" = Option<String>, Query, description = "Callback error.")
   ),
   responses(
     (status = 303, description = "Redirect back to app to continue login steps."),

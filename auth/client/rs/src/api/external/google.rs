@@ -2,9 +2,10 @@
 #[utoipa::path(
   get,
   path = "/google/login",
+  security(()),
   description = "Login using Google",
   params(
-    ("redirect", description = "Optional path to redirect back to after login.")
+    ("redirect" = Option<String>, Query, description = "Optional path to redirect back to after login.")
   ),
   responses(
     (status = 303, description = "Redirect to Google for login"),
@@ -18,6 +19,7 @@ fn google_login() {}
 #[utoipa::path(
   get,
   path = "/google/link",
+  security(()),
   description = "Link existing account to Google user",
   responses(
     (status = 303, description = "Redirect to Google for link"),
@@ -31,11 +33,12 @@ fn google_link() {}
 #[utoipa::path(
   get,
   path = "/google/callback",
+  security(()),
   description = "Callback to finish Google login",
   params(
-    ("state", description = "Callback state."),
-    ("code", description = "Callback code."),
-    ("error", description = "Callback error.")
+    ("state" = Option<String>, Query, description = "Callback state."),
+    ("code" = Option<String>, Query, description = "Callback code."),
+    ("error" = Option<String>, Query, description = "Callback error.")
   ),
   responses(
     (status = 303, description = "Redirect back to app to continue login steps."),

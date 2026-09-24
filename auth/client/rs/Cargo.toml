@@ -1,15 +1,17 @@
 [package]
 name = "mogh_auth_client"
 description = "Client library for Mogh Auth Server embedded API."
-version = "4.2.1"
+version = "5.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [features]
-# default = ["blocking"]
+# Adds `request::blocking`, the request functions
+# for a `reqwest::blocking::Client`.
 blocking = ["reqwest/blocking"]
-# Signing requests with an api key v2 (private key), see `signature`.
+# Signing requests with the private key of a signing key, see
+# `signature`.
 pki = ["dep:mogh_pki"]
 utoipa = ["dep:utoipa", "mogh_error/utoipa"]
 
@@ -24,6 +26,7 @@ webauthn-rs.workspace = true
 serde_json.workspace = true
 typeshare.workspace = true
 zeroize.workspace = true
+sha2.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
 serde.workspace = true

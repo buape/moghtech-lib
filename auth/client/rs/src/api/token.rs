@@ -33,6 +33,7 @@ pub const TOKEN_TYPE_ACCESS_TOKEN: &str =
 #[utoipa::path(
   post,
   path = "/token",
+  security(()),
   description = "RFC 8693 Token Exchange. Exchange a signed token (ID token / JWT) issued by an external login provider with token exchange enabled for an app token. The user the token belongs to must already exist.",
   request_body(content = TokenExchangeRequest, content_type = "application/x-www-form-urlencoded"),
   responses(

@@ -2,9 +2,10 @@
 #[utoipa::path(
   get,
   path = "/oidc/login",
+  security(()),
   description = "Login using OIDC",
   params(
-    ("redirect", description = "Optional path to redirect back to after login.")
+    ("redirect" = Option<String>, Query, description = "Optional path to redirect back to after login.")
   ),
   responses(
     (status = 303, description = "Redirect to OIDC provider for login"),
@@ -18,10 +19,8 @@ fn oidc_login() {}
 #[utoipa::path(
   get,
   path = "/oidc/link",
+  security(()),
   description = "Link existing account to OIDC user",
-  params(
-    ("redirect", description = "Optional path to redirect back to after login.")
-  ),
   responses(
     (status = 303, description = "Redirect to OIDC provider for link"),
     (status = 401, description = "Unauthorized", body = mogh_error::Serror),
@@ -34,11 +33,12 @@ fn oidc_link() {}
 #[utoipa::path(
   get,
   path = "/oidc/callback",
+  security(()),
   description = "Callback to finish OIDC login",
   params(
-    ("state", description = "Callback state."),
-    ("code", description = "Callback code."),
-    ("error", description = "Callback error.")
+    ("state" = Option<String>, Query, description = "Callback state."),
+    ("code" = Option<String>, Query, description = "Callback code."),
+    ("error" = Option<String>, Query, description = "Callback error.")
   ),
   responses(
     (status = 303, description = "Redirect back to app to continue login steps."),
