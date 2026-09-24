@@ -1,18 +1,20 @@
-//! App-level api key representation used by the auth server
-//! to authenticate api key (v1 and v2) requests.
+//! App-level key representation used by the auth server to
+//! authenticate the requests of api keys (key + secret) and signing
+//! keys (signed with a private key) alike.
 
-/// Implemented for the app specific api key struct,
-/// returned from [AuthImpl::get_api_key][crate::AuthImpl::get_api_key]
-/// and [AuthImpl::get_api_key_v2][crate::AuthImpl::get_api_key_v2].
+/// Implemented for the app specific api key struct, returned from
+/// [AuthImpl::get_api_key][crate::AuthImpl::get_api_key] for an api
+/// key and [AuthImpl::get_signing_key][crate::AuthImpl::get_signing_key]
+/// for a signing key.
 ///
 /// [AuthApiKey] is a ready made implementation
 /// for apps which do not need their own struct.
 pub trait AuthApiKeyImpl: Send + Sync + 'static {
-  /// The id of the user which owns the api key.
+  /// The id of the user which owns the key.
   fn user_id(&self) -> &str;
 
   /// Whitelist of CIDR ranges / ip addresses from which
-  /// requests using this api key are accepted.
+  /// requests using this key are accepted.
   /// Empty means all ips allowed.
   ///
   /// This is enforced by the auth server in
@@ -24,16 +26,17 @@ pub trait AuthApiKeyImpl: Send + Sync + 'static {
   }
 }
 
+/// An api key or signing key, see [AuthApiKeyImpl].
 pub type BoxAuthApiKey = Box<dyn AuthApiKeyImpl>;
 
-/// Ready made [AuthApiKeyImpl] for apps which
-/// do not need their own api key struct.
+/// Ready made [AuthApiKeyImpl] for apps which do not need their own
+/// struct, for api keys and signing keys alike.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthApiKey {
-  /// The id of the user which owns the api key.
+  /// The id of the user which owns the key.
   pub user_id: String,
   /// Whitelist of CIDR ranges / ip addresses from which
-  /// requests using this api key are accepted.
+  /// requests using this key are accepted.
   /// Empty means all ips allowed.
   pub cidr_whitelist: Vec<String>,
 }

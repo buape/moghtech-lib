@@ -41,7 +41,7 @@ impl Resolve<ManageArgs> for BeginPasskeyEnrollment {
     let (challenge, state) =
       provider.start_passkey_registration(username)?;
 
-    session.insert_passkey_enrollment(&state).await?;
+    session.insert_passkey_enrollment(user.id(), &state).await?;
 
     info!("Passkey 2FA enrollment flow initiated");
 
@@ -68,11 +68,17 @@ impl Resolve<ManageArgs> for ConfirmPasskeyEnrollment {
       session,
     }: &ManageArgs,
   ) -> Result<Self::Response, Self::Error> {
+    // Checked again, the lock may have been added since the
+    // enrollment began.
+    auth.check_username_locked(user.username())?;
+
     let provider = auth.passkey_provider().context(
       "No passkey provider available, invalid 'host' config",
     )?;
 
-    let state = session.retrieve_passkey_enrollment().await?;
+    // Only the user who began the enrollment can confirm it.
+    let state =
+      session.retrieve_passkey_enrollment(user.id()).await?;
 
     let passkey = provider
       .finish_passkey_registration(&self.credential, &state)?;

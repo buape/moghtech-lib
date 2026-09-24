@@ -1,4 +1,9 @@
-use std::net::IpAddr;
+use std::{
+  net::IpAddr,
+  num::NonZero,
+  sync::{Arc, LazyLock},
+  thread::available_parallelism,
+};
 
 use anyhow::{Context, anyhow};
 use axum::http::StatusCode;
@@ -8,12 +13,73 @@ use mogh_auth_client::api::login::{
 use mogh_error::{AddStatusCode, AddStatusCodeError};
 use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
-use tracing::{info, instrument};
+use tokio::sync::Semaphore;
+use tracing::{info, instrument, warn};
+use zeroize::Zeroizing;
 
 use crate::{
   AuthImpl, Login, LoginKind, api::login::LoginArgs,
   middleware::check_user_cidr_whitelist, session::Session,
 };
+
+/// Bounds the bcrypt work running at the same time to the
+/// available cores, see [spawn_bcrypt].
+static BCRYPT_PERMITS: LazyLock<Arc<Semaphore>> =
+  LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+      available_parallelism().map(NonZero::get).unwrap_or(1),
+    ))
+  });
+
+/// Runs the bcrypt work `f` on tokio's blocking pool.
+///
+/// A bcrypt hash or verify takes tens to hundreds of milliseconds
+/// of CPU (by its cost). Run on an async worker, a handful at once
+/// (unauthenticated logins, say) would stall every other request of
+/// the server. At most one per available core runs at a time,
+/// the others wait their turn without holding a thread.
+pub(crate) async fn spawn_bcrypt<T: Send + 'static>(
+  f: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+  let permit = BCRYPT_PERMITS
+    .clone()
+    .acquire_owned()
+    .await
+    .context("bcrypt permits closed")?;
+  tokio::task::spawn_blocking(move || {
+    // Held until the work is done, also when the caller
+    // stops waiting for it (the client disconnects).
+    let _permit = permit;
+    f()
+  })
+  .await
+  .context("bcrypt task failed")
+}
+
+/// The bcrypt hash of `secret`, off the async runtime
+/// (see [spawn_bcrypt]).
+pub(crate) async fn bcrypt_hash(
+  secret: &[u8],
+  cost: u32,
+) -> anyhow::Result<String> {
+  let secret = Zeroizing::new(secret.to_vec());
+  spawn_bcrypt(move || bcrypt::hash(&*secret, cost))
+    .await?
+    .context("Failed to hash secret")
+}
+
+/// Whether `secret` matches the bcrypt `hash`, off the async
+/// runtime (see [spawn_bcrypt]). Errors if the hash is malformed.
+pub(crate) async fn bcrypt_verify(
+  secret: &[u8],
+  hash: &str,
+) -> anyhow::Result<bool> {
+  let secret = Zeroizing::new(secret.to_vec());
+  let hash = hash.to_string();
+  spawn_bcrypt(move || bcrypt::verify(&*secret, &hash))
+    .await?
+    .context("Failed to verify secret")
+}
 
 pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
   auth: &I,
@@ -42,7 +108,8 @@ pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
   check_username_available(auth, &username, None).await?;
 
   let hashed_password =
-    bcrypt::hash(password.as_bytes(), auth.local_auth_bcrypt_cost())?;
+    bcrypt_hash(password.as_bytes(), auth.local_auth_bcrypt_cost())
+      .await?;
 
   let user_id = auth
     .sign_up_local_user(
@@ -110,12 +177,15 @@ impl Resolve<LoginArgs> for SignUpLocalUser {
 /// When there is no user or stored password hash to verify against,
 /// still run bcrypt before failing so response timing does not
 /// reveal whether the username exists.
-fn invalid_credentials_after_dummy_hash<I: AuthImpl + ?Sized>(
+async fn invalid_credentials_after_dummy_hash<
+  I: AuthImpl + ?Sized,
+>(
   auth: &I,
   password: &str,
 ) -> mogh_error::Error {
   let _ =
-    bcrypt::hash(password.as_bytes(), auth.local_auth_bcrypt_cost());
+    bcrypt_hash(password.as_bytes(), auth.local_auth_bcrypt_cost())
+      .await;
   anyhow!("Invalid login credentials")
     .status_code(StatusCode::UNAUTHORIZED)
 }
@@ -138,14 +208,21 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
 
   let Some(user) = auth.find_user_with_username(username).await?
   else {
-    return Err(invalid_credentials_after_dummy_hash(auth, password));
+    return Err(
+      invalid_credentials_after_dummy_hash(auth, password).await,
+    );
   };
 
   let Some(hashed_password) = user.hashed_password() else {
-    return Err(invalid_credentials_after_dummy_hash(auth, password));
+    return Err(
+      invalid_credentials_after_dummy_hash(auth, password).await,
+    );
   };
 
-  let verified = bcrypt::verify(password, hashed_password)
+  // Passwords longer than bcrypt's 72 bytes (which the default
+  // validation no longer accepts) still verify on their first 72.
+  let verified = bcrypt_verify(password.as_bytes(), hashed_password)
+    .await
     .context("Invalid login credentials")
     .status_code(StatusCode::UNAUTHORIZED)?;
 
@@ -156,9 +233,22 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
     );
   }
 
-  // Checked after credential verification so the
-  // whitelist does not reveal whether the username exists.
-  check_user_cidr_whitelist(user.as_ref(), ip)?;
+  // Checked after credential verification so the whitelist does not
+  // reveal whether the username exists, and answered like a wrong
+  // password so it does not confirm the password to whoever tries
+  // it from elsewhere. The reason is in the log.
+  if let Err(e) = check_user_cidr_whitelist(user.as_ref(), ip) {
+    warn!(
+      user_id = user.id(),
+      %ip,
+      "Local login refused outside the user's cidr whitelist | {:#}",
+      e.error
+    );
+    return Err(
+      anyhow!("Invalid login credentials")
+        .status_code(StatusCode::UNAUTHORIZED),
+    );
+  }
 
   let res = match (user.passkey(), user.totp_secret()) {
     // Passkey 2FA
@@ -228,6 +318,8 @@ impl Resolve<LoginArgs> for LoginLocalUser {
     self,
     LoginArgs { auth, session, ip }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
+    // Strict: a burst of guesses sent at once is bounded
+    // by the budget as well.
     login_local_user(
       auth.as_ref(),
       session,
@@ -235,7 +327,7 @@ impl Resolve<LoginArgs> for LoginLocalUser {
       self.username,
       &self.password,
     )
-    .with_failure_rate_limit_using_ip(
+    .with_strict_failure_rate_limit_using_ip(
       auth.local_login_rate_limiter(),
       ip,
     )

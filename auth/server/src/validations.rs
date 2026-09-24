@@ -27,18 +27,38 @@ pub fn validate_username(username: &str) -> anyhow::Result<()> {
 
 /// Minimum length for passwords
 pub const MIN_PASSWORD_LENGTH: usize = 8;
-/// Maximum length for passwords
-pub const MAX_PASSWORD_LENGTH: usize = 1000;
+/// Maximum length for passwords, in characters. A password can't be
+/// more than [MAX_PASSWORD_BYTES] long either, which is the tighter
+/// bound for characters outside of ASCII.
+pub const MAX_PASSWORD_LENGTH: usize = MAX_PASSWORD_BYTES;
+/// Maximum length for passwords, in bytes of their UTF-8 encoding.
+///
+/// Passwords are hashed with bcrypt, which only uses the first 72
+/// bytes: a longer password would log in with anything sharing its
+/// first 72 bytes (24 characters of CJK text, say), so it is refused
+/// instead. Passwords stored before this limit still log in.
+pub const MAX_PASSWORD_BYTES: usize = 72;
 
 /// Validate passwords
 ///
 /// - Between [MIN_PASSWORD_LENGTH] and [MAX_PASSWORD_LENGTH] characters
+/// - At most [MAX_PASSWORD_BYTES] bytes (UTF-8), bcrypt ignores the rest
 pub fn validate_password(password: &str) -> anyhow::Result<()> {
   StringValidator::default()
     .min_length(MIN_PASSWORD_LENGTH)
     .max_length(MAX_PASSWORD_LENGTH)
     .validate(password)
-    .context("Failed to validate password")
+    .context("Failed to validate password")?;
+  if password.len() > MAX_PASSWORD_BYTES {
+    return Err(
+      anyhow!(
+        "Input too long. Must be at most {MAX_PASSWORD_BYTES} bytes, \
+        characters outside of ASCII take 2 to 4 bytes each."
+      )
+      .context("Failed to validate password"),
+    );
+  }
+  Ok(())
 }
 
 /// Maximum length for API key names
@@ -235,6 +255,29 @@ mod tests {
     assert!(
       validate_password(&"a".repeat(MAX_PASSWORD_LENGTH + 1))
         .is_err()
+    );
+  }
+
+  #[test]
+  fn test_validate_password_bytes() {
+    // bcrypt uses all of a 72 byte password...
+    let longest = "a".repeat(MAX_PASSWORD_BYTES);
+    validate_password(&longest).unwrap();
+    let hash = bcrypt::hash(&longest, 4).unwrap();
+    assert!(!bcrypt::verify("a".repeat(71), &hash).unwrap());
+    // ...but ignores anything after, so longer ones are refused.
+    assert!(validate_password(&format!("{longest}b")).is_err());
+    assert!(bcrypt::verify(format!("{longest}b"), &hash).unwrap());
+    // Counted in bytes: 24 CJK characters are 72 bytes, 25 too many.
+    validate_password(&"密".repeat(24)).unwrap();
+    let err = validate_password(&"密".repeat(25)).unwrap_err();
+    assert!(
+      format!("{err:#}").contains("at most 72 bytes"),
+      "{err:#}"
+    );
+    // A multibyte character straddling the limit.
+    assert!(
+      validate_password(&format!("{}é", "a".repeat(71))).is_err()
     );
   }
 

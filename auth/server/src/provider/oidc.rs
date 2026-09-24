@@ -84,6 +84,9 @@ pub struct OidcProvider {
   client: InnerOidcProvider,
   use_full_email: bool,
   additional_scopes: Vec<String>,
+  /// Audiences besides the client id which
+  /// the ID tokens of logins may carry.
+  additional_audiences: Vec<String>,
   /// To verify tokens presented for token exchange
   verification_keys: TokenVerificationKeys,
 }
@@ -168,8 +171,25 @@ impl OidcProvider {
       app_user_agent,
       use_full_email: config.use_full_email,
       additional_scopes,
+      additional_audiences: config.additional_audiences.clone(),
       verification_keys,
     })
+  }
+
+  /// Verifies the ID tokens of logins. Some providers attach
+  /// additional audiences, which are trusted when configured
+  /// ('additional_audiences'). Every verification of a login's
+  /// ID token uses this, otherwise its claims would be verified
+  /// by one step and refused by the next.
+  fn id_token_verifier(&self) -> CoreIdTokenVerifier<'_> {
+    let verifier = self.client.id_token_verifier();
+    if self.additional_audiences.is_empty() {
+      verifier
+    } else {
+      verifier.set_other_audience_verifier_fn(|aud| {
+        self.additional_audiences.contains(aud)
+      })
+    }
   }
 
   /// Verifies a token presented for RFC 8693 token exchange, which
@@ -263,17 +283,7 @@ impl OidcProvider {
       .id_token()
       .context("OIDC Server did not return an ID token")?;
 
-    // Some providers attach additional audiences, they must be added here
-    // so token verification succeeds.
-    let verifier = self.client.id_token_verifier();
-    let additional_audiences = &config.additional_audiences;
-    let verifier = if additional_audiences.is_empty() {
-      verifier
-    } else {
-      verifier.set_other_audience_verifier_fn(|aud| {
-        additional_audiences.contains(aud)
-      })
-    };
+    let verifier = self.id_token_verifier();
 
     // The login can't be trusted, which is not a server error.
     let claims = id_token
@@ -369,7 +379,7 @@ impl OidcProvider {
 
     let id_claims = token.id_token().and_then(|token| {
       token
-        .claims(&self.client.id_token_verifier(), nonce)
+        .claims(&self.id_token_verifier(), nonce)
         .inspect(|claims| debug!("OIDC ID TOKEN CLAIMS: {claims:?}"))
         .ok()
     });
@@ -459,7 +469,7 @@ impl OidcProvider {
   ) -> String {
     let id_claims = token.id_token().and_then(|token| {
       token
-        .claims(&self.client.id_token_verifier(), nonce)
+        .claims(&self.id_token_verifier(), nonce)
         .inspect(|claims| debug!("OIDC ID TOKEN CLAIMS: {claims:?}"))
         .ok()
     });
@@ -566,6 +576,12 @@ pub struct OidcLoginInfo {
   /// `None` if 'admin_groups' is not configured or no group
   /// information is available, apps should then leave the
   /// users admin status as it is.
+  ///
+  /// ⚠️ Revoking admin through the provider relies on it sending the
+  /// groups claim. A provider which omits the claim for a user left
+  /// without any (matching) group reports `None`, and the user keeps
+  /// admin. Configure 'allowed_groups' as well: such a user is then
+  /// refused the login instead.
   pub admin: Option<bool>,
 }
 
@@ -867,6 +883,107 @@ mod tests {
           &token.mint()
         )
         .is_err()
+    );
+  }
+
+  /// The ID token of a login, as the provider of the test
+  /// metadata signs it, for `audiences`.
+  fn login_id_token(audiences: &[&str], nonce: &Nonce) -> String {
+    use crate::provider::token_exchange::test_tokens::{
+      CLIENT_ID, ISSUER,
+    };
+    use chrono::{Duration, Utc};
+    use openidconnect::{
+      Audience, EndUserEmail, EndUserUsername, IdToken, JsonWebKeyId,
+      StandardClaims,
+    };
+    let claims = IdTokenClaims::<
+      UsernameAdditionalClaims,
+      CoreGenderClaim,
+    >::new(
+      IssuerUrl::new(ISSUER.to_string()).unwrap(),
+      audiences
+        .iter()
+        .map(|audience| Audience::new(audience.to_string()))
+        .collect(),
+      Utc::now() + Duration::minutes(5),
+      Utc::now(),
+      StandardClaims::new(SubjectIdentifier::new(
+        "subject-123".to_string(),
+      ))
+      .set_preferred_username(Some(EndUserUsername::new(
+        "alice".to_string(),
+      )))
+      .set_email(Some(EndUserEmail::new(
+        "alice@example.com".to_string(),
+      ))),
+      UsernameAdditionalClaims {
+        username: None,
+        extra: HashMap::new(),
+      },
+    )
+    .set_nonce(Some(nonce.clone()))
+    .set_authorized_party(Some(ClientId::new(CLIENT_ID.to_string())));
+    let key = CoreRsaPrivateSigningKey::from_pem(
+      include_str!("test_keys/rsa_a.pem"),
+      Some(JsonWebKeyId::new("test-key".to_string())),
+    )
+    .unwrap();
+    IdToken::<
+      UsernameAdditionalClaims,
+      CoreGenderClaim,
+      CoreJweContentEncryptionAlgorithm,
+      CoreJwsSigningAlgorithm,
+    >::new(
+      claims,
+      &key,
+      CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+      None,
+      None,
+    )
+    .unwrap()
+    .to_string()
+  }
+
+  /// The username is resolved from the login's ID token, verified
+  /// again with the audiences the login was verified with. Without
+  /// them its claims were dropped for providers attaching another
+  /// audience, and the name fell back to the user info / subject.
+  #[tokio::test]
+  async fn test_username_from_id_token_with_additional_audiences() {
+    use crate::provider::token_exchange::test_tokens::CLIENT_ID;
+    let config = OidcConfig {
+      additional_audiences: vec!["project-id".to_string()],
+      ..exchange_config(&[], &[])
+    };
+    let nonce = Nonce::new("login-nonce".to_string());
+    let token: TokenResponse = serde_json::from_value(json!({
+      "access_token": "access-token",
+      "token_type": "bearer",
+      "id_token": login_id_token(&[CLIENT_ID, "project-id"], &nonce),
+    }))
+    .unwrap();
+    let subject = SubjectIdentifier::new("subject-123".to_string());
+
+    let provider = exchange_provider(&config);
+    assert_eq!(
+      provider.get_username(&subject, &token, &nonce).await,
+      "alice"
+    );
+    let provider = exchange_provider(&OidcConfig {
+      use_full_email: true,
+      ..config.clone()
+    });
+    assert_eq!(
+      provider.get_username(&subject, &token, &nonce).await,
+      "alice@example.com"
+    );
+    // An audience which isn't configured is still refused. The
+    // test provider has no user info, which leaves the subject.
+    let provider = exchange_provider(&exchange_config(&[], &[]));
+    assert_eq!(
+      provider.get_username(&subject, &token, &nonce).await,
+      "subject-123"
     );
   }
 

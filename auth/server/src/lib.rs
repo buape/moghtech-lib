@@ -61,7 +61,8 @@ pub enum RequestAuthentication {
   /// DANGER ⚠️ the secret needs bcrypt compare with matching
   /// api key's hashed secret to be validated as belonging to a particular client.
   ApiKey { key: String, secret: String },
-  /// X-API-SIGNATURE and X-API-TIMESTAMP. The handshake produces the public key.
+  /// X-API-SIGNATURE and X-API-TIMESTAMP of a request signed with a
+  /// signing key. The handshake produces its public key.
   /// DANGER ⚠️ the public key must still be validated as belonging to a particular client.
   PublicKey(String),
 }
@@ -190,8 +191,9 @@ pub trait AuthImpl: Send + Sync + 'static {
     )
   }
 
-  /// Provide the app 'host' config.
-  /// Example: https://example.com
+  /// Provide the app 'host' config: the origin the app is reached at,
+  /// eg. `https://example.com`, without the path the auth router is
+  /// nested at ([Self::path]).
   fn host(&self) -> &str {
     panic!(
       "Must implement 'AuthImpl::host' in order for external logins and other features to work."
@@ -225,7 +227,8 @@ pub trait AuthImpl: Send + Sync + 'static {
     self.registration_disabled() || provider.registration_disabled
   }
 
-  /// Validate api key CIDR whitelist entries.
+  /// Validate the CIDR whitelist entries of an api key or signing
+  /// key.
   fn validate_cidr_whitelist(
     &self,
     cidr_whitelist: &[String],
@@ -299,9 +302,10 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// - [RequestAuthentication::ApiKey]: secret verified and mapped
   ///   with [Self::get_api_key].
   /// - [RequestAuthentication::PublicKey]: mapped with
-  ///   [Self::get_api_key_v2].
+  ///   [Self::get_signing_key].
   ///
-  /// For api keys, the request `ip` is checked against the key's
+  /// For api keys and signing keys, the request `ip` is checked
+  /// against the key's
   /// [AuthApiKeyImpl::cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist].
   ///
   /// DANGER ⚠️ The user's own
@@ -323,7 +327,7 @@ pub trait AuthImpl: Send + Sync + 'static {
         self.get_api_key(key, secret)
       }
       RequestAuthentication::PublicKey(public_key) => {
-        self.get_api_key_v2(public_key)
+        self.get_signing_key(public_key)
       }
     };
     Box::pin(async move {
@@ -337,7 +341,13 @@ pub trait AuthImpl: Send + Sync + 'static {
   // = STATE =
   // =========
 
-  /// Get the jwt provider.
+  /// Get the jwt provider, which issues and verifies the app tokens.
+  ///
+  /// ⚠️ Build it from a random secret of at least
+  /// [MIN_SECRET_BYTES][provider::jwt::MIN_SECRET_BYTES] (32) bytes,
+  /// shared by all instances of the app, see [JwtProvider::try_new].
+  /// Anyone who knows or guesses the secret can issue tokens for any
+  /// user. With an empty secret no token is issued or accepted.
   fn jwt_provider(&self) -> &JwtProvider;
 
   /// Get the webauthn passkey provider
@@ -345,38 +355,86 @@ pub trait AuthImpl: Send + Sync + 'static {
     None
   }
 
-  /// Provide a rate limiter for
-  /// general authenticated requests.
+  /// The rate limiter for failed authentication by client ip.
   ///
-  /// It also limits failed external logins and token exchanges
-  /// (`POST /token`) by client ip. Note that hosted CI runners share
-  /// their ips between many customers, so with workload identity a
-  /// strict limit lets one failing job (or somebody else on the same
-  /// runners) get your other jobs limited. Keep it generous if
-  /// workloads come from shared ips.
+  /// ⚠️ **The default is a DISABLED limiter: nothing is rate limited
+  /// by ip unless the app implements this**, eg. with
+  /// `RateLimiter::new(false, 10, Duration::from_secs(60))` kept in a
+  /// static. A warning is logged once when the default is used. Only
+  /// failed TOTP and recovery codes are capped per user all the same
+  /// ([MAX_SECOND_FACTOR_FAILURES][api::login::totp::MAX_SECOND_FACTOR_FAILURES]).
+  ///
+  /// It counts the failures of:
+  /// - credentials presented to [middleware::authenticate_request] and
+  ///   the auth management API: invalid tokens, api keys and secrets
+  ///   (each unknown api key costs a bcrypt hash), and the signatures
+  ///   of requests signed with a signing key (each costs a key
+  ///   exchange);
+  /// - the second factor of logins (TOTP codes, recovery codes,
+  ///   passkeys), and local logins unless
+  ///   [Self::local_login_rate_limiter] is implemented;
+  /// - external logins, and token exchanges (`POST /token`,
+  ///   `ExchangeExternalForJwt`).
+  ///
+  /// Requests without any credentials are not counted. Clients are
+  /// counted by ip, IPv6 clients per /64 by default (see
+  /// `RateLimiter::builder`). The login steps checking a secret which
+  /// can be guessed (passwords, TOTP and recovery codes, passkeys)
+  /// count strictly, a burst of concurrent attempts can't go past the
+  /// limit either. Request authentication counts best effort:
+  /// concurrent requests from one client are all checked before their
+  /// failures count.
+  ///
+  /// Note that hosted CI runners share their ips between many
+  /// customers, so with workload identity a strict limit lets one
+  /// failing job (or somebody else on the same runners) get your other
+  /// jobs limited. Keep it generous if workloads come from shared ips.
   fn general_rate_limiter(&self) -> &RateLimiter {
     static DISABLED_RATE_LIMITER: LazyLock<Arc<RateLimiter>> =
-      LazyLock::new(|| RateLimiter::new(true, 0, Default::default()));
+      LazyLock::new(|| {
+        tracing::warn!(
+          "AuthImpl::general_rate_limiter is not implemented: failed authentication (passwords, api keys, tokens) is not rate limited by client ip, 2fa codes are only capped per user"
+        );
+        RateLimiter::new(true, 0, Default::default())
+      });
     &DISABLED_RATE_LIMITER
   }
 
   /// Requests of the auth management API which change how a user (or
   /// anyone, for the admin requests) can log in are only accepted with
-  /// a token issued at most this many seconds ago: passwords, usernames,
-  /// 2fa, linked logins, new api keys, login providers, trusted issuers.
-  /// A token which leaked is then not enough to take over the account
-  /// for good. `0` disables the check for sessions. Default: 15 minutes.
+  /// a token of a login at most this many seconds ago: passwords,
+  /// usernames, 2fa, linked logins, new api keys and signing keys,
+  /// login providers, trusted issuers. A token which leaked is then not enough to take
+  /// over the account for good. `0` disables the check for sessions.
+  /// Default: 15 minutes.
   ///
   /// - Older tokens get `403 Forbidden`, with a message starting with
   ///   [REAUTHENTICATION_REQUIRED][mogh_auth_client::api::manage::REAUTHENTICATION_REQUIRED].
   ///   The user has to log in again, which includes their second factor.
-  /// - Api keys have no login to be recent: they get the same `403`
-  ///   for these requests whatever the window, `0` included. Except
-  ///   the requests which manage resources rather than the caller's
-  ///   account (login providers, trusted issuers, whose handlers
-  ///   require an admin), which an admin's key may make.
-  /// - The time is the `iat` of a token of [Self::jwt_provider]. Other
-  ///   tokens which [Self::get_user_id_from_request_authentication]
+  /// - Api keys and signing keys have no login to be recent: they get
+  ///   the same `403` for these requests whatever the window, `0`
+  ///   included. Except the requests which manage resources rather
+  ///   than the caller's account (login providers, trusted issuers,
+  ///   whose handlers require an admin), which an admin's key may
+  ///   make.
+  /// - The time is the `iat` of a token of [Self::jwt_provider], with
+  ///   the clock skew its validation tolerates. A token issued by token
+  ///   exchange (`/token`, `ExchangeExternalForJwt` without a second
+  ///   factor) carries when the provider authenticated the user instead:
+  ///   the provider token's `auth_time`, else its `iat`. A provider token
+  ///   can be exchanged again until it expires, so an old one must not
+  ///   count as a fresh login. Exchange a freshly issued provider token
+  ///   (or complete a second factor) for these requests.
+  ///   A fresh token is not a fresh login though: identity providers
+  ///   with single sign-on sessions issue new tokens silently, which
+  ///   keep the original `auth_time`. ⚠️ Only when they carry it: a
+  ///   token without `auth_time` (which OIDC only requires when it is
+  ///   requested, eg. with `max_age`) counts from its `iat`, so a
+  ///   silently issued or refreshed one counts as a fresh login. To get a recent login
+  ///   through token exchange, the client must make the provider
+  ///   authenticate the user again (eg. OIDC `prompt=login` or
+  ///   `max_age=0` on the authorization request).
+  /// - Other tokens which [Self::get_user_id_from_request_authentication]
   ///   accepts have no known login and count as api keys: they are
   ///   refused the account requests whatever the window, and may make
   ///   only the resource requests.
@@ -453,7 +511,10 @@ pub trait AuthImpl: Send + Sync + 'static {
 
   /// Local login method can have it's own rate limiter
   /// for 1 to 1 user feedback on remaining attempts.
-  /// By default uses the general rate limiter.
+  /// By default uses the general rate limiter, which is
+  /// ⚠️ disabled unless the app implements
+  /// [Self::general_rate_limiter]: then passwords can be guessed
+  /// without limit.
   fn local_login_rate_limiter(&self) -> &RateLimiter {
     self.general_rate_limiter()
   }
@@ -800,6 +861,17 @@ pub trait AuthImpl: Send + Sync + 'static {
   ///   otherwise the exchange is refused. It stops the workload from
   ///   creating credentials which outlive its rule.
   /// - Never apply signup logic like making the first user an admin.
+  /// - ⚠️ It is called concurrently for the same identity, eg. by a CI
+  ///   matrix starting many jobs at once, and must be safe under it:
+  ///   every call has to return the same user, and none may fail
+  ///   because another created it first. Keep a unique key on
+  ///   (`issuer_id`, `rule_id`) and create with an upsert, or an insert
+  ///   which ignores the conflict (`ON CONFLICT DO NOTHING`), followed
+  ///   by reading the user. A find, then insert creates duplicate users
+  ///   without the key, and fails the exchange with it. Usernames made
+  ///   for the user must not collide either (derive them from the rule
+  ///   id, or retry). The calls of one rule are serialized within one
+  ///   instance of the app, not across several.
   fn get_or_create_workload_user(
     &self,
     _identity: WorkloadIdentity,
@@ -910,6 +982,16 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// [AuthUserImpl][user::AuthUserImpl]::hashed_totp_recovery_codes,
   /// so the code cannot be used again.
   ///
+  /// ⚠️ Make the removal atomic and conditional in storage: remove
+  /// the code only if it is still there, in one operation (eg. an
+  /// update filtered on the code being present, or a transaction),
+  /// and return an error, eg. `401 Unauthorized`, when it was not
+  /// there anymore. The login is then refused. The server serializes
+  /// the recovery code logins of a user within one process only, so
+  /// with a read-modify-write (load the codes, write back the rest)
+  /// two instances of a replicated app can both accept the same code,
+  /// and a removal can write back a code another just removed.
+  ///
   /// Must be implemented for
   /// [CompleteTotpRecoveryLogin][mogh_auth_client::api::login::CompleteTotpRecoveryLogin]
   /// to be usable.
@@ -966,7 +1048,7 @@ pub trait AuthImpl: Send + Sync + 'static {
   // ============
   // = API KEYS =
   // ============
-  /// Validate api key name.
+  /// Validate the name of an api key or signing key.
   fn validate_api_key_name(
     &self,
     api_key_name: &str,
@@ -1004,8 +1086,10 @@ pub trait AuthImpl: Send + Sync + 'static {
   ///
   /// DANGER ⚠️ the incoming secret must still be validated as matching the
   /// known hashed secret for the api key. Use
-  /// [middleware::verify_api_key_secret] with the stored hash
-  /// (or `None` if the key does not exist) to do so.
+  /// [middleware::verify_api_key_secret_async] with the stored hash
+  /// (or `None` if the key does not exist) to do so. It runs bcrypt on
+  /// the blocking thread pool: bcrypt takes tens of milliseconds, and
+  /// runs for every request carrying X-API-KEY, made up keys included.
   ///
   /// The returned [cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist]
   /// is enforced by [Self::get_user_id_from_request_authentication].
@@ -1044,24 +1128,48 @@ pub trait AuthImpl: Send + Sync + 'static {
     })
   }
 
-  /// Pass the server private key to use with api key v2 handshakes.
+  // ================
+  // = SIGNING KEYS =
+  // ================
+  /// Pass the server private key, which the requests signed with a
+  /// signing key are signed for (see [mogh_auth_client::signature]).
+  /// Without one (the default) signing keys are not enabled, and
+  /// signed requests are refused.
   fn server_private_key(&self) -> Option<&RotatableKeyPair> {
     None
   }
 
-  /// How far the `X-API-TIMESTAMP` of an api key v2 request may be
-  /// from the server time, in milliseconds. Default: 1 second.
+  /// How far the `X-API-TIMESTAMP` of a signed request may be from
+  /// the server time, in milliseconds. Default: 1 second.
   ///
-  /// The signature covers the timestamp, so this is how long a
-  /// captured request can be replayed for, and at the same time how
-  /// much clock difference (plus latency) clients can have before
-  /// their requests are refused. Raise it for clients without
-  /// synchronized clocks, always use TLS either way.
-  fn api_key_v2_timestamp_tolerance_ms(&self) -> u64 {
+  /// It is checked when the request headers arrive, before the body is
+  /// read, so the time the body takes to upload doesn't count.
+  ///
+  /// The signature covers the method, path and query, timestamp and
+  /// body of the request, so this is how long a captured request can
+  /// be replayed for (the exact same request, it can't be changed),
+  /// and at the same time how much clock difference (plus the latency
+  /// of the headers) clients can have before their requests are
+  /// refused. Raise it for clients without synchronized clocks, always
+  /// use TLS either way.
+  fn signing_key_timestamp_tolerance_ms(&self) -> u64 {
     1_000
   }
 
-  fn create_api_key_v2(
+  /// Store a new signing key of the user: a key pair whose private
+  /// key signs the requests, recognized by its public key (base64
+  /// spki der, as requests are matched with). `body` has the name,
+  /// expiry and cidr whitelist, as for an api key.
+  ///
+  /// ⚠️ Public keys are not secret, and one given to `CreateSigningKey`
+  /// is chosen by the caller. Store them unique across all users (eg.
+  /// a unique index), and fail if the key exists: the server refuses
+  /// a public key [Self::get_signing_key_owner_id] finds with
+  /// `409 Conflict` first, but that can race another request. A key
+  /// stored twice lets requests signed by one owner authenticate as
+  /// the other, and [Self::get_signing_key], [Self::get_signing_key_owner_id]
+  /// and [Self::delete_signing_key] must each match exactly one key.
+  fn create_signing_key(
     &self,
     _user_id: String,
     _body: CreateApiKey,
@@ -1069,48 +1177,50 @@ pub trait AuthImpl: Send + Sync + 'static {
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async {
       Err(
-        anyhow!("Must implement 'AuthImpl::create_api_key_v2'.")
+        anyhow!("Must implement 'AuthImpl::create_signing_key'.")
           .into(),
       )
     })
   }
 
-  /// Get the api key ([AuthApiKeyImpl][api_key::AuthApiKeyImpl])
-  /// for a given public key, returning UNAUTHORIZED if none exists.
+  /// Get the signing key ([AuthApiKeyImpl][api_key::AuthApiKeyImpl],
+  /// as for an api key) for a given public key, returning
+  /// UNAUTHORIZED if none exists.
   ///
   /// The returned [cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist]
   /// is enforced by [Self::get_user_id_from_request_authentication].
-  fn get_api_key_v2(
+  fn get_signing_key(
     &self,
     _public_key: String,
   ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
     Box::pin(async {
       Err(
-        anyhow!("Must implement 'AuthImpl::get_api_key_v2'.").into(),
+        anyhow!("Must implement 'AuthImpl::get_signing_key'.").into(),
       )
     })
   }
 
-  /// Get the user id which owns the api key (v2), without it
-  /// having to be usable. Used to check ownership before deletion.
+  /// Get the user id which owns the signing key, without it
+  /// having to be usable. Used to check ownership before deletion,
+  /// and that a public key isn't stored already before creating one.
   ///
-  /// Defaults to [Self::get_api_key_v2]. Implement this if that
+  /// Defaults to [Self::get_signing_key]. Implement this if that
   /// rejects keys which should still be deletable, eg. expired ones.
-  fn get_api_key_v2_owner_id(
+  fn get_signing_key_owner_id(
     &self,
     public_key: String,
   ) -> DynFuture<mogh_error::Result<String>> {
-    let api_key = self.get_api_key_v2(public_key);
+    let api_key = self.get_signing_key(public_key);
     Box::pin(async move { Ok(api_key.await?.user_id().to_string()) })
   }
 
-  fn delete_api_key_v2(
+  fn delete_signing_key(
     &self,
     _public_key: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async {
       Err(
-        anyhow!("Must implement 'AuthImpl::delete_api_key_v2'.")
+        anyhow!("Must implement 'AuthImpl::delete_signing_key'.")
           .into(),
       )
     })
@@ -1171,20 +1281,21 @@ mod tests {
       4
     }
     /// The intended implementation shape: one lookup for the key,
-    /// then verify the secret with the helper.
+    /// then verify the secret with the helper, off the async runtime.
     fn get_api_key(
       &self,
       key: String,
       secret: String,
     ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
-      let verified = middleware::verify_api_key_secret(
-        self,
-        &secret,
-        self.hashed_secret.as_deref(),
-      );
+      let hashed_secret = self.hashed_secret.clone();
       let cidr_whitelist = self.cidr_whitelist.clone();
       Box::pin(async move {
-        verified?;
+        middleware::verify_api_key_secret_async(
+          &TestAuth::new(),
+          secret,
+          hashed_secret,
+        )
+        .await?;
         Ok(
           AuthApiKey {
             user_id: format!("user-of-{key}"),
@@ -1194,7 +1305,7 @@ mod tests {
         )
       })
     }
-    fn get_api_key_v2(
+    fn get_signing_key(
       &self,
       public_key: String,
     ) -> DynFuture<mogh_error::Result<BoxAuthApiKey>> {
@@ -1313,7 +1424,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_get_user_id_from_api_key_v2_enforces_cidr_whitelist()
+  async fn test_get_user_id_from_signing_key_enforces_cidr_whitelist()
   {
     let mut auth = TestAuth::new();
     auth.cidr_whitelist = vec!["10.1.2.3".into()];

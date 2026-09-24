@@ -1,21 +1,24 @@
 use std::{
   collections::HashMap,
-  sync::{LazyLock, Mutex},
+  sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
+  time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, anyhow};
 use axum::http::StatusCode;
 use data_encoding::BASE32_NOPAD;
 use mogh_auth_client::api::login::{
-  CompleteTotpLogin, CompleteTotpRecoveryLogin,
+  CompleteTotpLogin, CompleteTotpRecoveryLogin, JwtResponse,
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
+use zeroize::Zeroizing;
 
 use crate::{
-  Login, SecondFactor, api::login::LoginArgs,
+  Login, SecondFactor,
+  api::login::{LoginArgs, local::spawn_bcrypt},
   middleware::check_user_cidr_whitelist,
 };
 
@@ -49,72 +52,323 @@ pub fn consume_totp_step_in_process(
   }
 }
 
+// ==========================
+// = SECOND FACTOR FAILURES =
+// ==========================
+
+/// How many second factor codes (TOTP or recovery) can fail for one
+/// user within [SECOND_FACTOR_FAILURE_WINDOW]: whatever the session,
+/// first factor or client ip they are sent with. Past it, the codes
+/// of the user are refused with `429 Too Many Requests` until the
+/// oldest failure leaves the window.
+///
+/// The codes being checked count against it as well, so a burst of
+/// codes sent at once can't get more guesses than this. With 6 digit
+/// codes accepted one step either side, each guess has about a 3 in
+/// a million chance.
+///
+/// Only a client which passed the first factor (the password, or an
+/// external login) can send codes for a user, so somebody without it
+/// can't use up the budget and lock the user out. Whoever holds the
+/// first factor can though, and keep the user's second factor locked
+/// for as long as they like by failing this many codes each window
+/// (10 per 15 minutes, per process). The user or an admin then
+/// changes the password, or unlinks the external login, the first
+/// factor came from. A failure is any
+/// refused code (wrong, already used, or from an ip outside the
+/// user's whitelist); server errors are not counted. Accepted codes
+/// don't give the failures back, they leave the window.
+///
+/// Kept in process memory (like [consume_totp_step_in_process]), so
+/// every instance of a replicated app allows this many, and a
+/// restart starts over.
+pub const MAX_SECOND_FACTOR_FAILURES: usize = 10;
+
+/// See [MAX_SECOND_FACTOR_FAILURES].
+pub const SECOND_FACTOR_FAILURE_WINDOW: Duration =
+  Duration::from_secs(15 * 60);
+
+/// How often users without failures in the window, nor codes being
+/// checked, are dropped from [SECOND_FACTOR_ATTEMPTS].
+const SECOND_FACTOR_SWEEP_INTERVAL: Duration =
+  Duration::from_secs(60);
+
+static SECOND_FACTOR_ATTEMPTS: LazyLock<Mutex<SecondFactorAttempts>> =
+  LazyLock::new(|| {
+    Mutex::new(SecondFactorAttempts::new(
+      MAX_SECOND_FACTOR_FAILURES,
+      SECOND_FACTOR_FAILURE_WINDOW,
+    ))
+  });
+
+fn second_factor_attempts()
+-> MutexGuard<'static, SecondFactorAttempts> {
+  // Nothing panics while holding the lock, and the
+  // attempts stay valid even if something did.
+  SECOND_FACTOR_ATTEMPTS
+    .lock()
+    .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The second factor codes of every user, see
+/// [MAX_SECOND_FACTOR_FAILURES].
+struct SecondFactorAttempts {
+  max_failures: usize,
+  window: Duration,
+  /// Users with failures in the window or codes being checked,
+  /// by id. Bounded by the users who passed a first factor.
+  users: HashMap<String, UserAttempts>,
+  last_sweep: Option<Instant>,
+}
+
+#[derive(Default)]
+struct UserAttempts {
+  /// When codes failed, oldest first.
+  failures: Vec<Instant>,
+  /// Codes being checked.
+  in_flight: usize,
+  /// Held while a recovery code is checked and used up, see
+  /// [SecondFactorAttempt::lock_recovery_codes]. The user stays on
+  /// the map while any attempt holds a clone.
+  recovery_codes: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl UserAttempts {
+  fn prune(&mut self, now: Instant, window: Duration) {
+    // Saturates to zero rather than panicking if a
+    // time is somehow later than now.
+    self
+      .failures
+      .retain(|&time| now.duration_since(time) < window);
+  }
+}
+
+impl SecondFactorAttempts {
+  fn new(max_failures: usize, window: Duration) -> Self {
+    Self {
+      max_failures,
+      window,
+      users: Default::default(),
+      last_sweep: None,
+    }
+  }
+
+  /// Reserves one of the remaining attempts of `user_id`, returning
+  /// the lock of their recovery codes. Refused with `429` once their
+  /// failures, with the codes being checked, use up the budget.
+  fn begin(
+    &mut self,
+    user_id: &str,
+    now: Instant,
+  ) -> mogh_error::Result<Arc<tokio::sync::Mutex<()>>> {
+    self.sweep(now);
+    let window = self.window;
+    let user = self.users.entry(user_id.to_string()).or_default();
+    user.prune(now, window);
+    if user.failures.len() >= self.max_failures {
+      // Attempts checked at the same time are all recorded,
+      // those above the budget have to leave the window too.
+      let retry_in = user
+        .failures
+        .get(user.failures.len() - self.max_failures)
+        .map(|&time| window.saturating_sub(now.duration_since(time)))
+        .unwrap_or(window);
+      return Err(
+        anyhow!(
+          "Too many invalid codes for this account | Try again in {retry_in:.0?}"
+        )
+        .status_code(StatusCode::TOO_MANY_REQUESTS),
+      );
+    }
+    if user.failures.len() + user.in_flight >= self.max_failures {
+      return Err(
+        anyhow!(
+          "Too many codes for this account are being checked at once | Try again shortly"
+        )
+        .status_code(StatusCode::TOO_MANY_REQUESTS),
+      );
+    }
+    user.in_flight += 1;
+    Ok(user.recovery_codes.clone())
+  }
+
+  /// Ends an attempt of `user_id`, recording a failure if it `failed`.
+  fn end(&mut self, user_id: &str, failed: bool, now: Instant) {
+    let window = self.window;
+    let Some(user) = self.users.get_mut(user_id) else {
+      return;
+    };
+    user.in_flight = user.in_flight.saturating_sub(1);
+    user.prune(now, window);
+    if failed {
+      user.failures.push(now);
+    }
+    if user.in_flight == 0 && user.failures.is_empty() {
+      self.users.remove(user_id);
+    }
+  }
+
+  /// Drops the users without failures in the window nor codes
+  /// being checked, once per [SECOND_FACTOR_SWEEP_INTERVAL].
+  fn sweep(&mut self, now: Instant) {
+    if self.last_sweep.is_some_and(|last| {
+      now.duration_since(last) < SECOND_FACTOR_SWEEP_INTERVAL
+    }) {
+      return;
+    }
+    self.last_sweep = Some(now);
+    let window = self.window;
+    self.users.retain(|_, user| {
+      user.prune(now, window);
+      user.in_flight > 0 || !user.failures.is_empty()
+    });
+  }
+}
+
+/// A second factor code of the user being checked, holding one of
+/// their remaining attempts (see [MAX_SECOND_FACTOR_FAILURES]) until
+/// it is [ended](Self::end), or dropped (the request was cancelled).
+struct SecondFactorAttempt {
+  user_id: String,
+  recovery_codes: Arc<tokio::sync::Mutex<()>>,
+  ended: bool,
+}
+
+impl SecondFactorAttempt {
+  fn begin(user_id: &str) -> mogh_error::Result<Self> {
+    let recovery_codes =
+      second_factor_attempts().begin(user_id, Instant::now())?;
+    Ok(Self {
+      user_id: user_id.to_string(),
+      recovery_codes,
+      ended: false,
+    })
+  }
+
+  /// Ends the attempt with the result of the code, counting a
+  /// refused code (not a server error) as a failure.
+  fn end<T>(mut self, res: &mogh_error::Result<T>) {
+    let failed = matches!(res, Err(e) if !e.status.is_server_error());
+    if failed {
+      warn!(user_id = self.user_id, "Second factor code refused");
+    }
+    self.ended = true;
+    second_factor_attempts().end(
+      &self.user_id,
+      failed,
+      Instant::now(),
+    );
+  }
+
+  /// Waits for the other recovery code logins of the user to
+  /// finish. Held from loading the user's codes until the used one
+  /// is removed, so one code can't be used twice at the same time,
+  /// nor the removal of one code undo another's (with storage
+  /// which writes back the whole list) within this process.
+  async fn lock_recovery_codes(
+    &self,
+  ) -> tokio::sync::OwnedMutexGuard<()> {
+    self.recovery_codes.clone().lock_owned().await
+  }
+}
+
+impl Drop for SecondFactorAttempt {
+  fn drop(&mut self) {
+    if !self.ended {
+      second_factor_attempts().end(
+        &self.user_id,
+        false,
+        Instant::now(),
+      );
+    }
+  }
+}
+
+// =========
+// = LOGIN =
+// =========
+
 impl Resolve<LoginArgs> for CompleteTotpLogin {
   #[instrument(
     "CompleteTotpLogin",
     skip_all,
     fields(
-      ip = ip.to_string(),
+      ip = args.ip.to_string(),
     )
   )]
   async fn resolve(
     self,
-    LoginArgs { auth, session, ip }: &LoginArgs,
+    args: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
     async {
-      let user_id = session.begin_totp_login_attempt().await?;
-
-      let user = auth.get_user(user_id.clone()).await?;
-      let totp_secret = user
-        .totp_secret()
-        .context("User is not enrolled in TOTP 2FA")?;
-
-      check_user_cidr_whitelist(user.as_ref(), *ip)?;
-
-      let secret_bytes = BASE32_NOPAD
-        .decode(totp_secret.as_bytes())
-        .context("Failed to decode TOTP secret to bytes")?;
-
-      let totp = auth.make_totp(secret_bytes, None)?;
-
-      // The step is the 30s window since epoch
-      // which the TOTP is valid for.
-      let step = totp
-        .check_current(&self.code)
-        .context("Invalid TOTP code")
-        .status_code(StatusCode::UNAUTHORIZED)?;
-
-      // A code must only be accepted once (RFC 6238).
-      if !auth.consume_totp_step(user_id.clone(), step).await? {
-        return Err(
-          anyhow!("TOTP code already used. Wait for the next code.")
-            .status_code(StatusCode::UNAUTHORIZED),
-        );
-      }
-
-      let kind = session.complete_totp_login().await?;
-      auth
-        .record_login(Login::of(
-          user.as_ref(),
-          *ip,
-          kind,
-          Some(SecondFactor::Totp),
-        ))
-        .await?;
-
-      let res = auth.jwt_provider().encode_sub(&user_id)?;
-
-      info!(
-        user_id = user.id(),
-        username = user.username(),
-        "TOTP 2FA flow complete, user logged in"
-      );
-
-      Ok(res)
+      let user_id = args.session.begin_totp_login_attempt().await?;
+      let attempt = SecondFactorAttempt::begin(&user_id)?;
+      let res = finish_totp_login(args, &user_id, &self.code).await;
+      attempt.end(&res);
+      res
     }
-    .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), ip)
+    // Strict: a burst of guesses sent at once is bounded
+    // by the budget as well.
+    .with_strict_failure_rate_limit_using_ip(
+      args.auth.general_rate_limiter(),
+      &args.ip,
+    )
     .await
   }
+}
+
+async fn finish_totp_login(
+  LoginArgs { auth, session, ip }: &LoginArgs,
+  user_id: &str,
+  code: &str,
+) -> mogh_error::Result<JwtResponse> {
+  let user = auth.get_user(user_id.to_string()).await?;
+  let totp_secret = user
+    .totp_secret()
+    .context("User is not enrolled in TOTP 2FA")?;
+
+  check_user_cidr_whitelist(user.as_ref(), *ip)?;
+
+  let secret_bytes = BASE32_NOPAD
+    .decode(totp_secret.as_bytes())
+    .context("Failed to decode TOTP secret to bytes")?;
+
+  let totp = auth.make_totp(secret_bytes, None)?;
+
+  // The step is the 30s window since epoch
+  // which the TOTP is valid for.
+  let step = totp
+    .check_current(code)
+    .context("Invalid TOTP code")
+    .status_code(StatusCode::UNAUTHORIZED)?;
+
+  // A code must only be accepted once (RFC 6238).
+  if !auth.consume_totp_step(user_id.to_string(), step).await? {
+    return Err(
+      anyhow!("TOTP code already used. Wait for the next code.")
+        .status_code(StatusCode::UNAUTHORIZED),
+    );
+  }
+
+  let kind = session.complete_totp_login().await?;
+  auth
+    .record_login(Login::of(
+      user.as_ref(),
+      *ip,
+      kind,
+      Some(SecondFactor::Totp),
+    ))
+    .await?;
+
+  let res = auth.jwt_provider().encode_sub(user_id)?;
+
+  info!(
+    user_id = user.id(),
+    username = user.username(),
+    "TOTP 2FA flow complete, user logged in"
+  );
+
+  Ok(res)
 }
 
 impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
@@ -122,73 +376,112 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
     "CompleteTotpRecoveryLogin",
     skip_all,
     fields(
-      ip = ip.to_string(),
+      ip = args.ip.to_string(),
     )
   )]
   async fn resolve(
     self,
-    LoginArgs { auth, session, ip }: &LoginArgs,
+    args: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
     async {
-      let user_id = session.begin_totp_login_attempt().await?;
-
-      let user = auth.get_user(user_id.clone()).await?;
-      if user.totp_secret().is_none() {
-        return Err(
-          anyhow!("User is not enrolled in TOTP 2FA")
-            .status_code(StatusCode::UNAUTHORIZED),
-        );
-      }
-
-      check_user_cidr_whitelist(user.as_ref(), *ip)?;
-
-      // Recovery codes are bcrypt hashed, so each unused code
-      // must be verified against the provided one.
-      let hashed_code = user
-        .hashed_totp_recovery_codes()
-        .iter()
-        .find(|hash| {
-          bcrypt::verify(&self.code, hash).unwrap_or(false)
-        })
-        .cloned()
-        .context("Invalid recovery code")
-        .status_code(StatusCode::UNAUTHORIZED)?;
-
-      // Each recovery code can only be used once.
-      auth
-        .remove_totp_recovery_code(user_id.clone(), hashed_code)
-        .await?;
-
-      let kind = session.complete_totp_login().await?;
-      auth
-        .record_login(Login::of(
-          user.as_ref(),
-          *ip,
-          kind,
-          Some(SecondFactor::TotpRecovery),
-        ))
-        .await?;
-
-      let res = auth.jwt_provider().encode_sub(&user_id)?;
-
-      info!(
-        user_id = user.id(),
-        username = user.username(),
-        "TOTP recovery code flow complete, user logged in"
-      );
-
-      Ok(res)
+      let user_id = args.session.begin_totp_login_attempt().await?;
+      let attempt = SecondFactorAttempt::begin(&user_id)?;
+      let res = finish_totp_recovery_login(
+        args, &attempt, &user_id, &self.code,
+      )
+      .await;
+      attempt.end(&res);
+      res
     }
-    .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), ip)
+    // Strict: a burst of guesses sent at once is bounded
+    // by the budget as well.
+    .with_strict_failure_rate_limit_using_ip(
+      args.auth.general_rate_limiter(),
+      &args.ip,
+    )
     .await
   }
 }
 
+async fn finish_totp_recovery_login(
+  LoginArgs { auth, session, ip }: &LoginArgs,
+  attempt: &SecondFactorAttempt,
+  user_id: &str,
+  code: &str,
+) -> mogh_error::Result<JwtResponse> {
+  // The user's codes are loaded under the lock, so they
+  // include the removal of any code used before.
+  let recovery_codes = attempt.lock_recovery_codes().await;
+
+  let user = auth.get_user(user_id.to_string()).await?;
+  if user.totp_secret().is_none() {
+    return Err(
+      anyhow!("User is not enrolled in TOTP 2FA")
+        .status_code(StatusCode::UNAUTHORIZED),
+    );
+  }
+
+  check_user_cidr_whitelist(user.as_ref(), *ip)?;
+
+  let hashed_code =
+    find_recovery_code(code, user.hashed_totp_recovery_codes())
+      .await?
+      .context("Invalid recovery code")
+      .status_code(StatusCode::UNAUTHORIZED)?;
+
+  // Each recovery code can only be used once.
+  auth
+    .remove_totp_recovery_code(user_id.to_string(), hashed_code)
+    .await?;
+  drop(recovery_codes);
+
+  let kind = session.complete_totp_login().await?;
+  auth
+    .record_login(Login::of(
+      user.as_ref(),
+      *ip,
+      kind,
+      Some(SecondFactor::TotpRecovery),
+    ))
+    .await?;
+
+  let res = auth.jwt_provider().encode_sub(user_id)?;
+
+  info!(
+    user_id = user.id(),
+    username = user.username(),
+    "TOTP recovery code flow complete, user logged in"
+  );
+
+  Ok(res)
+}
+
+/// The stored hash (of `hashed_codes`) which the recovery `code`
+/// matches. Recovery codes are bcrypt hashed, so the code is
+/// verified against each unused one, off the async runtime.
+async fn find_recovery_code(
+  code: &str,
+  hashed_codes: &[String],
+) -> anyhow::Result<Option<String>> {
+  let code = Zeroizing::new(code.as_bytes().to_vec());
+  let hashed_codes = hashed_codes.to_vec();
+  spawn_bcrypt(move || {
+    hashed_codes
+      .into_iter()
+      .find(|hash| bcrypt::verify(&*code, hash).unwrap_or(false))
+  })
+  .await
+}
+
 #[cfg(test)]
 mod tests {
-  use std::sync::{Arc, Mutex};
-
-  use std::net::IpAddr;
+  use std::{
+    net::IpAddr,
+    sync::{
+      Arc, Mutex,
+      atomic::{AtomicUsize, Ordering},
+    },
+  };
 
   use crate::{
     AuthImpl, Login, LoginKind, SecondFactor,
@@ -202,11 +495,14 @@ mod tests {
   const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
   const SECRET: &[u8] = b"12345678901234567890";
 
-  struct TestUser;
+  struct TestUser {
+    id: String,
+    recovery_codes: Vec<String>,
+  }
 
   impl AuthUserImpl for TestUser {
     fn id(&self) -> &str {
-      "totp-hook-user"
+      &self.id
     }
     fn username(&self) -> &str {
       "totp"
@@ -216,25 +512,59 @@ mod tests {
         std::sync::LazyLock::new(|| BASE32_NOPAD.encode(SECRET));
       Some(&ENCODED)
     }
+    fn hashed_totp_recovery_codes(&self) -> &[String] {
+      &self.recovery_codes
+    }
   }
 
-  #[derive(Default)]
+  #[derive(Clone)]
   struct TestAuth {
+    /// The id of the only user. Unique per test, the second
+    /// factor failures are counted per process.
+    user_id: String,
     logins: Arc<Mutex<Vec<Login>>>,
+    get_user_calls: Arc<AtomicUsize>,
+    /// Hashed, like the app would store them.
+    recovery_codes: Arc<Mutex<Vec<String>>>,
+    /// Keeps the requests in flight, so they overlap.
+    delay: Duration,
+  }
+
+  impl TestAuth {
+    fn with_user(user_id: &str) -> Self {
+      Self {
+        user_id: user_id.to_string(),
+        logins: Default::default(),
+        get_user_calls: Default::default(),
+        recovery_codes: Default::default(),
+        delay: Duration::ZERO,
+      }
+    }
   }
 
   impl AuthImpl for TestAuth {
     fn new() -> Self {
-      Self::default()
+      Self::with_user("totp-hook-user")
     }
     fn app_name(&self) -> &'static str {
       "test"
     }
     fn get_user(
       &self,
-      _user_id: String,
+      user_id: String,
     ) -> crate::DynFuture<mogh_error::Result<BoxAuthUser>> {
-      Box::pin(async { Ok(Box::new(TestUser) as BoxAuthUser) })
+      assert_eq!(user_id, self.user_id);
+      self.get_user_calls.fetch_add(1, Ordering::SeqCst);
+      let recovery_codes = self.recovery_codes.clone();
+      let delay = self.delay;
+      Box::pin(async move {
+        tokio::time::sleep(delay).await;
+        let recovery_codes = recovery_codes.lock().unwrap().clone();
+        Ok(Box::new(TestUser {
+          id: user_id,
+          recovery_codes,
+        }) as BoxAuthUser)
+      })
     }
     fn handle_request_authentication(
       &self,
@@ -260,6 +590,29 @@ mod tests {
       self.logins.lock().unwrap().push(login);
       Box::pin(async { Ok(()) })
     }
+    /// Reads, filters and writes back the whole list, like an app
+    /// whose storage only supports read-modify-write: not atomic.
+    /// (The example app uses one conditional update instead.)
+    fn remove_totp_recovery_code(
+      &self,
+      _user_id: String,
+      hashed_code: String,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      let recovery_codes = self.recovery_codes.clone();
+      let delay = self.delay;
+      Box::pin(async move {
+        let remaining = recovery_codes
+          .lock()
+          .unwrap()
+          .iter()
+          .filter(|hash| **hash != hashed_code)
+          .cloned()
+          .collect::<Vec<_>>();
+        tokio::time::sleep(delay).await;
+        *recovery_codes.lock().unwrap() = remaining;
+        Ok(())
+      })
+    }
   }
 
   fn session() -> Session {
@@ -270,32 +623,49 @@ mod tests {
     ))
   }
 
+  /// A session which passed the first factor of `user_id`.
+  async fn pending_login(user_id: &str) -> Session {
+    let session = session();
+    session.insert_totp_login_user_id(user_id).await.unwrap();
+    session
+  }
+
+  fn login_args(auth: &TestAuth, session: Session) -> LoginArgs {
+    LoginArgs {
+      auth: Box::new(auth.clone()),
+      session,
+      ip: IP,
+    }
+  }
+
+  /// A code which is not valid now.
+  fn wrong_code(auth: &TestAuth) -> String {
+    let totp = auth.make_totp(SECRET.to_vec(), None).unwrap();
+    ["000000", "111111", "222222", "333333"]
+      .into_iter()
+      .find(|code| totp.check_current(code).is_none())
+      .unwrap()
+      .to_string()
+  }
+
   /// A TOTP completion records the login with the kind its first
   /// factor left on the session, and takes both off the session.
   #[tokio::test]
   async fn test_completion_records_the_first_factors_login() {
-    let auth = TestAuth::default();
+    let auth = TestAuth::with_user("totp-hook-user");
     let logins = auth.logins.clone();
     let code = auth
       .make_totp(SECRET.to_vec(), None)
       .unwrap()
       .generate_current()
       .to_string();
-    let session = session();
-    session
-      .insert_totp_login_user_id("totp-hook-user")
-      .await
-      .unwrap();
+    let session = pending_login("totp-hook-user").await;
     let provider = LoginKind::Provider {
       provider_id: "oidc".into(),
       provider_name: "OIDC".into(),
     };
     session.insert_login_kind(&provider).await.unwrap();
-    let args = LoginArgs {
-      auth: Box::new(auth),
-      session,
-      ip: IP,
-    };
+    let args = login_args(&auth, session);
     let jwt =
       CompleteTotpLogin { code }.resolve(&args).await.unwrap();
     assert_eq!(
@@ -316,6 +686,185 @@ mod tests {
       args.session.take_login_kind().await,
       LoginKind::Local
     );
+  }
+
+  /// Codes sent at once, on as many sessions (first factors) as
+  /// wanted, get no more guesses than the budget of the user, and
+  /// once it is used up the user's codes are refused whatever the
+  /// session.
+  #[tokio::test]
+  async fn test_concurrent_codes_are_bounded_per_user() {
+    let auth = TestAuth {
+      delay: Duration::from_millis(50),
+      ..TestAuth::with_user("burst-user")
+    };
+    let code = wrong_code(&auth);
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..30 {
+      let args = login_args(&auth, pending_login("burst-user").await);
+      let code = code.clone();
+      requests.spawn(async move {
+        CompleteTotpLogin { code }.resolve(&args).await
+      });
+    }
+    let results = requests.join_all().await;
+    let checked = results
+      .iter()
+      .filter(|res| {
+        res
+          .as_ref()
+          .is_err_and(|e| e.status == StatusCode::UNAUTHORIZED)
+      })
+      .count();
+    let refused = results
+      .iter()
+      .filter(|res| {
+        res
+          .as_ref()
+          .is_err_and(|e| e.status == StatusCode::TOO_MANY_REQUESTS)
+      })
+      .count();
+    assert_eq!(checked, MAX_SECOND_FACTOR_FAILURES);
+    assert_eq!(refused, 30 - MAX_SECOND_FACTOR_FAILURES);
+    assert_eq!(
+      auth.get_user_calls.load(Ordering::SeqCst),
+      MAX_SECOND_FACTOR_FAILURES
+    );
+
+    // The budget is the user's: a new first factor (session)
+    // doesn't get more, not even with the right code.
+    let valid = auth
+      .make_totp(SECRET.to_vec(), None)
+      .unwrap()
+      .generate_current()
+      .to_string();
+    let args = login_args(&auth, pending_login("burst-user").await);
+    let err = CompleteTotpLogin { code: valid }
+      .resolve(&args)
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(format!("{:#}", err.error).contains("Try again in"));
+    let err = CompleteTotpRecoveryLogin {
+      code: "recovery".into(),
+    }
+    .resolve(&args)
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    // Other users are not affected
+    let other = TestAuth::with_user("burst-other-user");
+    let args =
+      login_args(&other, pending_login("burst-other-user").await);
+    let err = CompleteTotpLogin {
+      code: wrong_code(&other),
+    }
+    .resolve(&args)
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  /// The same recovery code sent twice at once, on two sessions,
+  /// logs in once, and two codes used at once are both removed,
+  /// also with storage which writes back the whole list.
+  #[tokio::test]
+  async fn test_recovery_code_is_used_once_concurrently() {
+    let auth = TestAuth {
+      delay: Duration::from_millis(20),
+      ..TestAuth::with_user("recovery-race-user")
+    };
+    *auth.recovery_codes.lock().unwrap() = vec![
+      bcrypt::hash("code-one", 4).unwrap(),
+      bcrypt::hash("code-two", 4).unwrap(),
+      bcrypt::hash("code-three", 4).unwrap(),
+    ];
+    let first =
+      login_args(&auth, pending_login("recovery-race-user").await);
+    let second =
+      login_args(&auth, pending_login("recovery-race-user").await);
+    let (first, second) = tokio::join!(
+      CompleteTotpRecoveryLogin {
+        code: "code-one".into()
+      }
+      .resolve(&first),
+      CompleteTotpRecoveryLogin {
+        code: "code-one".into()
+      }
+      .resolve(&second),
+    );
+    assert!(
+      first.is_ok() != second.is_ok(),
+      "The code logged in {} times",
+      first.is_ok() as u8 + second.is_ok() as u8
+    );
+    assert_eq!(auth.recovery_codes.lock().unwrap().len(), 2);
+
+    let first =
+      login_args(&auth, pending_login("recovery-race-user").await);
+    let second =
+      login_args(&auth, pending_login("recovery-race-user").await);
+    let (first, second) = tokio::join!(
+      CompleteTotpRecoveryLogin {
+        code: "code-two".into()
+      }
+      .resolve(&first),
+      CompleteTotpRecoveryLogin {
+        code: "code-three".into()
+      }
+      .resolve(&second),
+    );
+    first.unwrap();
+    second.unwrap();
+    // Neither removal undid the other.
+    assert!(auth.recovery_codes.lock().unwrap().is_empty());
+  }
+
+  #[test]
+  fn test_second_factor_attempts_budget() {
+    let window = Duration::from_secs(60);
+    let mut attempts = SecondFactorAttempts::new(3, window);
+    let start = Instant::now();
+    // Codes being checked hold the budget...
+    for _ in 0..3 {
+      attempts.begin("user", start).unwrap();
+    }
+    let err = attempts.begin("user", start).unwrap_err();
+    assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    // ...an accepted code gives its attempt back...
+    attempts.end("user", false, start);
+    attempts.begin("user", start).unwrap();
+    // ...a refused one uses it up.
+    for _ in 0..3 {
+      attempts.end("user", true, start);
+    }
+    let err = attempts.begin("user", start).unwrap_err();
+    assert!(format!("{:#}", err.error).contains("Try again in 60s"));
+    // Other users have their own budget.
+    attempts.begin("other", start).unwrap();
+    attempts.end("other", false, start);
+    // The failures leave the window.
+    let later = start + window;
+    attempts.begin("user", later).unwrap();
+    attempts.end("user", false, later);
+    // Users without failures or attempts are dropped.
+    assert!(attempts.users.is_empty());
+  }
+
+  #[test]
+  fn test_second_factor_attempts_sweep() {
+    let window = Duration::from_secs(60);
+    let mut attempts = SecondFactorAttempts::new(3, window);
+    let start = Instant::now();
+    attempts.begin("failed", start).unwrap();
+    attempts.end("failed", true, start);
+    attempts.begin("checking", start).unwrap();
+    assert_eq!(attempts.users.len(), 2);
+    let later = start + window + SECOND_FACTOR_SWEEP_INTERVAL;
+    attempts.begin("new", later).unwrap();
+    // The failure left the window, the code being checked stays.
+    assert!(!attempts.users.contains_key("failed"));
+    assert!(attempts.users.contains_key("checking"));
   }
 
   #[test]
@@ -347,21 +896,19 @@ mod tests {
     assert!(consume_totp_step_in_process("user-b", 100));
   }
 
-  #[test]
-  fn test_recovery_code_matches_bcrypt_hash() {
+  #[tokio::test]
+  async fn test_find_recovery_code() {
     // The lookup used by CompleteTotpRecoveryLogin: find the
     // stored hash matching the provided code.
     let hashes = [
       bcrypt::hash("code-one", 4).unwrap(),
       bcrypt::hash("code-two", 4).unwrap(),
     ];
-    let found = hashes
-      .iter()
-      .find(|hash| bcrypt::verify("code-two", hash).unwrap_or(false));
-    assert_eq!(found, Some(&hashes[1]));
-    let missing = hashes.iter().find(|hash| {
-      bcrypt::verify("code-three", hash).unwrap_or(false)
-    });
+    let found =
+      find_recovery_code("code-two", &hashes).await.unwrap();
+    assert_eq!(found.as_ref(), Some(&hashes[1]));
+    let missing =
+      find_recovery_code("code-three", &hashes).await.unwrap();
     assert!(missing.is_none());
   }
 }

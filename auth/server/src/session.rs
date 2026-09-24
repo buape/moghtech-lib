@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anyhow::Context;
 use axum::extract::FromRequestParts;
 use mogh_error::{AddStatusCode, AddStatusCodeError as _};
@@ -39,18 +41,25 @@ impl Session {
     self.0.id()
   }
 
-  pub async fn insert_authenticated_user_id(
-    &self,
-    user_id: &str,
-  ) -> mogh_error::Result<()> {
-    // Cycle the session id on privilege elevation to
-    // prevent session fixation attacks. All session data
-    // is retained under the new id.
+  /// Gives the session a new id, keeping its data, and deletes
+  /// the record under the old one. Done on privilege elevation
+  /// (a first factor passed) to prevent session fixation: a
+  /// session id planted in the browser beforehand (eg a cookie set
+  /// by a sibling subdomain) is worthless once the user logs in.
+  async fn cycle_id(&self) -> mogh_error::Result<()> {
     self
       .0
       .cycle_id()
       .await
-      .context("Failed to cycle session id")?;
+      .context("Failed to cycle session id")
+      .map_err(Into::into)
+  }
+
+  pub async fn insert_authenticated_user_id(
+    &self,
+    user_id: &str,
+  ) -> mogh_error::Result<()> {
+    self.cycle_id().await?;
     self
       .0
       .insert(Self::AUTHENTICATED_USER_ID, user_id)
@@ -110,11 +119,16 @@ impl Session {
 
   const PASSKEY_LOGIN: &str = "passkey-login";
 
+  /// Begins the passkey second factor of the user, whose first
+  /// factor has passed. Cycles the session id first, so the
+  /// pending login is only reachable with the cookie issued to the
+  /// client which passed the first factor.
   pub async fn insert_passkey_login(
     &self,
     user_id: &str,
     state: &PasskeyAuthentication,
   ) -> mogh_error::Result<()> {
+    self.cycle_id().await?;
     self
       .0
       .insert(Self::PASSKEY_LOGIN, (user_id, state))
@@ -187,13 +201,25 @@ impl Session {
 
   /// How many codes (TOTP or recovery) can be tried for one
   /// first factor login, before it has to be started again.
+  ///
+  /// This spares the user from entering the password again after
+  /// a mistyped code, it is not what bounds guessing: the count
+  /// rides on the session record, which concurrent requests each
+  /// load and write back whole, and a new first factor starts it
+  /// over. The failed codes of a user are bounded by
+  /// [MAX_SECOND_FACTOR_FAILURES][crate::api::login::totp::MAX_SECOND_FACTOR_FAILURES]
+  /// whatever the session or client.
   pub const MAX_TOTP_LOGIN_ATTEMPTS: u32 = 5;
 
-  /// Insert the user id which began totp login
+  /// Begins the TOTP second factor of the user, whose first factor
+  /// has passed. Cycles the session id first, so the pending login
+  /// is only reachable with the cookie issued to the client which
+  /// passed the first factor.
   pub async fn insert_totp_login_user_id(
     &self,
     user_id: &str,
   ) -> mogh_error::Result<()> {
+    self.cycle_id().await?;
     self
       .0
       .insert(Self::TOTP_LOGIN_ATTEMPTS, 0u32)
@@ -266,104 +292,224 @@ impl Session {
   // = 2FA ENROLLMENT =
   // ==================
 
-  const PASSKEY_ENROLLMENT: &str = "passkey-enrollment";
+  // The enrollment state is stored with the id of the user who
+  // began it: the manage api authenticates the user by the
+  // Authorization header, not the session cookie, so a client could
+  // otherwise begin an enrollment as one user and confirm it as
+  // another (a locked one, say) on the same cookie jar. The keys
+  // are not those of the earlier format (the state alone), which
+  // then reads as not initiated.
 
+  const PASSKEY_ENROLLMENT: &str = "passkey-enrollment-of-user";
+
+  /// Stores the passkey registration `user_id` began, replacing
+  /// any other in flight on the session.
   pub async fn insert_passkey_enrollment(
     &self,
+    user_id: &str,
     state: &PasskeyRegistration,
   ) -> mogh_error::Result<()> {
     self
       .0
-      .insert(Self::PASSKEY_ENROLLMENT, state)
+      .insert(Self::PASSKEY_ENROLLMENT, (user_id, state))
       .await
       .context("Session: Failed to insert passkey enrollment state")
       .map_err(Into::into)
   }
 
+  /// Takes the passkey registration in flight, which only
+  /// `user_id` can complete. It is taken either way, so a refused
+  /// one has to be started again.
   pub async fn retrieve_passkey_enrollment(
     &self,
+    user_id: &str,
   ) -> mogh_error::Result<PasskeyRegistration> {
-    self
+    let (began_by, state) = self
       .0
-      .remove(Self::PASSKEY_ENROLLMENT)
+      .remove::<(String, PasskeyRegistration)>(
+        Self::PASSKEY_ENROLLMENT,
+      )
       .await
       .context("Internal session type error")?
       .context(
         "Passkey enrollment has not been initiated for this session",
       )
-      .status_code(StatusCode::UNAUTHORIZED)
+      .status_code(StatusCode::UNAUTHORIZED)?;
+    check_enrollment_user("Passkey", &began_by, user_id)?;
+    Ok(state)
   }
 
-  const TOTP_ENROLLMENT: &str = "totp-enrollment";
+  const TOTP_ENROLLMENT: &str = "totp-enrollment-of-user";
 
-  /// Insert the totp which began totp enrollment
+  /// Stores the TOTP (with its secret) `user_id` began enrolling,
+  /// replacing any other in flight on the session.
   pub async fn insert_totp_enrollment(
     &self,
+    user_id: &str,
     totp: &totp_rs::Totp,
   ) -> mogh_error::Result<()> {
     self
       .0
-      .insert(Self::TOTP_ENROLLMENT, totp)
+      .insert(Self::TOTP_ENROLLMENT, (user_id, totp))
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
   }
 
-  /// Returns the user id which began totp enrollment
+  /// Takes the TOTP enrollment in flight, which only `user_id`
+  /// can complete. It is taken either way, so a refused one has to
+  /// be started again.
   pub async fn retrieve_totp_enrollment(
     &self,
+    user_id: &str,
   ) -> mogh_error::Result<totp_rs::Totp> {
-    self
+    let (began_by, totp) = self
       .0
-      .remove(Self::TOTP_ENROLLMENT)
+      .remove::<(String, totp_rs::Totp)>(Self::TOTP_ENROLLMENT)
       .await
       .context("Internal session type error")?
       .context(
         "TOTP enrollment has not been initiated for this session",
       )
-      .status_code(StatusCode::UNAUTHORIZED)
+      .status_code(StatusCode::UNAUTHORIZED)?;
+    check_enrollment_user("TOTP", &began_by, user_id)?;
+    Ok(totp)
   }
 
   // ========
   // = LINK =
   // ========
 
-  const EXTERNAL_LINK: &str = "external-link";
+  // Stored with when the link was begun. The key is not the one of
+  // the earlier format (the user id alone), which then reads as not
+  // initiated.
+  const EXTERNAL_LINK: &str = "external-link-begun";
 
-  /// Insert the user id which began external login linking
+  /// How long a link begun with
+  /// [BeginExternalLoginLink][mogh_auth_client::api::manage::BeginExternalLoginLink]
+  /// can be started (`/external/{slug}/link`) for. The request comes
+  /// right after it from the same page, an older link is refused
+  /// rather than left for whoever holds the session later.
+  pub const MAX_EXTERNAL_LINK_AGE: Duration =
+    Duration::from_secs(10 * 60);
+
+  /// Stores the user id which began external login linking, and
+  /// when, replacing any other link begun on the session.
   pub async fn insert_external_link_user_id(
     &self,
     user_id: &str,
   ) -> mogh_error::Result<()> {
     self
+      .insert_external_link(user_id, unix_timestamp_secs())
+      .await
+  }
+
+  /// [Self::insert_external_link_user_id] begun at `begun_at`
+  /// (unix seconds).
+  pub(crate) async fn insert_external_link(
+    &self,
+    user_id: &str,
+    begun_at: u64,
+  ) -> mogh_error::Result<()> {
+    self
       .0
-      .insert(Self::EXTERNAL_LINK, user_id)
+      .insert(Self::EXTERNAL_LINK, (user_id, begun_at))
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
   }
 
-  /// Returns the user id which began external login linking
-  pub async fn retrieve_external_link_user_id(
+  /// Takes the link begun on the session, it can only be started
+  /// once. Check [ExternalLink::check_age] before using it: the link
+  /// is taken either way, so an expired one has to be begun again.
+  pub async fn retrieve_external_link(
     &self,
-  ) -> mogh_error::Result<String> {
-    self
+  ) -> mogh_error::Result<ExternalLink> {
+    let (user_id, begun_at) = self
       .0
-      .remove(Self::EXTERNAL_LINK)
+      .remove::<(String, u64)>(Self::EXTERNAL_LINK)
       .await
       .context("Internal session type error")?
       .context(
         "External link has not been initiated for this session",
       )
-      .status_code(StatusCode::UNAUTHORIZED)
+      .status_code(StatusCode::UNAUTHORIZED)?;
+    Ok(ExternalLink { user_id, begun_at })
   }
+}
+
+/// A link begun on the session, see [Session::retrieve_external_link].
+pub struct ExternalLink {
+  /// The user who began the link.
+  pub user_id: String,
+  /// When the link was begun, unix seconds.
+  pub begun_at: u64,
+}
+
+impl ExternalLink {
+  /// Refuses the link once it is older than
+  /// [Session::MAX_EXTERNAL_LINK_AGE].
+  pub fn check_age(&self) -> mogh_error::Result<()> {
+    check_external_link_age(self.begun_at, unix_timestamp_secs())
+  }
+}
+
+/// Refuses a link `begun_at` more than [Session::MAX_EXTERNAL_LINK_AGE]
+/// before `now` (unix seconds). One begun in the future (the clock of
+/// the instance which began it runs ahead) is as good as new.
+fn check_external_link_age(
+  begun_at: u64,
+  now: u64,
+) -> mogh_error::Result<()> {
+  if now.saturating_sub(begun_at)
+    <= Session::MAX_EXTERNAL_LINK_AGE.as_secs()
+  {
+    return Ok(());
+  }
+  Err(
+    anyhow::anyhow!("External link has expired, begin linking again")
+      .status_code(StatusCode::UNAUTHORIZED),
+  )
+}
+
+fn unix_timestamp_secs() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_secs())
+    .unwrap_or_default()
+}
+
+/// Refuses to complete an enrollment `began_by` another user than
+/// the `user_id` confirming it.
+fn check_enrollment_user(
+  kind: &str,
+  began_by: &str,
+  user_id: &str,
+) -> mogh_error::Result<()> {
+  if began_by == user_id {
+    return Ok(());
+  }
+  warn!(
+    began_by,
+    user_id,
+    "Refused {kind} enrollment confirmed by another user than the one who began it"
+  );
+  Err(
+    anyhow::anyhow!(
+      "{kind} enrollment was not initiated by this user"
+    )
+    .status_code(StatusCode::UNAUTHORIZED),
+  )
 }
 
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
 
+  use tower_sessions::{MemoryStore, SessionStore as _};
+
   use super::*;
+  use crate::provider::passkey::{PasskeyProvider, test_passkey};
 
   fn session() -> Session {
     Session(tower_sessions::Session::new(
@@ -371,6 +517,168 @@ mod tests {
       Arc::new(tower_sessions::MemoryStore::default()),
       None,
     ))
+  }
+
+  /// A session saved to `store`, as a client which has
+  /// its cookie holds it, and the id of the cookie.
+  async fn saved_session(
+    store: &Arc<MemoryStore>,
+  ) -> (Session, tower_sessions::session::Id) {
+    let session = Session(tower_sessions::Session::new(
+      None,
+      store.clone(),
+      None,
+    ));
+    session.0.insert("marker", 1u32).await.unwrap();
+    session.0.save().await.unwrap();
+    let id = session.id().unwrap();
+    (session, id)
+  }
+
+  /// Passing the first factor gives the session a new id, so a
+  /// session id planted in the browser beforehand can't be used to
+  /// send the second factor codes (session fixation).
+  #[tokio::test]
+  async fn test_first_factor_cycles_the_session_id() {
+    let store = Arc::new(MemoryStore::default());
+    let (session, planted) = saved_session(&store).await;
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    session.0.save().await.unwrap();
+    let cycled = session.id().unwrap();
+    assert_ne!(cycled, planted);
+    // Nothing is left under the planted id...
+    assert!(store.load(&planted).await.unwrap().is_none());
+    let planted = Session(tower_sessions::Session::new(
+      Some(planted),
+      store.clone(),
+      None,
+    ));
+    assert!(planted.begin_totp_login_attempt().await.is_err());
+    // ...the login continues under the new one, with the data
+    // the session had before.
+    let session = Session(tower_sessions::Session::new(
+      Some(cycled),
+      store.clone(),
+      None,
+    ));
+    assert_eq!(
+      session.begin_totp_login_attempt().await.unwrap(),
+      "user-1"
+    );
+    assert_eq!(
+      session.0.get::<u32>("marker").await.unwrap(),
+      Some(1)
+    );
+
+    // The passkey second factor as well
+    let (session, planted) = saved_session(&store).await;
+    let state = passkey_authentication();
+    session
+      .insert_passkey_login("user-1", &state)
+      .await
+      .unwrap();
+    session.0.save().await.unwrap();
+    assert_ne!(session.id().unwrap(), planted);
+    assert!(store.load(&planted).await.unwrap().is_none());
+
+    // And the external login ready to be exchanged for a jwt
+    let (session, planted) = saved_session(&store).await;
+    session
+      .insert_authenticated_user_id("user-1")
+      .await
+      .unwrap();
+    session.0.save().await.unwrap();
+    assert_ne!(session.id().unwrap(), planted);
+    assert!(store.load(&planted).await.unwrap().is_none());
+  }
+
+  /// A passkey authentication state, for a made up passkey
+  /// (never verified).
+  fn passkey_authentication() -> PasskeyAuthentication {
+    PasskeyProvider::new("https://example.com")
+      .unwrap()
+      .start_passkey_authentication(test_passkey(&[1; 16]))
+      .unwrap()
+      .1
+  }
+
+  fn test_totp() -> totp_rs::Totp {
+    totp_rs::Builder::new()
+      .with_secret(vec![7; 20])
+      .with_account_name("user-1")
+      .build()
+      .unwrap()
+  }
+
+  /// An enrollment is confirmed by the user who began it only: the
+  /// manage api authenticates by the Authorization header, and a
+  /// client could send another user's with the same cookie.
+  #[tokio::test]
+  async fn test_enrollment_is_bound_to_the_user() {
+    let session = session();
+    let totp = test_totp();
+
+    session
+      .insert_totp_enrollment("user-1", &totp)
+      .await
+      .unwrap();
+    let err = session
+      .retrieve_totp_enrollment("user-2")
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("not initiated by"));
+    // Taken by the refusal, the enrollment has to be started again.
+    let err = session
+      .retrieve_totp_enrollment("user-1")
+      .await
+      .unwrap_err();
+    assert!(
+      format!("{:#}", err.error).contains("has not been initiated")
+    );
+    session
+      .insert_totp_enrollment("user-1", &totp)
+      .await
+      .unwrap();
+    let retrieved =
+      session.retrieve_totp_enrollment("user-1").await.unwrap();
+    assert_eq!(retrieved, totp);
+
+    let provider =
+      PasskeyProvider::new("https://example.com").unwrap();
+    let (_, state) =
+      provider.start_passkey_registration("user").unwrap();
+    session
+      .insert_passkey_enrollment("user-1", &state)
+      .await
+      .unwrap();
+    let err = session
+      .retrieve_passkey_enrollment("user-2")
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(
+      session.retrieve_passkey_enrollment("user-1").await.is_err()
+    );
+    session
+      .insert_passkey_enrollment("user-1", &state)
+      .await
+      .unwrap();
+    session.retrieve_passkey_enrollment("user-1").await.unwrap();
+  }
+
+  /// An enrollment stored by an earlier version (the state alone)
+  /// reads as not initiated, rather than a server error.
+  #[tokio::test]
+  async fn test_enrollment_of_earlier_format_is_not_initiated() {
+    let session = session();
+    let totp = test_totp();
+    session.0.insert("totp-enrollment", &totp).await.unwrap();
+    let err = session
+      .retrieve_totp_enrollment("user-1")
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 
   /// The kind of a first factor rides on the session until the
@@ -439,6 +747,60 @@ mod tests {
       session.begin_totp_login_attempt().await.unwrap(),
       "user-1"
     );
+  }
+
+  #[tokio::test]
+  async fn test_external_link_expires() {
+    let session = session();
+    session
+      .insert_external_link_user_id("user-1")
+      .await
+      .unwrap();
+    let link = session.retrieve_external_link().await.unwrap();
+    assert_eq!(link.user_id, "user-1");
+    link.check_age().unwrap();
+    // Taken, it can only be started once.
+    let err = session.retrieve_external_link().await.err().unwrap();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+    let max_age = Session::MAX_EXTERNAL_LINK_AGE.as_secs();
+    let expired = unix_timestamp_secs() - max_age - 60;
+    session
+      .insert_external_link("user-1", expired)
+      .await
+      .unwrap();
+    let link = session.retrieve_external_link().await.unwrap();
+    let err = link.check_age().unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("expired"));
+    // Used up all the same.
+    let err = session.retrieve_external_link().await.err().unwrap();
+    assert!(
+      format!("{:#}", err.error).contains("not been initiated")
+    );
+  }
+
+  #[test]
+  fn test_check_external_link_age() {
+    let max_age = Session::MAX_EXTERNAL_LINK_AGE.as_secs();
+    let now = 1_000_000;
+    for begun_at in [now, now - max_age, now + 30, u64::MAX] {
+      check_external_link_age(begun_at, now).unwrap();
+    }
+    for begun_at in [now - max_age - 1, 0] {
+      let err = check_external_link_age(begun_at, now).unwrap_err();
+      assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+  }
+
+  /// A link stored by an earlier version (the user id alone) reads
+  /// as not initiated, rather than a server error.
+  #[tokio::test]
+  async fn test_external_link_of_earlier_format_is_not_initiated() {
+    let session = session();
+    session.0.insert("external-link", "user-1").await.unwrap();
+    let err = session.retrieve_external_link().await.err().unwrap();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 
   #[tokio::test]

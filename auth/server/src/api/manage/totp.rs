@@ -9,15 +9,51 @@ use mogh_auth_client::api::manage::{
 use mogh_error::AddStatusCode as _;
 use mogh_resolver::Resolve;
 use tracing::{info, instrument};
+use zeroize::Zeroizing;
 
 use crate::{
   AuthImpl,
-  api::manage::ManageArgs,
+  api::{login::local::spawn_bcrypt, manage::ManageArgs},
   rand::{random_bytes, random_string},
 };
 
 /// 160 bits
 const TOTP_ENROLLMENT_SECRET_LENGTH: usize = 40;
+
+/// How many recovery codes an enrollment gives.
+const RECOVERY_CODE_COUNT: usize = 10;
+
+/// Random alphanumeric characters, about 119 bits.
+const RECOVERY_CODE_LENGTH: usize = 20;
+
+/// The bcrypt cost recovery codes are hashed with: the minimum (4).
+///
+/// The cost slows down guessing a secret from its hash, which only
+/// matters for secrets a person picks (passwords). Random recovery
+/// codes can't be guessed at any speed, while the cost is paid for
+/// each code at enrollment, and for each unused code on every
+/// recovery login (a wrong code is checked against all of them).
+/// Codes hashed with a higher cost before still verify, bcrypt reads
+/// the cost from the hash.
+const RECOVERY_CODE_BCRYPT_COST: u32 = 4;
+
+/// Hashes the recovery codes for storage, in one task off the
+/// async runtime.
+async fn hash_recovery_codes(
+  codes: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+  let codes = Zeroizing::new(codes);
+  spawn_bcrypt(move || {
+    codes
+      .iter()
+      .map(|code| {
+        bcrypt::hash(code, RECOVERY_CODE_BCRYPT_COST)
+          .context("Failed to hash a recovery code.")
+      })
+      .collect()
+  })
+  .await?
+}
 
 //
 
@@ -52,7 +88,7 @@ impl Resolve<ManageArgs> for BeginTotpEnrollment {
     let uri =
       totp.to_url().context("Failed to generate QR code uri")?;
 
-    session.insert_totp_enrollment(&totp).await?;
+    session.insert_totp_enrollment(user.id(), &totp).await?;
 
     info!("Totp 2FA enrollment flow initiated");
 
@@ -79,7 +115,12 @@ impl Resolve<ManageArgs> for ConfirmTotpEnrollment {
       session,
     }: &ManageArgs,
   ) -> Result<Self::Response, Self::Error> {
-    let totp = session.retrieve_totp_enrollment().await?;
+    // Checked again, the lock may have been added since the
+    // enrollment began.
+    auth.check_username_locked(user.username())?;
+
+    // Only the user who began the enrollment can confirm it.
+    let totp = session.retrieve_totp_enrollment(user.id()).await?;
 
     // The step is the 30s window since epoch
     // which the TOTP is valid for.
@@ -88,16 +129,13 @@ impl Resolve<ManageArgs> for ConfirmTotpEnrollment {
       .context("The provided code was not valid. Please try BeginTotpEnrollment flow again.")
       .status_code(StatusCode::BAD_REQUEST)?;
 
-    let recovery_codes =
-      (0..10).map(|_| random_string(20)).collect::<Vec<_>>();
-    let hashed_recovery_codes = recovery_codes
-      .iter()
-      .map(|code| {
-        bcrypt::hash(code, auth.local_auth_bcrypt_cost())
-          .context("Failed to hash a recovery code.")
-      })
-      .collect::<anyhow::Result<Vec<_>>>()
-      .context("Failed to generate valid recovery codes")?;
+    let recovery_codes = (0..RECOVERY_CODE_COUNT)
+      .map(|_| random_string(RECOVERY_CODE_LENGTH))
+      .collect::<Vec<_>>();
+    let hashed_recovery_codes =
+      hash_recovery_codes(recovery_codes.clone())
+        .await
+        .context("Failed to generate valid recovery codes")?;
 
     auth
       .update_user_stored_totp(
@@ -240,6 +278,20 @@ mod tests {
     assert!(totp.check_current("").is_none());
     assert!(totp.check_current("not-a-code").is_none());
     assert!(totp.check_current("12345").is_none());
+  }
+
+  #[tokio::test]
+  async fn test_recovery_codes_hash_cheaply() {
+    let codes = (0..RECOVERY_CODE_COUNT)
+      .map(|_| random_string(RECOVERY_CODE_LENGTH))
+      .collect::<Vec<_>>();
+    let hashed = hash_recovery_codes(codes.clone()).await.unwrap();
+    assert_eq!(hashed.len(), RECOVERY_CODE_COUNT);
+    for (code, hash) in codes.iter().zip(&hashed) {
+      assert!(hash.starts_with("$2b$04$"), "{hash}");
+      assert!(bcrypt::verify(code, hash).unwrap());
+    }
+    assert!(!bcrypt::verify(&codes[1], &hashed[0]).unwrap());
   }
 
   #[test]

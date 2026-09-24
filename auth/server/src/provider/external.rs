@@ -74,6 +74,12 @@ pub struct ExternalLoginInfo {
   /// `None` if 'admin_groups' is not configured or no group
   /// information is available, apps should then leave the
   /// users admin status as it is.
+  ///
+  /// ⚠️ Revoking admin through the provider relies on it sending the
+  /// groups claim. A provider which omits the claim for a user left
+  /// without any (matching) group reports `None`, and the user keeps
+  /// admin. Configure 'allowed_groups' as well: such a user is then
+  /// refused the login instead.
   pub admin: Option<bool>,
 }
 
@@ -91,9 +97,14 @@ pub struct SessionExternalLogin {
   pub state: String,
   /// OIDC, Google
   pub nonce: Option<String>,
-  /// OIDC
+  /// OIDC, Github
   pub pkce_verifier: Option<PkceCodeVerifier>,
-  /// Where to send the user after login.
+  /// Where to send the user after login: an absolute http(s) url
+  /// on the app's hostname, sanitized and bounded
+  /// ([crate::api::MAX_REDIRECT_LENGTH]) when the login starts.
+  /// A session written by an older version may hold the raw query
+  /// value, so it is sanitized again when used: do the same when
+  /// reading it.
   pub redirect: Option<String>,
 }
 
@@ -237,13 +248,15 @@ impl BuiltProvider {
         }
       }
       BuiltProvider::Github(provider) => {
+        let (pkce_challenge, pkce_verifier) =
+          PkceCodeChallenge::new_random_sha256();
         let (state, url) =
-          provider.get_state_and_login_redirect_url();
+          provider.get_state_and_login_redirect_url(&pkce_challenge);
         BeginExternalLogin {
           url,
           state,
           nonce: None,
-          pkce_verifier: None,
+          pkce_verifier: Some(pkce_verifier),
         }
       }
       BuiltProvider::Google(provider) => {
@@ -372,7 +385,15 @@ impl BuiltProvider {
         BuiltProvider::Github(github),
         ExternalLoginProviderConfig::Github(_),
       ) => {
-        let token = github.get_access_token(&code).await?;
+        // Logins begun before Github used PKCE have no verifier.
+        let pkce_verifier = login
+          .pkce_verifier
+          .context(
+            "Session is missing Github pkce verifier, log in again",
+          )
+          .status_code(StatusCode::UNAUTHORIZED)?;
+        let token =
+          github.get_access_token(&code, &pkce_verifier).await?;
         let user =
           github.get_github_user(&token.access_token).await?;
         Ok(CompletedExternalLogin {
@@ -961,6 +982,126 @@ mod tests {
     );
   }
 
+  /// A Github login through a mock of Github: the verifier of
+  /// the challenge in the login url is sent with the code.
+  #[tokio::test]
+  async fn test_github_complete_login() {
+    use crate::provider::named::github::mock;
+    let github_mock = mock::spawn(
+      r#"{"access_token":"gho_token","token_type":"bearer"}"#,
+    )
+    .await;
+    let provider = github("mock-github", "secret");
+    let built = mock_github_client(&provider, &github_mock.url);
+    let begin = built.begin_login();
+    let challenge = begin
+      .url
+      .split("code_challenge=")
+      .nth(1)
+      .unwrap()
+      .split('&')
+      .next()
+      .unwrap()
+      .to_string();
+    let login = session_login(&provider, &begin);
+    let Ok(completed) = built
+      .complete_login(&provider, login, begin.state, "code".into())
+      .await
+    else {
+      panic!("expected the login to complete")
+    };
+    assert_eq!(completed.info.provider_id, "mock-github");
+    assert_eq!(completed.info.external_id, "42");
+    assert_eq!(completed.username(&built).await, "octocat");
+
+    let received = github_mock.received.lock().unwrap().clone();
+    let form = mock::form(&received[0].body);
+    let verifier =
+      PkceCodeVerifier::new(form["code_verifier"].clone());
+    assert_eq!(
+      PkceCodeChallenge::from_code_verifier_sha256(&verifier)
+        .as_str(),
+      challenge
+    );
+  }
+
+  /// A login begun before Github used PKCE has no verifier on the
+  /// session, and a refused code is the user's failed login. Neither
+  /// error carries the client secret.
+  #[tokio::test]
+  async fn test_github_failed_login() {
+    use crate::provider::named::github::mock;
+    const SECRET: &str = "the-github-client-secret";
+    let github_mock =
+      mock::spawn(r#"{"error":"bad_verification_code"}"#).await;
+    let provider = github("mock-github", SECRET);
+    let built = mock_github_client(&provider, &github_mock.url);
+
+    let begin = built.begin_login();
+    let mut login = session_login(&provider, &begin);
+    login.pkce_verifier = None;
+    let Err(err) = built
+      .complete_login(&provider, login, begin.state, "code".into())
+      .await
+    else {
+      panic!("expected the login to fail")
+    };
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    // Refused before the code is redeemed.
+    assert!(github_mock.received.lock().unwrap().is_empty());
+
+    let begin = built.begin_login();
+    let login = session_login(&provider, &begin);
+    let Err(err) = built
+      .complete_login(&provider, login, begin.state, "code".into())
+      .await
+    else {
+      panic!("expected the code to be refused")
+    };
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    let message = format!("{:#}", err.error);
+    assert!(message.contains("bad_verification_code"), "{message}");
+    for rendered in [message, mogh_error::serialize_error(&err.error)]
+    {
+      assert!(!rendered.contains(SECRET), "{rendered}");
+    }
+  }
+
+  fn mock_github_client(
+    provider: &ExternalLoginProvider,
+    url: &str,
+  ) -> BuiltProvider {
+    let ExternalLoginProviderConfig::Github(config) =
+      &provider.config
+    else {
+      unreachable!()
+    };
+    BuiltProvider::Github(
+      GithubProvider::new(
+        redirect_uri("https://example.com", "/auth", provider),
+        config,
+      )
+      .unwrap()
+      .with_base_urls(url, url),
+    )
+  }
+
+  fn session_login(
+    provider: &ExternalLoginProvider,
+    begin: &BeginExternalLogin,
+  ) -> SessionExternalLogin {
+    SessionExternalLogin {
+      provider_id: provider.id.clone(),
+      link_user_id: None,
+      state: begin.state.clone(),
+      nonce: begin.nonce.clone(),
+      pkce_verifier: begin.pkce_verifier.as_ref().map(|verifier| {
+        PkceCodeVerifier::new(verifier.secret().clone())
+      }),
+      redirect: None,
+    }
+  }
+
   #[test]
   fn test_github_begin_login() {
     let built = BuiltProvider::Github(
@@ -977,6 +1118,13 @@ mod tests {
     let begin = built.begin_login();
     assert!(begin.url.contains(&begin.state));
     assert!(begin.nonce.is_none());
-    assert!(begin.pkce_verifier.is_none());
+    // The code is bound to the session with PKCE.
+    let verifier = begin.pkce_verifier.unwrap();
+    let challenge =
+      PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+    assert!(begin.url.contains(&format!(
+      "code_challenge={}&code_challenge_method=S256",
+      challenge.as_str()
+    )));
   }
 }

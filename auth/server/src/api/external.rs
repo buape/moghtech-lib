@@ -24,7 +24,7 @@ use crate::{
   AuthImpl,
   api::{
     RedirectQuery, StandardCallbackQuery, get_user_id_or_two_factor,
-    unique_username, user_id_or_two_factor_redirect,
+    login_redirect, unique_username, user_id_or_two_factor_redirect,
   },
   middleware::check_user_cidr_whitelist,
   provider::{
@@ -34,8 +34,9 @@ use crate::{
     },
     load_cache::LoadFailedRecently,
   },
-  session::Session,
-  validations::constant_time_eq,
+  rand::random_string,
+  session::{ExternalLink, Session},
+  validations::{MAX_USERNAME_LENGTH, constant_time_eq},
 };
 use crate::{Login, api::provider_login};
 
@@ -99,12 +100,11 @@ pub fn router<I: AuthImpl>() -> Router {
   router
 }
 
-/// Resolves the provider of the url's slug and its client,
-/// ensuring it's enabled.
-async fn load_enabled_provider<I: AuthImpl>(
+/// Resolves the provider of the url's slug, ensuring it's enabled.
+async fn resolve_enabled_provider<I: AuthImpl>(
   auth: &I,
   slug: &str,
-) -> mogh_error::Result<(ExternalLoginProvider, Arc<BuiltProvider>)> {
+) -> mogh_error::Result<ExternalLoginProvider> {
   let provider = resolve_external_provider_by_slug(auth, slug)
     .await?
     .provider;
@@ -116,8 +116,17 @@ async fn load_enabled_provider<I: AuthImpl>(
     );
   }
 
-  let built = load_provider_client(auth, &provider).await?;
+  Ok(provider)
+}
 
+/// Resolves the provider of the url's slug and its client,
+/// ensuring it's enabled.
+async fn load_enabled_provider<I: AuthImpl>(
+  auth: &I,
+  slug: &str,
+) -> mogh_error::Result<(ExternalLoginProvider, Arc<BuiltProvider>)> {
+  let provider = resolve_enabled_provider(auth, slug).await?;
+  let built = load_provider_client(auth, &provider).await?;
   Ok((provider, built))
 }
 
@@ -153,56 +162,107 @@ pub(crate) async fn load_provider_client<I: AuthImpl + ?Sized>(
         "Failed to initialize external login provider | {e:#}"
       );
     }
-    anyhow!("Login provider '{}' is not available", provider.name)
+    anyhow::Error::new(ProviderUnavailable(provider.name.clone()))
       .status_code(StatusCode::SERVICE_UNAVAILABLE)
   })?;
 
   Ok(built)
 }
 
+/// The error of a login provider which can't be loaded
+/// ([load_provider_client]). The reason was logged there, once per
+/// attempt, and isn't part of the error.
+#[derive(Debug)]
+struct ProviderUnavailable(String);
+
+impl std::fmt::Display for ProviderUnavailable {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "Login provider '{}' is not available", self.0)
+  }
+}
+
+impl std::error::Error for ProviderUnavailable {}
+
+// Rate limiting: these routes are plain GETs, which any web page the
+// user visits can send from their browser (and ip). Only the failures
+// of a callback which redeems a code (the credential of these flows)
+// count against the client ip. A request naming an unknown provider,
+// or a flow which was never started on the session, is refused
+// without counting it, so it can't lock the ip out of logging in.
+
+/// Starts an external login: stores it on the session, and sends the
+/// browser to the provider. The `redirect` (where the login ends) must
+/// be on the app's host, and at most
+/// [MAX_REDIRECT_LENGTH][crate::api::MAX_REDIRECT_LENGTH] characters,
+/// otherwise the login ends at the host.
+///
+/// Starting a login handles no credential, so it is not rate
+/// limited, and the client ip is not used.
 pub async fn external_login<I: AuthImpl>(
   slug: String,
-  RequestIp(ip): RequestIp,
+  RequestIp(_ip): RequestIp,
   session: Session,
   Query(RedirectQuery { redirect }): Query<RedirectQuery>,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
-  let res = async {
-    let (provider, built) =
-      load_enabled_provider(&auth, &slug).await?;
-
-    let begin = built.begin_login();
-
-    // Data inserted here will be matched on callback side for csrf protection.
-    session
-      .insert_external_login(&SessionExternalLogin {
-        provider_id: provider.id.clone(),
-        link_user_id: None,
-        state: begin.state,
-        nonce: begin.nonce,
-        pkce_verifier: begin.pkce_verifier,
-        redirect,
-      })
-      .await?;
-
-    provider_redirect(&provider, &begin.url)
-  }
-  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
-  .await;
+  let res =
+    begin_external_login(&auth, &slug, &session, redirect).await;
   error_redirect(&auth, ExternalFlow::Login, res)
 }
 
+async fn begin_external_login<I: AuthImpl>(
+  auth: &I,
+  slug: &str,
+  session: &Session,
+  redirect: Option<String>,
+) -> mogh_error::Result<Redirect> {
+  let (provider, built) = load_enabled_provider(auth, slug).await?;
+
+  let begin = built.begin_login();
+
+  // Data inserted here will be matched on callback side for csrf protection.
+  session
+    .insert_external_login(&SessionExternalLogin {
+      provider_id: provider.id.clone(),
+      link_user_id: None,
+      state: begin.state,
+      nonce: begin.nonce,
+      pkce_verifier: begin.pkce_verifier,
+      // Stored by an unauthenticated request,
+      // so only a bounded, sanitized one.
+      redirect: login_redirect(auth.host(), redirect),
+    })
+    .await?;
+
+  provider_redirect(&provider, &begin.url)
+}
+
+/// Starts linking an external login to the user who began the link on
+/// the session ([BeginExternalLoginLink][mogh_auth_client::api::manage::BeginExternalLoginLink]).
+///
+/// The link begun on the session is used up by the first request,
+/// whatever its outcome, and refused once it is older than 10 minutes
+/// (`Session::MAX_EXTERNAL_LINK_AGE`). Until it is taken, the request
+/// is not known to be a link, and a failure goes to the login page.
 pub async fn external_link<I: AuthImpl>(
   slug: String,
   RequestIp(ip): RequestIp,
   session: Session,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
+  // Known once the link begun on the session is taken.
+  let mut flow = ExternalFlow::Login;
   let res = async {
+    // Taken before anything else can fail: a failed attempt can't
+    // leave the link to be completed later (for any provider) by
+    // whoever holds the session.
+    let link = take_external_link(&session).await?;
+    flow = ExternalFlow::Link;
+    link.check_age()?;
+    let user_id = link.user_id;
+
     let (provider, built) =
       load_enabled_provider(&auth, &slug).await?;
-
-    let user_id = session.retrieve_external_link_user_id().await?;
 
     let user = auth.get_user(user_id.clone()).await?;
     auth.check_username_locked(user.username())?;
@@ -231,23 +291,55 @@ pub async fn external_link<I: AuthImpl>(
 
     provider_redirect(&provider, &begin.url)
   }
-  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
   .await;
-  error_redirect(&auth, ExternalFlow::Link, res)
+  error_redirect(&auth, flow, res)
+}
+
+/// Takes the link begun on the session, and saves the session right
+/// away: the session layer doesn't save it for a response with a
+/// server error, which would leave the link on the session.
+async fn take_external_link(
+  session: &Session,
+) -> mogh_error::Result<ExternalLink> {
+  let link = session.retrieve_external_link().await?;
+  session.0.save().await.context("Failed to save session")?;
+  Ok(link)
+}
+
+/// Takes the external login or link in flight on the session,
+/// and saves the session right away, see [take_external_link].
+async fn take_external_login(
+  session: &Session,
+) -> mogh_error::Result<SessionExternalLogin> {
+  let login = session.retrieve_external_login().await?;
+  session.0.save().await.context("Failed to save session")?;
+  Ok(login)
 }
 
 /// Whether an external flow logs a user in, or links
 /// the provider to the user who is already logged in.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExternalFlow {
   Login,
   Link,
 }
 
+/// What a redirect reports for a server error (5xx) of the external
+/// flows. Its causes (provider responses, internal addresses) are for
+/// the operator, not for the url bar.
+const SERVER_ERROR_MESSAGE: &str =
+  "Login failed, see the server logs for details";
+
 /// External logins are browser navigations, so with
 /// [AuthImpl::external_login_error_redirect] configured a failure sends
 /// the user back to the app with the reason, rather than leaving them
-/// on a page showing the JSON error.
+/// on a page showing the JSON error. A failed link (once the session
+/// had one begun) goes to [AuthImpl::post_link_redirect] instead.
+///
+/// Server errors are logged ([is_logged_here]). The redirect reports
+/// them only as [SERVER_ERROR_MESSAGE]. Without the redirect the error
+/// is returned as it is, with as much detail as `mogh_error` sends for
+/// 5xx responses (see `mogh_error::set_server_error_detail`).
 fn error_redirect<I: AuthImpl>(
   auth: &I,
   flow: ExternalFlow,
@@ -257,6 +349,16 @@ fn error_redirect<I: AuthImpl>(
     Ok(redirect) => return Ok(redirect),
     Err(e) => e,
   };
+  if is_logged_here(&e) {
+    match flow {
+      ExternalFlow::Login => {
+        error!("External login failed | {:#}", e.error)
+      }
+      ExternalFlow::Link => {
+        error!("External login link failed | {:#}", e.error)
+      }
+    }
+  }
   let Some(login_page) = auth.external_login_error_redirect() else {
     return Err(e);
   };
@@ -265,9 +367,7 @@ fn error_redirect<I: AuthImpl>(
     ExternalFlow::Link => (auth.post_link_redirect(), "link_error"),
   };
   let message = if e.status.is_server_error() {
-    // The details are for the operator, not for the url bar.
-    error!("External login failed | {:#}", e.error);
-    String::from("Login failed, see the server logs for details")
+    String::from(SERVER_ERROR_MESSAGE)
   } else if let Some(attempt) =
     e.error.downcast_ref::<FailedAttempt>()
   {
@@ -282,6 +382,15 @@ fn error_redirect<I: AuthImpl>(
     "{target}{splitter}{param}={}",
     urlencoding::encode(&message)
   )))
+}
+
+/// Whether [error_redirect] logs `e`: the server errors, except a
+/// provider which can't be loaded ([ProviderUnavailable]). That was
+/// logged where it happened, once per attempt, not by every request
+/// while the provider is down (starting a login isn't rate limited).
+fn is_logged_here(e: &mogh_error::Error) -> bool {
+  e.status.is_server_error()
+    && e.error.downcast_ref::<ProviderUnavailable>().is_none()
 }
 
 /// Applies the OIDC 'redirect_host'
@@ -332,44 +441,58 @@ pub async fn external_callback<I: AuthImpl>(
   Query(query): Query<StandardCallbackQuery>,
 ) -> mogh_error::Result<Redirect> {
   let auth = I::new();
-  // Known once the login which was started is read from the session.
+  // Known once the login which was started is taken from the session.
   let mut flow = ExternalFlow::Login;
   let res = async {
-    let (client_state, code) = query.open()?;
-
-    let (provider, built) =
-      load_enabled_provider(&auth, &slug).await?;
-
-    let login = session.retrieve_external_login().await?;
-
+    // Taken before anything else can fail: the attempt is used up
+    // whatever the outcome (a login denied at the provider included),
+    // and a failed link goes back to where links are managed.
+    let login = take_external_login(&session).await?;
     if login.link_user_id.is_some() {
       flow = ExternalFlow::Link;
     }
+
+    let (client_state, code) = query.open()?;
+
+    // Checked before the provider's client is loaded (which may
+    // mean discovery requests) and without counting a failure: none
+    // of this is a credential which could be guessed.
+    let provider = resolve_enabled_provider(&auth, &slug).await?;
 
     // The provider the url named, by its id: the slug may have
     // changed while the login was in flight.
     validate_callback(&login, &provider.id, &client_state)?;
 
+    let built = load_provider_client(&auth, &provider).await?;
+
     let link_user_id = login.link_user_id.clone();
     let redirect = login.redirect.clone();
 
-    let completed = built
-      .complete_login(&provider, login, client_state, code)
-      .await?;
+    // Redeeming the code is the credential check of the flow.
+    async {
+      let completed = built
+        .complete_login(&provider, login, client_state, code)
+        .await?;
 
-    match link_user_id {
-      Some(user_id) => {
-        link_callback(&auth, &provider, user_id, completed).await
-      }
-      None => {
-        login_callback(
-          &auth, &session, &provider, &built, completed, redirect, ip,
-        )
-        .await
+      match link_user_id {
+        Some(user_id) => {
+          link_callback(&auth, &provider, user_id, completed).await
+        }
+        None => {
+          login_callback(
+            &auth, &session, &provider, &built, completed, redirect,
+            ip,
+          )
+          .await
+        }
       }
     }
+    .with_failure_rate_limit_using_ip(
+      auth.general_rate_limiter(),
+      &ip,
+    )
+    .await
   }
-  .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), &ip)
   .await;
   error_redirect(&auth, flow, res)
 }
@@ -439,10 +562,12 @@ async fn login_callback<I: AuthImpl>(
         );
       }
 
-      let username = completed.username(built).await;
-
-      // Modify username if it already exists
-      let username = unique_username(auth, username).await?;
+      let username = signup_username(
+        auth,
+        provider,
+        completed.username(built).await,
+      )
+      .await?;
 
       let user_id = auth
         .sign_up_external_user(
@@ -482,6 +607,76 @@ async fn login_callback<I: AuthImpl>(
     user_id_or_two_factor,
     redirect.as_deref(),
   )
+}
+
+/// The username a new external user is signed up with, which passes
+/// [AuthImpl::validate_username] (the rule local users are held to):
+/// - the provider's name for the user, if it passes,
+/// - else that name reduced to the characters of the default rule
+///   ([normalize_username]), if it passes,
+/// - else a name made from the provider's slug and random characters.
+///
+/// A taken name gets a random suffix ([unique_username]).
+async fn signup_username<I: AuthImpl>(
+  auth: &I,
+  provider: &ExternalLoginProvider,
+  provider_username: String,
+) -> mogh_error::Result<String> {
+  let normalized = normalize_username(&provider_username);
+  for candidate in [provider_username, normalized] {
+    if candidate.is_empty()
+      || auth.validate_username(&candidate).is_err()
+    {
+      continue;
+    }
+    let username = unique_username(auth, candidate).await?;
+    if auth.validate_username(&username).is_ok() {
+      return Ok(username);
+    }
+  }
+  let generated = format!(
+    "{}-{}",
+    normalize_username(provider.slug()),
+    random_string(8)
+  );
+  let username = unique_username(auth, generated).await?;
+  // The app's rule refuses even the generated name.
+  if let Err(e) = auth.validate_username(&username) {
+    return Err(
+      e.error
+        .context(
+          "No username for the new user passes 'validate_username'",
+        )
+        .status_code(StatusCode::INTERNAL_SERVER_ERROR),
+    );
+  }
+  Ok(username)
+}
+
+/// Reduces a provider's name for a user to the characters of the
+/// default username rule (`[a-zA-Z0-9._@-]`): any other becomes a
+/// '-' (runs of them collapse), it doesn't start or end with '-' or
+/// '.', and it is cut to [MAX_USERNAME_LENGTH] characters.
+fn normalize_username(name: &str) -> String {
+  let mut normalized = String::with_capacity(name.len());
+  for c in name.trim().chars() {
+    let c =
+      if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@') {
+        c
+      } else {
+        '-'
+      };
+    if c == '-'
+      && (normalized.is_empty() || normalized.ends_with('-'))
+    {
+      continue;
+    }
+    normalized.push(c);
+    if normalized.len() >= MAX_USERNAME_LENGTH {
+      break;
+    }
+  }
+  normalized.trim_matches(['-', '.']).to_string()
 }
 
 async fn link_callback<I: AuthImpl>(
@@ -531,6 +726,7 @@ async fn link_callback<I: AuthImpl>(
 #[cfg(test)]
 mod tests {
   use axum::response::IntoResponse;
+  use mogh_error::AddStatusCode as _;
 
   use super::*;
   use crate::{LoginKind, provider::external::ExternalLoginInfo};
@@ -592,6 +788,8 @@ mod tests {
     sync_fails: bool,
     cidr_whitelist: Vec<String>,
     error_redirect: Option<&'static str>,
+    /// Refused by the app's 'validate_username', on top of the default rule.
+    rejected_usernames: Vec<&'static str>,
     calls: Arc<std::sync::Mutex<Calls>>,
   }
 
@@ -628,6 +826,20 @@ mod tests {
 
     fn registration_disabled(&self) -> bool {
       self.registration_disabled
+    }
+
+    fn validate_username(
+      &self,
+      username: &str,
+    ) -> mogh_error::Result<()> {
+      if self.rejected_usernames.contains(&username) {
+        return Err(
+          anyhow!("Username is reserved")
+            .status_code(StatusCode::BAD_REQUEST),
+        );
+      }
+      crate::validations::validate_username(username)
+        .status_code(StatusCode::BAD_REQUEST)
     }
 
     fn no_users_exist(
@@ -868,6 +1080,8 @@ mod tests {
     let message = format!("{:#}", err.error);
     assert!(message.contains("not available"), "{message}");
     assert!(!message.contains("client_secret"), "{message}");
+    // Nor logged again by every request while it is down.
+    assert!(!is_logged_here(&err));
   }
 
   #[tokio::test]
@@ -1118,21 +1332,35 @@ mod tests {
     );
   }
 
+  /// A redirect reports server errors only as such: their
+  /// causes are for the operator, not for the url bar.
   #[test]
   fn test_error_redirect_hides_server_errors() {
     let auth = TestAuth {
       error_redirect: Some("https://example.com/login"),
       ..Default::default()
     };
-    let redirect = error_redirect(
-      &auth,
-      ExternalFlow::Login,
-      Err(anyhow!("connection refused to 10.0.0.5:5432").into()),
-    )
-    .unwrap();
-    let location = location(redirect);
-    assert!(location.contains("login_error=Login%20failed"));
-    assert!(!location.contains("10.0.0.5"), "{location}");
+    for (flow, target) in [
+      (
+        ExternalFlow::Login,
+        "https://example.com/login?login_error=",
+      ),
+      (
+        ExternalFlow::Link,
+        "https://example.com/profile?link_error=",
+      ),
+    ] {
+      let location = location(
+        error_redirect(&auth, flow, server_error()).unwrap(),
+      );
+      assert!(location.starts_with(target), "{location}");
+      assert!(
+        location
+          .ends_with(&*urlencoding::encode(SERVER_ERROR_MESSAGE)),
+        "{location}"
+      );
+      assert!(!location.contains("10.0.0.5"), "{location}");
+    }
   }
 
   #[tokio::test]
@@ -1164,6 +1392,384 @@ mod tests {
     assert_eq!(
       completed.username(built(&provider).await.as_ref()).await,
       "42"
+    );
+  }
+
+  /// The login is started by unauthenticated requests: only a
+  /// bounded, sanitized redirect is stored on the session.
+  #[tokio::test]
+  async fn test_login_stores_only_a_sanitized_bounded_redirect() {
+    let auth = TestAuth {
+      static_providers: vec![github("flow-redirect", true, "secret")],
+      ..Default::default()
+    };
+    for (redirect, stored) in [
+      (
+        Some("/notes?tab=1"),
+        Some("https://example.com/notes?tab=1"),
+      ),
+      (Some("https://evil.example/steal"), None),
+      (Some("//evil.example"), None),
+      (None, None),
+    ] {
+      let session = session();
+      let _redirect = begin_external_login(
+        &auth,
+        "flow-redirect",
+        &session,
+        redirect.map(String::from),
+      )
+      .await
+      .unwrap();
+      let login = session.retrieve_external_login().await.unwrap();
+      assert_eq!(login.redirect.as_deref(), stored, "{redirect:?}");
+    }
+    let session = session();
+    let long = format!("/{}", "a".repeat(60 * 1024));
+    let _redirect = begin_external_login(
+      &auth,
+      "flow-redirect",
+      &session,
+      Some(long),
+    )
+    .await
+    .unwrap();
+    let login = session.retrieve_external_login().await.unwrap();
+    assert_eq!(login.redirect, None);
+  }
+
+  fn session_on(
+    store: &Arc<tower_sessions::MemoryStore>,
+    id: Option<tower_sessions::session::Id>,
+  ) -> Session {
+    Session(tower_sessions::Session::new(id, store.clone(), None))
+  }
+
+  /// A failed link request uses up the link begun on the session,
+  /// in the store as well, so it can't be completed later (with
+  /// another provider) by whoever holds the session.
+  #[tokio::test]
+  async fn test_failed_link_uses_up_the_begun_link() {
+    let store = Arc::new(tower_sessions::MemoryStore::default());
+    let session = session_on(&store, None);
+    // As BeginExternalLoginLink leaves it.
+    session
+      .insert_external_link_user_id("user-1")
+      .await
+      .unwrap();
+    session.0.save().await.unwrap();
+    let id = session.id();
+
+    let err = external_link::<TestAuth>(
+      "unknown".to_string(),
+      RequestIp(IP),
+      session.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+    assert!(session.retrieve_external_link().await.is_err());
+    let stored = session_on(&store, id);
+    let err = stored.retrieve_external_link().await.err().unwrap();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  /// A link begun longer than [Session::MAX_EXTERNAL_LINK_AGE] ago is
+  /// refused, and used up as well. The failure is one of the link,
+  /// it goes back to where the link was begun.
+  #[tokio::test]
+  async fn test_expired_link_is_refused_and_used_up() {
+    let store = Arc::new(tower_sessions::MemoryStore::default());
+    let session = session_on(&store, None);
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+    let expired = now - Session::MAX_EXTERNAL_LINK_AGE.as_secs() - 60;
+    session
+      .insert_external_link("user-1", expired)
+      .await
+      .unwrap();
+    session.0.save().await.unwrap();
+    let id = session.id();
+
+    let err = external_link::<TestAuth>(
+      "github".to_string(),
+      RequestIp(IP),
+      session.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("expired"));
+
+    let stored = session_on(&store, id);
+    let err = stored.retrieve_external_link().await.err().unwrap();
+    assert!(
+      format!("{:#}", err.error).contains("not been initiated")
+    );
+
+    // With the error redirect, to the page of the link.
+    session
+      .insert_external_link("user-1", expired)
+      .await
+      .unwrap();
+    let redirect = external_link::<LinkErrorAuth>(
+      "github".to_string(),
+      RequestIp(IP),
+      session.clone(),
+    )
+    .await
+    .unwrap();
+    let location = location(redirect);
+    assert!(
+      location.starts_with("https://example.com/profile?link_error="),
+      "{location}"
+    );
+  }
+
+  /// An app which shows failed logins and links, for flows which
+  /// fail before they need anything else.
+  struct LinkErrorAuth;
+
+  impl AuthImpl for LinkErrorAuth {
+    fn new() -> Self {
+      LinkErrorAuth
+    }
+    fn host(&self) -> &str {
+      "https://example.com"
+    }
+    fn post_link_redirect(&self) -> &str {
+      "https://example.com/profile"
+    }
+    fn external_login_error_redirect(&self) -> Option<&str> {
+      Some("https://example.com/login")
+    }
+    fn get_user(
+      &self,
+      _user_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<crate::user::BoxAuthUser>>
+    {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: crate::RequestAuthentication,
+      _ip: IpAddr,
+      _require_user_enabled: bool,
+      _req: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+      panic!("not needed for these tests")
+    }
+  }
+
+  /// An app which shows failed logins on its login page, but has no
+  /// linking (so no [AuthImpl::post_link_redirect], whose default
+  /// panics).
+  struct NoLinkingAuth;
+
+  impl AuthImpl for NoLinkingAuth {
+    fn new() -> Self {
+      NoLinkingAuth
+    }
+    fn host(&self) -> &str {
+      "https://example.com"
+    }
+    fn external_login_error_redirect(&self) -> Option<&str> {
+      Some("https://example.com/login")
+    }
+    fn get_user(
+      &self,
+      _user_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<crate::user::BoxAuthUser>>
+    {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: crate::RequestAuthentication,
+      _ip: IpAddr,
+      _require_user_enabled: bool,
+      _req: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+      panic!("not needed for these tests")
+    }
+  }
+
+  /// Anyone can request the link routes. Without a link begun on the
+  /// session the request is not a link, and fails to the login page
+  /// rather than the (panicking) link page.
+  #[tokio::test]
+  async fn test_link_without_begun_link_fails_to_the_login_page() {
+    for slug in ["oidc", "unknown"] {
+      let redirect = external_link::<NoLinkingAuth>(
+        slug.to_string(),
+        RequestIp(IP),
+        session(),
+      )
+      .await
+      .unwrap();
+      let location = location(redirect);
+      assert!(
+        location
+          .starts_with("https://example.com/login?login_error="),
+        "{location}"
+      );
+      assert!(
+        location.contains("not%20been%20initiated"),
+        "{location}"
+      );
+    }
+    // The callback of a flow never started on the session.
+    let redirect = external_callback::<NoLinkingAuth>(
+      "oidc".to_string(),
+      RequestIp(IP),
+      session(),
+      Query(StandardCallbackQuery {
+        state: Some("state".into()),
+        code: Some("code".into()),
+        error: None,
+      }),
+    )
+    .await
+    .unwrap();
+    assert!(
+      location(redirect)
+        .starts_with("https://example.com/login?login_error=")
+    );
+  }
+
+  fn server_error() -> mogh_error::Result<Redirect> {
+    Err(
+      anyhow!("connection refused to 10.0.0.5:5432")
+        .context("Failed to get Oauth token")
+        .status_code(StatusCode::BAD_GATEWAY),
+    )
+  }
+
+  /// Server errors are logged by [error_redirect], but not a provider
+  /// which can't be loaded: [load_provider_client] logged it once.
+  #[tokio::test]
+  async fn test_error_redirect_logs_server_errors() {
+    assert!(is_logged_here(&server_error().unwrap_err()));
+    assert!(!is_logged_here(&rejected().unwrap_err()));
+    let unavailable = || {
+      anyhow::Error::new(ProviderUnavailable("flow-a".into()))
+        .status_code(StatusCode::SERVICE_UNAVAILABLE)
+    };
+    assert!(!is_logged_here(&unavailable()));
+    // Also under the note of the rate limit (callbacks).
+    let limiter = mogh_rate_limit::RateLimiter::new(
+      false,
+      3,
+      std::time::Duration::from_secs(60),
+    );
+    let err = async { Err::<Redirect, _>(unavailable()) }
+      .with_failure_rate_limit_using_ip(
+        &limiter,
+        &IpAddr::from([10, 0, 0, 2]),
+      )
+      .await
+      .unwrap_err();
+    assert!(!is_logged_here(&err));
+  }
+
+  /// Without the redirect the JSON error is left to `mogh_error`,
+  /// which sends the full trace by default.
+  #[test]
+  fn test_server_errors_keep_their_detail_without_the_redirect() {
+    let auth = TestAuth::default();
+    for flow in [ExternalFlow::Login, ExternalFlow::Link] {
+      let err =
+        error_redirect(&auth, flow, server_error()).unwrap_err();
+      assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+      let body = mogh_error::serialize_error(&err.error);
+      assert!(body.contains("Failed to get Oauth token"), "{body}");
+      assert!(body.contains("10.0.0.5"), "{body}");
+      assert!(!body.contains(SERVER_ERROR_MESSAGE), "{body}");
+    }
+  }
+
+  async fn signup_username_of(
+    auth: &TestAuth,
+    provider_username: &str,
+  ) -> String {
+    signup_username(
+      auth,
+      &github("flow-names", true, "secret"),
+      provider_username.to_string(),
+    )
+    .await
+    .unwrap()
+  }
+
+  /// External sign ups are held to the app's username rule.
+  #[tokio::test]
+  async fn test_signup_username_passes_validate_username() {
+    let auth = TestAuth {
+      rejected_usernames: vec!["admin"],
+      ..Default::default()
+    };
+    for (provider_username, username) in [
+      ("octocat", "octocat"),
+      ("john.doe@example.com", "john.doe@example.com"),
+      ("John Smith", "John-Smith"),
+      ("  José  Müller ", "Jos-M-ller"),
+      ("john.doe+tag@example.com", "john.doe-tag@example.com"),
+      // A name the rule allows is kept as it is.
+      ("-.alice.-", "-.alice.-"),
+      ("- alice -", "alice"),
+    ] {
+      assert_eq!(
+        signup_username_of(&auth, provider_username).await,
+        username
+      );
+    }
+    let long = signup_username_of(&auth, &"a".repeat(150)).await;
+    assert_eq!(long, "a".repeat(MAX_USERNAME_LENGTH));
+
+    // Nothing usable is left, or the app refuses it:
+    // a name made from the provider's slug.
+    for provider_username in ["日本語", "admin", "!!!"] {
+      let username =
+        signup_username_of(&auth, provider_username).await;
+      assert!(username.starts_with("flow-names-"), "{username}");
+      assert_eq!(username.len(), "flow-names-".len() + 8);
+      crate::validations::validate_username(&username).unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn test_signup_uses_the_valid_username() {
+    let provider = github("flow-a", true, "secret");
+    let auth = TestAuth::default();
+    let completed = CompletedExternalLogin::known(
+      completed(&provider, "42", None).info,
+      "Mona Lisa Octocat",
+    );
+    let _redirect = login_callback(
+      &auth,
+      &session(),
+      &provider,
+      built(&provider).await.as_ref(),
+      completed,
+      None,
+      IP,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      auth.calls.lock().unwrap().signed_up,
+      ["Mona-Lisa-Octocat"]
     );
   }
 

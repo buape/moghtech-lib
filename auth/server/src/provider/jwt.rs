@@ -5,10 +5,12 @@ use std::{
 
 use anyhow::{Context as _, anyhow};
 use jsonwebtoken::{
-  DecodingKey, EncodingKey, Header, Validation, decode, encode,
+  Algorithm, DecodingKey, EncodingKey, Header, Validation, decode,
+  encode,
 };
 use mogh_auth_client::api::login::JwtResponse;
 use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
 
 static DEFAULT_HEADER: LazyLock<Header> =
   LazyLock::new(Default::default);
@@ -16,14 +18,20 @@ static DEFAULT_HEADER: LazyLock<Header> =
 /// The default `iss` / `aud` claim value.
 pub const DEFAULT_ISS_AUD: &str = "mogh_auth";
 
+/// The shortest secret [JwtProvider::try_new] accepts, in bytes: the
+/// size of the HS256 hash (RFC 7518 section 3.2). [JwtProvider::new]
+/// warns about shorter ones.
+pub const MIN_SECRET_BYTES: usize = 32;
+
 /// JWT clock skew tolerance, in seconds.
 const JWT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 10;
 
 /// The claims of an app token.
 ///
-/// `iat` / `exp` are unix timestamps in **seconds**, as RFC 7519
-/// defines them. Tokens issued before 4.0 carried milliseconds, and
-/// are rejected (they would read as issued in the far future).
+/// `iat` / `exp` / `auth_time` are unix timestamps in **seconds**, as
+/// RFC 7519 defines them. Tokens issued before 4.0 carried
+/// milliseconds, and are rejected (they would read as issued in the
+/// far future).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct JwtClaims {
   /// Client identifier, eg user id
@@ -36,6 +44,26 @@ pub struct JwtClaims {
   pub iat: u64,
   /// Expiry time, unix timestamp in seconds.
   pub exp: u64,
+  /// When the user authenticated, unix timestamp in seconds, if
+  /// that was before the token was issued. Set on tokens issued
+  /// for the token of an external provider (token exchange): the
+  /// time the provider authenticated the user, see
+  /// [JwtProvider::encode_sub_with_auth_time]. `None` on tokens
+  /// issued by a login, which authenticated the user at `iat`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub auth_time: Option<u64>,
+}
+
+impl JwtClaims {
+  /// When the user authenticated: `auth_time`, else `iat`. The
+  /// reauthentication window
+  /// ([AuthImpl::reauthentication_window_secs][crate::AuthImpl::reauthentication_window_secs])
+  /// is measured from this.
+  pub fn authenticated_at(&self) -> u64 {
+    self
+      .auth_time
+      .map_or(self.iat, |auth_time| auth_time.min(self.iat))
+  }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,23 +78,32 @@ pub struct BorrowedJwtClaims<'a> {
   pub iat: u64,
   /// Expiry time, unix timestamp in seconds.
   pub exp: u64,
+  /// When the user authenticated, see [JwtClaims::auth_time].
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub auth_time: Option<u64>,
 }
 
 pub struct JwtProvider {
   header: Option<Header>,
   validation: Option<Validation>,
-  /// Built from iss / aud, used unless
+  /// Built from iss / aud / the algorithm of the header, used unless
   /// overridden with [Self::with_validation].
   default_validation: Validation,
   encoding_key: EncodingKey,
   decoding_key: DecodingKey,
+  /// Built with an empty secret: nothing is encoded or accepted.
+  secret_missing: bool,
   ttl_ms: u128,
   iss: String,
   aud: String,
 }
 
-fn build_validation(iss: &str, aud: &str) -> Validation {
-  let mut validation = Validation::default();
+fn build_validation(
+  iss: &str,
+  aud: &str,
+  algorithm: Algorithm,
+) -> Validation {
+  let mut validation = Validation::new(algorithm);
   validation.set_issuer(&[iss]);
   validation.set_audience(&[aud]);
   validation.leeway = JWT_CLOCK_SKEW_TOLERANCE_SECS;
@@ -86,30 +123,76 @@ fn ttl_secs(ttl_ms: u128) -> u64 {
 }
 
 impl JwtProvider {
-  /// Uses [DEFAULT_ISS_AUD] for the iss / aud claims,
-  /// override with [Self::with_iss] / [Self::with_aud]
-  /// (usually the app name).
+  /// Signs and verifies tokens (HS256) with `secret`. Uses
+  /// [DEFAULT_ISS_AUD] for the iss / aud claims, override with
+  /// [Self::with_iss] / [Self::with_aud] (usually the app name).
+  ///
+  /// ⚠️ `secret` must be random, at least [MIN_SECRET_BYTES] long, and
+  /// shared by all instances of the app: anyone who knows it, or
+  /// guesses it offline from any token they got, can issue tokens for
+  /// any user. A shorter secret is logged as a warning,
+  /// [Self::try_new] refuses it. With an empty secret (eg. a config
+  /// value which is missing) nothing is issued or accepted:
+  /// [Self::encode_sub] fails, and so does every token.
   pub fn new(secret: &[u8], ttl_ms: u128) -> Self {
+    if secret.is_empty() {
+      error!(
+        "The jwt secret is empty: no app token is issued or accepted. Configure a random secret of at least {MIN_SECRET_BYTES} bytes."
+      );
+    } else if secret.len() < MIN_SECRET_BYTES {
+      warn!(
+        "The jwt secret is only {} bytes: anyone with a token can try to guess it offline, and then issue tokens for any user. Configure a random secret of at least {MIN_SECRET_BYTES} bytes.",
+        secret.len()
+      );
+    }
     Self {
       header: None,
       validation: None,
       default_validation: build_validation(
         DEFAULT_ISS_AUD,
         DEFAULT_ISS_AUD,
+        DEFAULT_HEADER.alg,
       ),
       encoding_key: EncodingKey::from_secret(secret),
       decoding_key: DecodingKey::from_secret(secret),
+      secret_missing: secret.is_empty(),
       ttl_ms,
       iss: DEFAULT_ISS_AUD.to_string(),
       aud: DEFAULT_ISS_AUD.to_string(),
     }
   }
 
+  /// [Self::new], refusing a `secret` shorter than
+  /// [MIN_SECRET_BYTES]. Apps should use this for the secret they are
+  /// configured with (or generate a random one when there is none).
+  pub fn try_new(
+    secret: &[u8],
+    ttl_ms: u128,
+  ) -> anyhow::Result<Self> {
+    if secret.len() < MIN_SECRET_BYTES {
+      return Err(anyhow!(
+        "The jwt secret must be at least {MIN_SECRET_BYTES} random bytes, it is {} bytes",
+        secret.len()
+      ));
+    }
+    Ok(Self::new(secret, ttl_ms))
+  }
+
+  /// The header of the tokens issued, eg. to sign with HS512. The
+  /// validation requires its algorithm from then on (unless replaced
+  /// with [Self::with_validation]). Only the HMAC algorithms (HS256,
+  /// HS384, HS512) work with the secret, others fail to encode.
   pub fn with_header(mut self, header: Header) -> Self {
     self.header = Some(header);
+    self.rebuild_default_validation();
     self
   }
 
+  /// Replaces the validation of tokens entirely. The `iss` / `aud`
+  /// of [Self::with_iss] / [Self::with_aud] and the algorithm of
+  /// [Self::with_header] are then only required if `validation`
+  /// requires them, and its leeway is also the clock skew tolerated
+  /// for tokens issued in the future.
   pub fn with_validation(mut self, validation: Validation) -> Self {
     self.validation = Some(validation);
     self
@@ -118,15 +201,20 @@ impl JwtProvider {
   /// Set the `iss` claim issued and required on JWTs.
   pub fn with_iss(mut self, iss: impl Into<String>) -> Self {
     self.iss = iss.into();
-    self.default_validation = build_validation(&self.iss, &self.aud);
+    self.rebuild_default_validation();
     self
   }
 
   /// Set the `aud` claim issued and required on JWTs.
   pub fn with_aud(mut self, aud: impl Into<String>) -> Self {
     self.aud = aud.into();
-    self.default_validation = build_validation(&self.iss, &self.aud);
+    self.rebuild_default_validation();
     self
+  }
+
+  fn rebuild_default_validation(&mut self) {
+    self.default_validation =
+      build_validation(&self.iss, &self.aud, self.header().alg);
   }
 
   /// How long encoded tokens are valid for, in milliseconds.
@@ -143,8 +231,9 @@ impl JwtProvider {
     self.validation.as_ref().unwrap_or(&self.default_validation)
   }
 
+  /// Encodes a token for a user who just logged in.
   pub fn encode_sub(&self, sub: &str) -> anyhow::Result<JwtResponse> {
-    self.encode_sub_with_ttl(sub, self.ttl_ms)
+    self.encode(sub, self.ttl_ms, None)
   }
 
   /// Encodes a token which is valid for a shorter time than
@@ -154,6 +243,33 @@ impl JwtProvider {
     sub: &str,
     ttl_ms: u128,
   ) -> anyhow::Result<JwtResponse> {
+    self.encode(sub, ttl_ms, None)
+  }
+
+  /// Encodes a token for a user who authenticated at `auth_time`
+  /// (unix seconds) rather than now: with the token of an external
+  /// provider (token exchange), which the provider may have issued
+  /// long ago, and which can be exchanged again until it expires.
+  /// The reauthentication window is measured from `auth_time`
+  /// ([JwtClaims::authenticated_at]), so a replayed provider token
+  /// doesn't count as a fresh login. Capped at the issue time.
+  pub fn encode_sub_with_auth_time(
+    &self,
+    sub: &str,
+    auth_time: u64,
+  ) -> anyhow::Result<JwtResponse> {
+    self.encode(sub, self.ttl_ms, Some(auth_time))
+  }
+
+  fn encode(
+    &self,
+    sub: &str,
+    ttl_ms: u128,
+    auth_time: Option<u64>,
+  ) -> anyhow::Result<JwtResponse> {
+    if self.secret_missing {
+      return Err(anyhow!("No jwt secret is configured"));
+    }
     let iat = unix_timestamp_secs()?;
     let exp = iat.saturating_add(ttl_secs(ttl_ms.min(self.ttl_ms)));
     let claims = BorrowedJwtClaims {
@@ -162,6 +278,7 @@ impl JwtProvider {
       aud: &self.aud,
       iat,
       exp,
+      auth_time: auth_time.map(|auth_time| auth_time.min(iat)),
     };
     let jwt = encode(self.header(), &claims, &self.encoding_key)
       .context("Failed at signing claim")?;
@@ -174,12 +291,17 @@ impl JwtProvider {
   }
 
   /// Decodes the JWT and validates its signature, `iss` / `aud`, and
-  /// that it is not expired (with [JWT_CLOCK_SKEW_TOLERANCE_SECS]).
+  /// that it is not expired (with the leeway of [Self::validation],
+  /// 10 seconds by default).
   /// The error never says which of these failed.
   pub fn decode_claims(
     &self,
     jwt: &str,
   ) -> anyhow::Result<JwtClaims> {
+    // Anyone can sign with an empty secret.
+    if self.secret_missing {
+      return Err(anyhow!("Invalid user credentials"));
+    }
     let claims =
       decode::<JwtClaims>(jwt, &self.decoding_key, self.validation())
         .map(|res| res.claims)
@@ -242,6 +364,7 @@ mod tests {
         aud,
         iat,
         exp,
+        auth_time: None,
       },
       &EncodingKey::from_secret(secret),
     )
@@ -351,6 +474,7 @@ mod tests {
         aud: DEFAULT_ISS_AUD,
         iat: now,
         exp: now + 60,
+        auth_time: None,
       },
       &EncodingKey::from_secret(SECRET),
     )
@@ -480,6 +604,112 @@ mod tests {
     let claims = provider.decode_claims(&jwt).unwrap();
     assert_eq!(claims.sub, "user-123");
     assert!(claims.iat <= now() && now() <= claims.iat + 5);
+  }
+
+  #[test]
+  fn test_auth_time_round_trip() {
+    let provider = JwtProvider::new(SECRET, 60_000);
+    // A login: authenticated when the token was issued.
+    let jwt = provider.encode_sub("user-123").unwrap().jwt;
+    let claims = provider.decode_claims(&jwt).unwrap();
+    assert_eq!(claims.auth_time, None);
+    assert_eq!(claims.authenticated_at(), claims.iat);
+    // Not even serialized, the tokens stay as they were.
+    let payload = jwt.split('.').nth(1).unwrap();
+    let payload = data_encoding::BASE64URL_NOPAD
+      .decode(payload.as_bytes())
+      .unwrap();
+    assert!(
+      !String::from_utf8(payload).unwrap().contains("auth_time")
+    );
+
+    // A token exchange: when the provider authenticated the user.
+    let authenticated = now() - 3_600;
+    let jwt = provider
+      .encode_sub_with_auth_time("user-123", authenticated)
+      .unwrap()
+      .jwt;
+    let claims = provider.decode_claims(&jwt).unwrap();
+    assert_eq!(claims.sub, "user-123");
+    assert_eq!(claims.auth_time, Some(authenticated));
+    assert_eq!(claims.authenticated_at(), authenticated);
+    // Valid for the full ttl nonetheless.
+    assert_eq!(claims.exp, claims.iat + 60);
+
+    // Never later than the token was issued.
+    let jwt = provider
+      .encode_sub_with_auth_time("user-123", u64::MAX)
+      .unwrap()
+      .jwt;
+    let claims = provider.decode_claims(&jwt).unwrap();
+    assert_eq!(claims.auth_time, Some(claims.iat));
+    assert_eq!(claims.authenticated_at(), claims.iat);
+  }
+
+  #[test]
+  fn test_authenticated_at_is_capped_at_issue_time() {
+    let claims = |auth_time| JwtClaims {
+      sub: "user-123".into(),
+      iss: DEFAULT_ISS_AUD.into(),
+      aud: DEFAULT_ISS_AUD.into(),
+      iat: 1_000,
+      exp: 2_000,
+      auth_time,
+    };
+    assert_eq!(claims(None).authenticated_at(), 1_000);
+    assert_eq!(claims(Some(10)).authenticated_at(), 10);
+    assert_eq!(claims(Some(5_000)).authenticated_at(), 1_000);
+  }
+
+  #[test]
+  fn test_empty_secret_issues_and_accepts_nothing() {
+    // Eg. a secret missing from the config.
+    let provider = JwtProvider::new(b"", 60_000);
+    assert!(provider.encode_sub("user-123").is_err());
+    // Anyone can sign with the empty secret.
+    let now = now();
+    let forged = encode_claims(b"", "admin", now, now + 60);
+    let err = provider.decode_sub(&forged).unwrap_err();
+    assert_eq!(err.to_string(), "Invalid user credentials");
+  }
+
+  #[test]
+  fn test_try_new_requires_a_long_secret() {
+    for secret in [&b""[..], b"secret", &[7; MIN_SECRET_BYTES - 1]] {
+      assert!(JwtProvider::try_new(secret, 60_000).is_err());
+    }
+    let provider =
+      JwtProvider::try_new(&[7; MIN_SECRET_BYTES], 60_000).unwrap();
+    let jwt = provider.encode_sub("user-123").unwrap().jwt;
+    assert_eq!(provider.decode_sub(&jwt).unwrap(), "user-123");
+  }
+
+  #[test]
+  fn test_with_header_algorithm_is_validated() {
+    let now = now();
+    let hs256 = encode_claims_iss_aud(
+      SECRET,
+      "user-123",
+      "my-app",
+      DEFAULT_ISS_AUD,
+      now,
+      now + 60,
+    );
+    // Before or after iss / aud.
+    for provider in [
+      JwtProvider::new(SECRET, 60_000)
+        .with_header(Header::new(Algorithm::HS512))
+        .with_iss("my-app"),
+      JwtProvider::new(SECRET, 60_000)
+        .with_iss("my-app")
+        .with_header(Header::new(Algorithm::HS512)),
+    ] {
+      // The tokens it issues are accepted.
+      let jwt = provider.encode_sub("user-123").unwrap().jwt;
+      assert_eq!(provider.decode_sub(&jwt).unwrap(), "user-123");
+      // Only with the algorithm of the header.
+      assert!(provider.decode_sub(&hs256).is_err());
+    }
   }
 
   #[test]

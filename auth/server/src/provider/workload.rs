@@ -3,8 +3,9 @@
 //! acts as. See [crate::api::token] for the exchange itself.
 
 use std::{
+  collections::HashMap,
   hash::{DefaultHasher, Hash as _, Hasher as _},
-  sync::{Arc, OnceLock},
+  sync::{Arc, Mutex, OnceLock},
   time::Duration,
 };
 
@@ -302,6 +303,68 @@ pub async fn load_verification_keys(
 
 pub fn evict_verification_keys(issuer_id: &str) {
   keys_cache().evict(issuer_id);
+}
+
+// ==============
+// = USER LOCKS =
+// ==============
+
+type UserLocks =
+  Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+
+/// One lock per (issuer id, rule id) with a caller.
+fn user_locks() -> &'static UserLocks {
+  static LOCKS: OnceLock<UserLocks> = OnceLock::new();
+  LOCKS.get_or_init(Default::default)
+}
+
+/// Held while the app gets or creates the user of a rule, see
+/// [lock_workload_user]. Releases the lock when dropped.
+pub struct WorkloadUserLock {
+  key: (String, String),
+  guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for WorkloadUserLock {
+  fn drop(&mut self) {
+    let mut locks =
+      user_locks().lock().unwrap_or_else(|e| e.into_inner());
+    drop(self.guard.take());
+    // Waiting callers hold a clone, which is only taken with the
+    // map locked: nobody but the map holding it means nobody waits.
+    if locks
+      .get(&self.key)
+      .is_some_and(|lock| Arc::strong_count(lock) == 1)
+    {
+      locks.remove(&self.key);
+    }
+  }
+}
+
+/// Serializes the exchanges of one rule (`issuer_id`, `rule_id`)
+/// around [AuthImpl::get_or_create_workload_user]. A CI matrix starts
+/// many jobs at once, and without this all their first exchanges ask
+/// the app for a user which doesn't exist yet at the same moment,
+/// racing to create it. Exchanges of other rules don't wait.
+///
+/// This only covers one instance of the app: apps running several
+/// still need a get or create which is safe under concurrency.
+pub async fn lock_workload_user(
+  issuer_id: &str,
+  rule_id: &str,
+) -> WorkloadUserLock {
+  let key = (issuer_id.to_string(), rule_id.to_string());
+  let lock = user_locks()
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .entry(key.clone())
+    .or_default()
+    .clone();
+  let guard = lock.lock_owned().await;
+  WorkloadUserLock {
+    key,
+    guard: Some(guard),
+  }
 }
 
 // ==============
@@ -777,6 +840,65 @@ mod tests {
       format!("{err:#}").contains("Failed to reach http://***@"),
       "{err:#}"
     );
+  }
+
+  /// Exchanges of one rule get the user one after another, those of
+  /// other rules don't wait, and nothing is left behind in the map.
+  #[tokio::test]
+  async fn test_workload_user_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let holders = Arc::new(AtomicUsize::new(0));
+    let max_holders = Arc::new(AtomicUsize::new(0));
+    let callers = (0..20)
+      .map(|_| {
+        let (holders, max_holders) =
+          (holders.clone(), max_holders.clone());
+        tokio::spawn(async move {
+          let _lock =
+            lock_workload_user("lock-test", "same-rule").await;
+          let now = holders.fetch_add(1, Ordering::SeqCst) + 1;
+          max_holders.fetch_max(now, Ordering::SeqCst);
+          tokio::time::sleep(Duration::from_millis(5)).await;
+          holders.fetch_sub(1, Ordering::SeqCst);
+        })
+      })
+      .collect::<Vec<_>>();
+    // Another rule, while the first one is held.
+    let other = lock_workload_user("lock-test", "other-rule").await;
+    for caller in callers {
+      caller.await.unwrap();
+    }
+    assert_eq!(max_holders.load(Ordering::SeqCst), 1);
+
+    let held = |rule: &str| {
+      user_locks()
+        .lock()
+        .unwrap()
+        .contains_key(&("lock-test".to_string(), rule.to_string()))
+    };
+    assert!(!held("same-rule"));
+    assert!(held("other-rule"));
+    drop(other);
+    assert!(!held("other-rule"));
+
+    // A caller giving up while waiting doesn't block the next one.
+    let first = lock_workload_user("lock-test", "cancelled").await;
+    let waiting = tokio::time::timeout(
+      Duration::from_millis(20),
+      lock_workload_user("lock-test", "cancelled"),
+    )
+    .await;
+    assert!(waiting.is_err());
+    drop(first);
+    let next = tokio::time::timeout(
+      Duration::from_secs(5),
+      lock_workload_user("lock-test", "cancelled"),
+    )
+    .await;
+    assert!(next.is_ok());
+    drop(next);
+    assert!(!held("cancelled"));
   }
 
   #[test]

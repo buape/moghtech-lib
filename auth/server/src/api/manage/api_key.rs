@@ -1,8 +1,8 @@
 use anyhow::{Context as _, anyhow};
 use mogh_auth_client::api::manage::{
-  CreateApiKey, CreateApiKeyResponse, CreateApiKeyV2,
-  CreateApiKeyV2Response, DeleteApiKey, DeleteApiKeyResponse,
-  DeleteApiKeyV2, DeleteApiKeyV2Response,
+  CreateApiKey, CreateApiKeyResponse, CreateSigningKey,
+  CreateSigningKeyResponse, DeleteApiKey, DeleteApiKeyResponse,
+  DeleteSigningKey, DeleteSigningKeyResponse,
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use mogh_resolver::Resolve;
@@ -49,10 +49,15 @@ pub async fn create_api_key<I: AuthImpl + ?Sized>(
   body.cidr_whitelist =
     normalize_cidr_whitelist(auth, body.cidr_whitelist)?;
 
-  let (key, secret, hashed_secret) = generate_api_key_parts(
-    auth.api_key_secret_length(),
-    auth.api_secret_bcrypt_cost(),
-  )?;
+  // bcrypt takes a while, keep it off the async runtime.
+  let secret_length = auth.api_key_secret_length();
+  let bcrypt_cost = auth.api_secret_bcrypt_cost();
+  let (key, secret, hashed_secret) =
+    tokio::task::spawn_blocking(move || {
+      generate_api_key_parts(secret_length, bcrypt_cost)
+    })
+    .await
+    .context("Failed to generate api key")??;
 
   auth
     .create_api_key(user_id.clone(), body, key.clone(), hashed_secret)
@@ -139,11 +144,36 @@ fn normalize_public_key(
     .status_code(StatusCode::BAD_REQUEST)
 }
 
-pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
+/// Public keys are not secret, and requests are recognized by the
+/// public key alone: one which is stored already (for any user) must
+/// not be stored again. Otherwise requests its owner signs could
+/// authenticate as whoever stored it second, and whoever did could
+/// delete it. CONFLICT, without saying whose it is.
+///
+/// Best effort, a concurrent create can race it, the storage has to
+/// keep public keys unique ([AuthImpl::create_signing_key]).
+async fn check_public_key_unused<I: AuthImpl + ?Sized>(
+  auth: &I,
+  public_key: &str,
+) -> mogh_error::Result<()> {
+  if auth
+    .get_signing_key_owner_id(public_key.to_string())
+    .await
+    .is_ok()
+  {
+    return Err(
+      anyhow!("This public key is already in use")
+        .status_code(StatusCode::CONFLICT),
+    );
+  }
+  Ok(())
+}
+
+pub async fn create_signing_key<I: AuthImpl + ?Sized>(
   auth: &I,
   user_id: String,
-  body: CreateApiKeyV2,
-) -> mogh_error::Result<CreateApiKeyV2Response> {
+  body: CreateSigningKey,
+) -> mogh_error::Result<CreateSigningKeyResponse> {
   auth.validate_api_key_name(&body.name)?;
   let cidr_whitelist =
     normalize_cidr_whitelist(auth, body.cidr_whitelist)?;
@@ -158,11 +188,13 @@ pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
       key_pair.public.into_inner(),
     )
   } else {
-    (None, normalize_public_key(public_key)?)
+    let public_key = normalize_public_key(public_key)?;
+    check_public_key_unused(auth, &public_key).await?;
+    (None, public_key)
   };
 
   auth
-    .create_api_key_v2(
+    .create_signing_key(
       user_id,
       CreateApiKey {
         name: body.name,
@@ -173,12 +205,12 @@ pub async fn create_api_key_v2<I: AuthImpl + ?Sized>(
     )
     .await?;
 
-  Ok(CreateApiKeyV2Response { private_key })
+  Ok(CreateSigningKeyResponse { private_key })
 }
 
-impl Resolve<ManageArgs> for CreateApiKeyV2 {
+impl Resolve<ManageArgs> for CreateSigningKey {
   #[instrument(
-  "CreateApiKeyV2",
+    "CreateSigningKey",
     skip_all,
     fields(
       user_id = user.id(),
@@ -192,15 +224,19 @@ impl Resolve<ManageArgs> for CreateApiKeyV2 {
     self,
     ManageArgs { auth, user, .. }: &ManageArgs,
   ) -> Result<Self::Response, Self::Error> {
-    create_api_key_v2(auth.as_ref(), user.id().to_string(), self)
+    create_signing_key(auth.as_ref(), user.id().to_string(), self)
       .await
   }
 }
 
 //
 
-#[instrument("DeleteApiKeyV2", skip_all, fields(user_id, public_key))]
-pub async fn delete_api_key_v2<I: AuthImpl + ?Sized>(
+#[instrument(
+  "DeleteSigningKey",
+  skip_all,
+  fields(user_id, public_key)
+)]
+pub async fn delete_signing_key<I: AuthImpl + ?Sized>(
   auth: &I,
   user_id: &str,
   public_key: String,
@@ -211,28 +247,28 @@ pub async fn delete_api_key_v2<I: AuthImpl + ?Sized>(
     normalize_public_key(&public_key).unwrap_or(public_key);
 
   let expected_user_id =
-    auth.get_api_key_v2_owner_id(public_key.clone()).await?;
+    auth.get_signing_key_owner_id(public_key.clone()).await?;
 
   if user_id != expected_user_id {
     return Err(
-      anyhow!("Api key does not belong to user")
+      anyhow!("Signing key does not belong to user")
         .status_code(StatusCode::FORBIDDEN),
     );
   }
 
-  auth.delete_api_key_v2(public_key).await?;
+  auth.delete_signing_key(public_key).await?;
 
   Ok(())
 }
 
-impl Resolve<ManageArgs> for DeleteApiKeyV2 {
+impl Resolve<ManageArgs> for DeleteSigningKey {
   async fn resolve(
     self,
     ManageArgs { auth, user, .. }: &ManageArgs,
   ) -> Result<Self::Response, Self::Error> {
-    delete_api_key_v2(auth.as_ref(), user.id(), self.public_key)
+    delete_signing_key(auth.as_ref(), user.id(), self.public_key)
       .await?;
-    Ok(DeleteApiKeyV2Response {})
+    Ok(DeleteSigningKeyResponse {})
   }
 }
 
@@ -321,6 +357,110 @@ mod tests {
       let err = normalize_public_key(invalid).unwrap_err();
       assert_eq!(err.status, StatusCode::BAD_REQUEST, "{invalid:?}");
     }
+  }
+
+  /// Knows one public key, owned by `owner`.
+  struct KnownKeyAuth {
+    known: String,
+  }
+
+  impl AuthImpl for KnownKeyAuth {
+    fn new() -> Self {
+      unimplemented!()
+    }
+    fn get_user(
+      &self,
+      _: String,
+    ) -> crate::DynFuture<mogh_error::Result<crate::user::BoxAuthUser>>
+    {
+      unimplemented!()
+    }
+    fn handle_request_authentication(
+      &self,
+      _: crate::RequestAuthentication,
+      _: std::net::IpAddr,
+      _: bool,
+      _: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      unimplemented!()
+    }
+    fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+      unimplemented!()
+    }
+    fn create_signing_key(
+      &self,
+      _: String,
+      _: CreateApiKey,
+      _: String,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      Box::pin(async { Ok(()) })
+    }
+    fn get_signing_key_owner_id(
+      &self,
+      public_key: String,
+    ) -> crate::DynFuture<mogh_error::Result<String>> {
+      let known = public_key == self.known;
+      Box::pin(async move {
+        if known {
+          Ok(String::from("owner"))
+        } else {
+          Err(
+            anyhow!("No signing key found")
+              .status_code(StatusCode::NOT_FOUND),
+          )
+        }
+      })
+    }
+  }
+
+  #[tokio::test]
+  async fn test_create_signing_key_refuses_known_public_key() {
+    let known =
+      mogh_pki::EncodedKeyPair::generate(mogh_pki::PkiKind::OneWay)
+        .unwrap();
+    let auth = KnownKeyAuth {
+      known: known.public().to_string(),
+    };
+    let create = |public_key: String| CreateSigningKey {
+      name: "key".into(),
+      expires: 0,
+      cidr_whitelist: Vec::new(),
+      public_key,
+    };
+    // Also in another encoding.
+    for public_key in
+      [known.public().to_string(), known.public.as_pem()]
+    {
+      let err = create_signing_key(
+        &auth,
+        "someone-else".into(),
+        create(public_key),
+      )
+      .await
+      .err()
+      .unwrap();
+      assert_eq!(err.status, StatusCode::CONFLICT);
+      // Doesn't say whose it is.
+      assert!(!format!("{:#}", err.error).contains("owner"));
+    }
+    // Other keys are created.
+    let other =
+      mogh_pki::EncodedKeyPair::generate(mogh_pki::PkiKind::OneWay)
+        .unwrap();
+    create_signing_key(
+      &auth,
+      "user".into(),
+      create(other.public().to_string()),
+    )
+    .await
+    .unwrap();
+    // Generated key pairs aren't looked up.
+    let res =
+      create_signing_key(&auth, "user".into(), create(String::new()))
+        .await
+        .unwrap();
+    assert!(res.private_key.is_some());
   }
 
   #[test]

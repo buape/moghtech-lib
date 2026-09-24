@@ -7,7 +7,10 @@ use tracing::instrument;
 
 use crate::{
   AuthImpl,
-  api::{login::local::check_username_available, manage::ManageArgs},
+  api::{
+    login::local::{bcrypt_hash, check_username_available},
+    manage::ManageArgs,
+  },
 };
 
 pub async fn update_username<I: AuthImpl + ?Sized>(
@@ -58,7 +61,8 @@ pub async fn update_password<I: AuthImpl + ?Sized>(
   auth.check_username_locked(username)?;
   auth.validate_password(password)?;
   let hashed_password =
-    bcrypt::hash(password.as_bytes(), auth.local_auth_bcrypt_cost())?;
+    bcrypt_hash(password.as_bytes(), auth.local_auth_bcrypt_cost())
+      .await?;
   auth.update_user_password(user_id, hashed_password).await?;
   Ok(())
 }

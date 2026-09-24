@@ -17,7 +17,7 @@ use mogh_auth_client::{
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use mogh_resolver::Resolve;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use zeroize::Zeroize as _;
 
 use crate::{
@@ -29,7 +29,7 @@ use crate::{
   },
   rand::random_string,
   user::AuthUserImpl,
-  validations::validate_public_http_url,
+  validations::{redact_url_credentials, validate_public_http_url},
 };
 
 const MAX_PROVIDER_NAME_LENGTH: usize = 100;
@@ -370,6 +370,32 @@ async fn resolve_managed_provider<I: AuthImpl + ?Sized>(
   Ok(resolved.provider)
 }
 
+/// The (existing, updated) issuer of an OIDC provider
+/// whose url the update changes.
+///
+/// ⚠️ The provider keeps its id, and so the users linked to it: they
+/// are found by the subject the new issuer sends. The new issuer can
+/// log in as every user linked to the provider, so an update of the
+/// url is only for the same identity provider at a new address (a
+/// different one is a new provider, whose new id carries no links).
+/// Changing it is allowed (with the secret entered again, see
+/// [keep_existing_secret]), and logged as a warning.
+fn issuer_change<'a>(
+  config: &'a ExternalLoginProviderConfig,
+  existing: &'a ExternalLoginProviderConfig,
+) -> Option<(&'a str, &'a str)> {
+  let (
+    ExternalLoginProviderConfig::Oidc(config),
+    ExternalLoginProviderConfig::Oidc(existing),
+  ) = (config, existing)
+  else {
+    return None;
+  };
+  let (from, to) = (existing.provider.trim(), config.provider.trim());
+  (from.trim_end_matches('/') != to.trim_end_matches('/'))
+    .then_some((from, to))
+}
+
 /// Validates the updated configuration against the
 /// existing one, and carries over the existing secret.
 fn merge_update(
@@ -406,6 +432,14 @@ pub async fn update_provider<I: AuthImpl + ?Sized>(
 
   let mut existing =
     resolve_managed_provider(auth, &request.id).await?;
+
+  // For the log. A stored url may predate the refusal of credentials.
+  let issuer_change =
+    issuer_change(&request.config, &existing.config).map(
+      |(from, to)| {
+        (redact_url_credentials(from), redact_url_credentials(to))
+      },
+    );
 
   // Wipe the secrets held here however the checks turn out.
   let merged = merge_update(
@@ -455,6 +489,18 @@ pub async fn update_provider<I: AuthImpl + ?Sized>(
 
   // Drops the client holding the previous secret.
   evict_built_provider(&item.provider.id);
+
+  if let Some((from, to)) = issuer_change {
+    warn!(
+      admin_id = user.id(),
+      admin = user.username(),
+      provider_id = item.provider.id,
+      provider = item.provider.name,
+      from,
+      to,
+      "External login provider issuer changed. The users linked to the provider now log in through the new issuer."
+    );
+  }
 
   info!(
     admin_id = user.id(),
@@ -1053,6 +1099,42 @@ mod tests {
       client_secret: secret.into(),
       ..Default::default()
     })
+  }
+
+  #[test]
+  fn test_issuer_change() {
+    let oidc = |provider: &str| {
+      ExternalLoginProviderConfig::Oidc(OidcConfig {
+        provider: provider.to_string(),
+        ..Default::default()
+      })
+    };
+    let existing = oidc("https://idp.example.com/realms/a");
+    assert_eq!(
+      issuer_change(
+        &oidc("https://idp.example.com/realms/b"),
+        &existing
+      ),
+      Some((
+        "https://idp.example.com/realms/a",
+        "https://idp.example.com/realms/b"
+      ))
+    );
+    // Cosmetic edits are not a change of issuer.
+    for same in [
+      "https://idp.example.com/realms/a",
+      "https://idp.example.com/realms/a/",
+      " https://idp.example.com/realms/a ",
+    ] {
+      assert_eq!(
+        issuer_change(&oidc(same), &existing),
+        None,
+        "{same}"
+      );
+    }
+    let github =
+      ExternalLoginProviderConfig::Github(Default::default());
+    assert_eq!(issuer_change(&github, &github), None);
   }
 
   #[tokio::test]

@@ -85,3 +85,49 @@ impl PasskeyProvider {
       .map(Passkey)
   }
 }
+
+/// A passkey with `cred_id` for tests, in the form it is stored.
+/// Its key is made up, it never verifies an assertion.
+#[cfg(test)]
+pub(crate) fn test_passkey(cred_id: &[u8]) -> Passkey {
+  use data_encoding::BASE64URL_NOPAD;
+  serde_json::from_value(serde_json::json!({
+    "cred": {
+      "cred_id": BASE64URL_NOPAD.encode(cred_id),
+      "cred": {
+        "type_": "ES256",
+        "key": {
+          "EC_EC2": {
+            "curve": "SECP256R1",
+            "x": BASE64URL_NOPAD.encode(&[2; 32]),
+            "y": BASE64URL_NOPAD.encode(&[3; 32]),
+          }
+        }
+      },
+      "counter": 1,
+      "transports": null,
+      "user_verified": true,
+      "backup_eligible": false,
+      "backup_state": false,
+      "registration_policy": "required",
+      "extensions": {},
+      "attestation": { "data": "None", "metadata": "None" },
+      "attestation_format": "none",
+    }
+  }))
+  .expect("Invalid test passkey")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_start_passkey_authentication() {
+    let provider =
+      PasskeyProvider::new("https://example.com").unwrap();
+    let passkey = test_passkey(&[1; 16]);
+    assert_eq!(passkey.0.cred_id().as_slice(), &[1; 16]);
+    provider.start_passkey_authentication(passkey).unwrap();
+  }
+}

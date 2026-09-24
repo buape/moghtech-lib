@@ -9,6 +9,28 @@
 //! - The user must already exist, the endpoint never signs anyone up.
 //! - Users who need a second factor for external logins are rejected,
 //!   there is nobody to ask for it.
+//! - The app token of a user counts as a login at the time the
+//!   provider authenticated the user (the token's `auth_time`, else its
+//!   `iat`), not at the exchange: a provider token can be exchanged
+//!   again until it expires, so an old one is no recent login for
+//!   [AuthImpl::reauthentication_window_secs].
+//!
+//! Errors are OAuth errors (RFC 6749 section 5.2). A malformed request
+//! is `invalid_request`, and a token which is rejected for any reason
+//! (signature, audience, expiry, no matching rule, the login rules) is
+//! `invalid_grant`, as for the assertion grants of RFC 7521 / 7523 and
+//! common token services. This deliberately deviates from RFC 8693
+//! section 2.2.2, which would report a rejected `subject_token` as
+//! `invalid_request` too: clients can tell a request to fix apart from
+//! a token to replace.
+//!
+//! Except when another login provider / trusted issuer of the same
+//! issuer couldn't be loaded: a token the others rejected for its
+//! signature, audience, expiry or a provider's `allowed_groups` is
+//! then `503 temporarily_unavailable`, since the one which couldn't be
+//! asked might have accepted it. A token one of them verified whose
+//! user is unknown, or which matches no rule, stays `invalid_grant`,
+//! as does a user one of them accepted who fails the login rules.
 //!
 //! Apps serving the exchange on another surface (a Vault compatible
 //! `auth/jwt/login`) use [exchange_token] and [token_exchange_error].
@@ -52,19 +74,24 @@ use crate::{
     },
     load_cache::LoadFailedRecently,
     token_exchange::{
-      MAX_SUBJECT_TOKEN_LENGTH, TokenVerificationKeys, issuers_match,
-      unverified_issuer,
+      MAX_SUBJECT_TOKEN_LENGTH, TokenVerificationKeys,
+      authenticated_at, issuers_match, unverified_issuer,
     },
     workload::{
       Claims, WorkloadIdentity, list_trusted_issuers,
-      load_verification_keys, lookup_claim, match_rule,
+      load_verification_keys, lock_workload_user, lookup_claim,
+      match_rule,
     },
   },
   user::BoxAuthUser,
 };
 
-const GOOGLE_ISSUERS: [&str; 2] =
-  ["https://accounts.google.com", "accounts.google.com"];
+/// The issuer of Google ID tokens. Google documents that tokens may
+/// also carry the scheme-less `accounts.google.com`, which can't
+/// verify: the token parser requires `iss` to be a url. Those are
+/// left to "no login provider accepts tokens of this issuer" rather
+/// than routed to a provider which always rejects them.
+const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
 pub fn router<I: AuthImpl>() -> Router {
   Router::new().route("/token", post(token::<I>))
@@ -378,9 +405,9 @@ fn exchange_candidates(
       ExternalLoginProviderConfig::Oidc(config) => {
         issuers_match(&config.provider, issuer)
       }
-      ExternalLoginProviderConfig::Google(_) => GOOGLE_ISSUERS
-        .iter()
-        .any(|google| issuers_match(google, issuer)),
+      ExternalLoginProviderConfig::Google(_) => {
+        issuers_match(GOOGLE_ISSUER, issuer)
+      }
       ExternalLoginProviderConfig::Github(_) => false,
     })
     .collect()
@@ -468,6 +495,10 @@ pub(crate) struct VerifiedExchange {
   pub provider: ExternalLoginProvider,
   pub user: BoxAuthUser,
   pub info: ExternalLoginInfo,
+  /// When the provider authenticated the user (unix seconds), which
+  /// the issued app token counts as the login time, see
+  /// [JwtProvider::encode_sub_with_auth_time][crate::provider::jwt::JwtProvider::encode_sub_with_auth_time].
+  pub authenticated_at: u64,
 }
 
 /// The part shared by the `/token` endpoint and the login api: finds
@@ -555,14 +586,20 @@ where
       provider,
       user,
       info,
+      // The token is verified at this point. Every verified token
+      // has an `iat`, one without counts as a login long ago.
+      authenticated_at: authenticated_at(token).unwrap_or_default(),
     }));
   }
 
-  // Report the furthest any provider got.
+  // Report the furthest any provider got. A provider which couldn't
+  // be asked might have accepted the token another one rejected
+  // (eg. for another audience, or its 'allowed_groups'): a temporary
+  // failure, not the token's.
   if let Some(e) = unknown_user {
     return Err(e);
   }
-  match rejected.or(unavailable) {
+  match unavailable.or(rejected) {
     // Only describes the token the caller presented
     Some(e) if e.status.is_client_error() => {
       Err(invalid_grant(format!("{:#}", e.error)))
@@ -697,11 +734,15 @@ where
     }));
   }
 
-  // Report the furthest any issuer got.
+  // Report the furthest any issuer got: one which verified the
+  // token, else one which couldn't be asked. Its keys might have
+  // verified a token the others rejected (eg. the other cluster of
+  // a shared issuer, which has other keys), so that's a temporary
+  // failure (503), not the token's.
   Err(
     unmatched
-      .or(rejected)
       .or(unavailable)
+      .or(rejected)
       .unwrap_or_else(|| invalid_grant("Token was rejected")),
   )
 }
@@ -781,6 +822,9 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     .collect::<Vec<_>>()
     .join(" ");
 
+  // The first exchanges of a rule (a CI matrix starting) would
+  // otherwise all race to create its user.
+  let user_lock = lock_workload_user(&issuer.id, &rule.id).await;
   let user_id = auth
     .get_or_create_workload_user(WorkloadIdentity {
       issuer_id: issuer.id.clone(),
@@ -791,6 +835,7 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
       claims,
     })
     .await?;
+  drop(user_lock);
   let user = auth.get_user(user_id).await?;
 
   // Without the flag the management API wouldn't
@@ -876,6 +921,7 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
     provider,
     user,
     info,
+    authenticated_at,
   }: VerifiedExchange,
   issued_token_type: &str,
 ) -> mogh_error::Result<ExchangedToken> {
@@ -906,7 +952,11 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
     ))
     .await?;
 
-  let jwt = auth.jwt_provider().encode_sub(user.id())?;
+  // A login when the provider authenticated the user, not now: the
+  // token may be replayed until it expires.
+  let jwt = auth
+    .jwt_provider()
+    .encode_sub_with_auth_time(user.id(), authenticated_at)?;
 
   info!(
     user_id = user.id(),
@@ -931,7 +981,13 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Mutex;
+  use std::{
+    sync::{
+      Mutex,
+      atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+  };
 
   use anyhow::anyhow;
 
@@ -1002,6 +1058,11 @@ mod tests {
     /// The user the app returns for workloads
     workload_user: TestUser,
     workloads: Arc<Mutex<Vec<WorkloadIdentity>>>,
+    /// How long getting the workload user takes.
+    workload_user_delay: Duration,
+    /// Calls getting the workload user right now, and at most.
+    workload_user_calls: Arc<AtomicUsize>,
+    max_workload_user_calls: Arc<AtomicUsize>,
     /// The user linked to ("oidc", "subject-123"), if any
     user: Option<TestUser>,
     sync_fails: bool,
@@ -1022,6 +1083,9 @@ mod tests {
           ..Default::default()
         },
         workloads: Default::default(),
+        workload_user_delay: Duration::ZERO,
+        workload_user_calls: Default::default(),
+        max_workload_user_calls: Default::default(),
         user,
         sync_fails: false,
         synced: Default::default(),
@@ -1090,7 +1154,18 @@ mod tests {
       identity: WorkloadIdentity,
     ) -> crate::DynFuture<mogh_error::Result<String>> {
       self.workloads.lock().unwrap().push(identity);
-      Box::pin(async { Ok("workload-user".to_string()) })
+      let delay = self.workload_user_delay;
+      let calls = self.workload_user_calls.clone();
+      let max_calls = self.max_workload_user_calls.clone();
+      Box::pin(async move {
+        let now = calls.fetch_add(1, Ordering::SeqCst) + 1;
+        max_calls.fetch_max(now, Ordering::SeqCst);
+        if !delay.is_zero() {
+          tokio::time::sleep(delay).await;
+        }
+        calls.fetch_sub(1, Ordering::SeqCst);
+        Ok("workload-user".to_string())
+      })
     }
 
     fn get_user(
@@ -1421,6 +1496,226 @@ mod tests {
     let token = workload_token(12345, "refs/heads/release/1").mint();
     assert!(run(&auth, token).await.is_ok());
     assert_eq!(auth.workloads.lock().unwrap()[0].issuer_id, "ci");
+  }
+
+  /// A CI matrix starting: every job's first exchange asks the app
+  /// for the user of the rule, which doesn't exist yet. They are asked
+  /// one after another, so the app doesn't race to create it.
+  #[tokio::test]
+  async fn test_workload_user_is_got_one_exchange_at_a_time() {
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.issuers[0].id = "concurrent-ci".to_string();
+    auth.workload_user_delay = Duration::from_millis(20);
+    let auth = Arc::new(auth);
+    let exchanges = (0..8)
+      .map(|_| {
+        let auth = auth.clone();
+        let token =
+          workload_token(12345, "refs/heads/release/1").mint();
+        tokio::spawn(async move { run(&auth, token).await })
+      })
+      .collect::<Vec<_>>();
+    for exchange in exchanges {
+      exchange.await.unwrap().unwrap();
+    }
+    assert_eq!(auth.workloads.lock().unwrap().len(), 8);
+    assert_eq!(
+      auth.max_workload_user_calls.load(Ordering::SeqCst),
+      1
+    );
+  }
+
+  /// Issuers sharing an issuer url, and the one which could have
+  /// verified the token is down: the caller is told to retry (503),
+  /// not that its token is bad because the other one rejected it.
+  #[tokio::test]
+  async fn test_workload_unavailable_issuer_wins_over_a_rejection() {
+    let token =
+      || workload_token(12345, "refs/heads/release/1").mint();
+    let mut other_cluster = trusted_issuer(vec![deploy_rule()]);
+    other_cluster.id = "shared-other-cluster".to_string();
+    other_cluster.keys = TrustedIssuerKeys::Static(other_jwks_json());
+    let mut down = trusted_issuer(vec![deploy_rule()]);
+    down.id = "shared-down-cluster".to_string();
+    down.name = "Down".to_string();
+    down.keys = TrustedIssuerKeys::Static("broken".into());
+
+    for issuers in [
+      vec![other_cluster.clone(), down.clone()],
+      vec![down.clone(), other_cluster.clone()],
+    ] {
+      let mut auth = workload_auth(Vec::new());
+      auth.issuers = issuers;
+      let err = run(&auth, token()).await.unwrap_err();
+      assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+      let (status, body) = token_exchange_error(&err);
+      assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+      assert_eq!(body.error, "temporarily_unavailable");
+    }
+
+    // One which verified the token (and matched no rule) still
+    // says so: that is the token's, whatever the others would say.
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.issuers[0].id = "shared-working-cluster".to_string();
+    auth.issuers.push(down);
+    let err = run(
+      &auth,
+      workload_token(99999, "refs/heads/release/1").mint(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&err), "invalid_grant");
+    assert!(err.error.to_string().contains("matches no rule"));
+  }
+
+  /// The same for login providers sharing an issuer.
+  #[tokio::test]
+  async fn test_unavailable_provider_wins_over_a_rejection() {
+    let mut auth = TestAuth::with_user(Some(TestUser {
+      external_skip_2fa: true,
+      ..Default::default()
+    }));
+    // Another client at the same issuer, which rejects the token
+    // (issued to the 'oidc' client) for its audience.
+    let mut other_client = oidc_provider("other", true);
+    let ExternalLoginProviderConfig::Oidc(config) =
+      &mut other_client.config
+    else {
+      unreachable!()
+    };
+    config.client_id = "other-client-id".to_string();
+    auth.providers = vec![other_client, oidc_provider("oidc", true)];
+
+    let err = exchange(
+      &auth,
+      IP,
+      TokenExchangeRequest::id_token(token().mint()),
+      |provider: ExternalLoginProvider| async move {
+        if provider.id == "oidc" {
+          return Err(
+            anyhow!("Login provider 'OIDC' is not available")
+              .status_code(StatusCode::SERVICE_UNAVAILABLE),
+          );
+        }
+        load_client(provider).await
+      },
+      load_issuer_keys,
+      None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, body) = token_exchange_error(&err);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body.error, "temporarily_unavailable");
+    assert!(auth.synced.lock().unwrap().is_empty());
+  }
+
+  /// A provider which verifies the token but refuses the user for its
+  /// 'allowed_groups' counts as a rejection too: the one which is
+  /// down might allow other groups.
+  #[tokio::test]
+  async fn test_unavailable_provider_wins_over_allowed_groups() {
+    let auth = |providers| {
+      let mut auth = TestAuth::with_user(Some(TestUser {
+        external_skip_2fa: true,
+        ..Default::default()
+      }));
+      auth.providers = providers;
+      auth
+    };
+    // Verifies the token (issued to its client), which carries no
+    // groups, so the user is refused.
+    let mut gated = oidc_provider("gated", true);
+    let ExternalLoginProviderConfig::Oidc(config) = &mut gated.config
+    else {
+      unreachable!()
+    };
+    config.allowed_groups = vec!["admins".to_string()];
+    let run = |auth: TestAuth| async move {
+      exchange(
+        &auth,
+        IP,
+        TokenExchangeRequest::id_token(token().mint()),
+        |provider: ExternalLoginProvider| async move {
+          if provider.id == "down" {
+            return Err(
+              anyhow!("Login provider 'OIDC' is not available")
+                .status_code(StatusCode::SERVICE_UNAVAILABLE),
+            );
+          }
+          load_client(provider).await
+        },
+        load_issuer_keys,
+        None,
+      )
+      .await
+      .unwrap_err()
+    };
+
+    // Alone, that is the token's
+    let err = run(auth(vec![gated.clone()])).await;
+    assert_eq!(code(&err), "invalid_grant");
+    assert!(err.error.to_string().contains("groups"));
+
+    for providers in [
+      vec![gated.clone(), oidc_provider("down", true)],
+      vec![oidc_provider("down", true), gated.clone()],
+    ] {
+      let err = run(auth(providers)).await;
+      assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+      let (status, body) = token_exchange_error(&err);
+      assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+      assert_eq!(body.error, "temporarily_unavailable");
+    }
+  }
+
+  /// A provider token can be exchanged again until it expires. The app
+  /// token counts as a login when the provider authenticated the user,
+  /// so an old one is no recent login for the reauthentication window.
+  #[tokio::test]
+  async fn test_exchange_login_time_is_the_providers() {
+    let auth = TestAuth::with_user(Some(TestUser {
+      external_skip_2fa: true,
+      ..Default::default()
+    }));
+    let now = chrono::Utc::now().timestamp() as u64;
+    let auth = &auth;
+    let authenticated_at =
+      |token: TestToken<UsernameAdditionalClaims>| async move {
+        let response = run(auth, token.mint()).await.unwrap();
+        auth
+          .jwt
+          .decode_claims(&response.access_token)
+          .unwrap()
+          .authenticated_at()
+      };
+
+    // Issued (and so authenticated) half an hour ago
+    let at = authenticated_at(TestToken {
+      issued_ago: chrono::Duration::minutes(30),
+      expires_in: chrono::Duration::hours(8),
+      ..token()
+    })
+    .await;
+    assert!(at.abs_diff(now - 30 * 60) <= 5, "{at}");
+
+    // Issued just now, for a login hours ago (eg. refreshed)
+    let at = authenticated_at(TestToken {
+      issued_ago: chrono::Duration::zero(),
+      auth_time_ago: Some(chrono::Duration::hours(3)),
+      ..token()
+    })
+    .await;
+    assert!(at.abs_diff(now - 3 * 60 * 60) <= 5, "{at}");
+
+    // Freshly issued: a recent login
+    let at = authenticated_at(TestToken {
+      issued_ago: chrono::Duration::zero(),
+      ..token()
+    })
+    .await;
+    assert!(at.abs_diff(now) <= 5, "{at}");
   }
 
   /// Static issuers come from the app configuration. Rules without
@@ -1843,7 +2138,8 @@ mod tests {
     // Trailing slash tolerant
     assert_eq!(ids(&format!("{ISSUER}/")), ["oidc"]);
     assert_eq!(ids("https://accounts.google.com"), ["google"]);
-    assert_eq!(ids("accounts.google.com"), ["google"]);
+    // Can't verify (`iss` must be a url), so not routed to Google.
+    assert!(ids("accounts.google.com").is_empty());
     // Github never takes part
     assert!(ids("https://github.com").is_empty());
     assert!(ids("https://evil.example.com").is_empty());

@@ -25,6 +25,25 @@ pub const MAX_SUBJECT_TOKEN_LENGTH: usize = 16 * 1024;
 /// enforcing the maximum token age.
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
 
+/// The only algorithms tokens are verified with: signatures by a
+/// key the provider publishes. Shared secrets (`HS256`), no
+/// signature (`none`), and anything added in the future never are.
+const ASYMMETRIC_ALGS: [CoreJwsSigningAlgorithm; 10] = {
+  use CoreJwsSigningAlgorithm::*;
+  [
+    RsaSsaPkcs1V15Sha256,
+    RsaSsaPkcs1V15Sha384,
+    RsaSsaPkcs1V15Sha512,
+    EcdsaP256Sha256,
+    EcdsaP384Sha384,
+    EcdsaP521Sha512,
+    RsaSsaPssSha256,
+    RsaSsaPssSha384,
+    RsaSsaPssSha512,
+    EdDsa,
+  ]
+};
+
 /// What is needed to verify tokens signed by a provider.
 pub struct TokenVerificationKeys {
   issuer: IssuerUrl,
@@ -36,22 +55,10 @@ impl TokenVerificationKeys {
   /// For issuers without provider metadata (workload identity).
   /// Any asymmetric algorithm the keys support is accepted.
   pub fn new(issuer: IssuerUrl, jwks: CoreJsonWebKeySet) -> Self {
-    use CoreJwsSigningAlgorithm::*;
     Self {
       issuer,
       jwks,
-      signing_algs: vec![
-        RsaSsaPkcs1V15Sha256,
-        RsaSsaPkcs1V15Sha384,
-        RsaSsaPkcs1V15Sha512,
-        EcdsaP256Sha256,
-        EcdsaP384Sha384,
-        EcdsaP521Sha512,
-        RsaSsaPssSha256,
-        RsaSsaPssSha384,
-        RsaSsaPssSha512,
-        EdDsa,
-      ],
+      signing_algs: ASYMMETRIC_ALGS.to_vec(),
     }
   }
 
@@ -212,15 +219,37 @@ fn check_token_age(
 }
 
 fn is_asymmetric(alg: &CoreJwsSigningAlgorithm) -> bool {
-  use CoreJwsSigningAlgorithm::*;
-  match alg {
-    RsaSsaPkcs1V15Sha256 | RsaSsaPkcs1V15Sha384
-    | RsaSsaPkcs1V15Sha512 | EcdsaP256Sha256 | EcdsaP384Sha384
-    | EcdsaP521Sha512 | RsaSsaPssSha256 | RsaSsaPssSha384
-    | RsaSsaPssSha512 | EdDsa => true,
-    // Shared secrets, no signature, and anything added in the future
-    _ => false,
-  }
+  ASYMMETRIC_ALGS.contains(alg)
+}
+
+/// When the provider authenticated the user a token is for: its
+/// `auth_time` claim (OIDC), else when it was issued (`iat`). Unix
+/// seconds, at most now: a provider clock running ahead doesn't make
+/// the login any more recent. `None` without either claim.
+///
+/// Reads the payload **without verifying anything**, only use it on
+/// a token which was verified. Crate private for that reason.
+pub(crate) fn authenticated_at(token: &str) -> Option<u64> {
+  let now = u64::try_from(unix_timestamp_secs()).unwrap_or_default();
+  authenticated_at_from(&unverified_payload(token)?, now)
+}
+
+fn authenticated_at_from(
+  payload: &serde_json::Map<String, serde_json::Value>,
+  now: u64,
+) -> Option<u64> {
+  // Some issuers write timestamps as floats. One before 1970 is
+  // as good as a long time ago.
+  let timestamp = |claim: &str| {
+    let value = payload.get(claim)?;
+    value
+      .as_u64()
+      .or_else(|| value.as_i64().map(|_| 0))
+      .or_else(|| value.as_f64().map(|value| value.max(0.0) as u64))
+  };
+  timestamp("auth_time")
+    .or_else(|| timestamp("iat"))
+    .map(|at| at.min(now))
 }
 
 /// The payload of a JWT, **without verifying anything**.
@@ -355,6 +384,9 @@ pub(crate) mod test_tokens {
     pub audiences: Vec<String>,
     pub expires_in: Duration,
     pub issued_ago: Duration,
+    /// How long ago the provider authenticated the user
+    /// (`auth_time`), not set by default.
+    pub auth_time_ago: Option<Duration>,
     pub signer: Signer,
     pub additional_claims: AC,
   }
@@ -367,6 +399,7 @@ pub(crate) mod test_tokens {
         audiences: vec![CLIENT_ID.to_string()],
         expires_in: Duration::minutes(5),
         issued_ago: Duration::minutes(1),
+        auth_time_ago: None,
         signer: Signer::Provider,
         additional_claims,
       }
@@ -383,7 +416,8 @@ pub(crate) mod test_tokens {
             "user@example.com".to_string(),
           ))),
         self.additional_claims,
-      );
+      )
+      .set_auth_time(self.auth_time_ago.map(|ago| Utc::now() - ago));
       type Token<AC> = IdToken<
         AC,
         CoreGenderClaim,
@@ -680,6 +714,146 @@ mod tests {
     assert!(check_token_age(i64::MIN, i64::MAX, u64::MAX).is_ok());
     assert!(check_token_age(i64::MAX, i64::MIN, 1).is_err());
     assert!(check_token_age(i64::MIN, i64::MAX, 0).is_ok());
+  }
+
+  /// The keys of trusted issuers (workload identity) are not built
+  /// from provider metadata, their algorithms are a list of their own.
+  /// This path can issue admin tokens, so the algorithm confusion
+  /// tests of [test_tampered_and_unsigned_tokens_are_rejected] and
+  /// [test_shared_secret_signature_is_rejected] are repeated for it.
+  #[test]
+  fn test_workload_keys_only_verify_asymmetric_signatures() {
+    let keys = TokenVerificationKeys::new(
+      IssuerUrl::new(ISSUER.to_string()).unwrap(),
+      serde_json::from_str(&jwks_json()).unwrap(),
+    );
+    assert!(keys.signing_algs.iter().all(is_asymmetric));
+    assert!(
+      !keys.signing_algs.contains(&CoreJwsSigningAlgorithm::None)
+    );
+    assert!(
+      !keys
+        .signing_algs
+        .contains(&CoreJwsSigningAlgorithm::HmacSha256)
+    );
+    let audiences = [CLIENT_ID.to_string()];
+    let verify =
+      |token: &str| keys.verify_payload(token, &audiences, 0);
+
+    let valid = token().mint();
+    assert_eq!(verify(&valid).unwrap()["sub"], "subject-123");
+
+    // HS256, keyed with a secret or with the published public key
+    let jwks = jwks_json();
+    let public_key: &'static str = Box::leak(jwks.into_boxed_str());
+    for secret in ["client-secret", public_key] {
+      let hmac = TestToken {
+        signer: Signer::Hmac(secret),
+        ..token()
+      }
+      .mint();
+      assert!(verify(&hmac).is_err());
+    }
+
+    let (header, rest) = valid.split_once('.').unwrap();
+    let (_, signature) = rest.split_once('.').unwrap();
+    let forged_payload = BASE64URL_NOPAD.encode(
+      format!(
+        r#"{{"iss":"{ISSUER}","sub":"admin-workload","aud":["{CLIENT_ID}"],"exp":4102444800,"iat":1}}"#
+      )
+      .as_bytes(),
+    );
+    // Another payload under the original signature
+    let tampered = format!("{header}.{forged_payload}.{signature}");
+    assert!(verify(&tampered).is_err());
+    // alg none, no signature
+    for none_header in [
+      r#"{"alg":"none","typ":"JWT"}"#,
+      r#"{"alg":"none"}"#,
+      r#"{"alg":"None"}"#,
+    ] {
+      let none_header =
+        BASE64URL_NOPAD.encode(none_header.as_bytes());
+      let unsigned = format!("{none_header}.{forged_payload}.");
+      assert!(verify(&unsigned).is_err(), "{unsigned}");
+      let unsigned =
+        format!("{none_header}.{forged_payload}.{signature}");
+      assert!(verify(&unsigned).is_err(), "{unsigned}");
+    }
+  }
+
+  /// Even with a shared secret algorithm allowed, the verifier has no
+  /// client secret to check it with: a second guard, independent of
+  /// the list of algorithms.
+  #[test]
+  fn test_no_client_secret_to_verify_shared_secret_signatures() {
+    let mut keys = keys();
+    keys.signing_algs.push(CoreJwsSigningAlgorithm::HmacSha256);
+    let hmac = TestToken {
+      signer: Signer::Hmac("client-secret"),
+      ..token()
+    }
+    .mint();
+    let audiences = [CLIENT_ID.to_string()];
+    assert!(keys.verify_payload(&hmac, &audiences, 0).is_err());
+  }
+
+  #[test]
+  fn test_authenticated_at() {
+    let now = 1_800_000_000;
+    let at = |payload: serde_json::Value| {
+      authenticated_at_from(payload.as_object().unwrap(), now)
+    };
+    // When the provider authenticated the user, not when it
+    // issued this token (eg. refreshed without a login).
+    assert_eq!(
+      at(
+        serde_json::json!({ "auth_time": now - 3600, "iat": now - 60 })
+      ),
+      Some(now - 3600)
+    );
+    assert_eq!(
+      at(serde_json::json!({ "iat": now - 60 })),
+      Some(now - 60)
+    );
+    assert_eq!(
+      at(serde_json::json!({ "auth_time": 1.5e9, "iat": now })),
+      Some(1_500_000_000)
+    );
+    // Not in the future, and nothing before 1970
+    assert_eq!(
+      at(serde_json::json!({ "auth_time": now + 600 })),
+      Some(now)
+    );
+    assert_eq!(at(serde_json::json!({ "auth_time": -5 })), Some(0));
+    assert_eq!(at(serde_json::json!({ "auth_time": -5.5 })), Some(0));
+    // Not a timestamp
+    assert_eq!(
+      at(serde_json::json!({ "auth_time": "yesterday", "iat": now })),
+      Some(now)
+    );
+    assert_eq!(at(serde_json::json!({})), None);
+
+    // Of a minted token
+    let issued = TestToken {
+      issued_ago: Duration::minutes(30),
+      ..token()
+    }
+    .mint();
+    let at = authenticated_at(&issued).unwrap();
+    let expected =
+      (chrono::Utc::now() - Duration::minutes(30)).timestamp() as u64;
+    assert!(at.abs_diff(expected) <= 5, "{at} / {expected}");
+    let refreshed = TestToken {
+      auth_time_ago: Some(Duration::hours(3)),
+      ..token()
+    }
+    .mint();
+    let at = authenticated_at(&refreshed).unwrap();
+    let expected =
+      (chrono::Utc::now() - Duration::hours(3)).timestamp() as u64;
+    assert!(at.abs_diff(expected) <= 5, "{at} / {expected}");
+    assert_eq!(authenticated_at("not-a-jwt"), None);
   }
 
   #[test]

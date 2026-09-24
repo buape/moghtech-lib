@@ -46,6 +46,7 @@ where
     provider,
     user,
     info,
+    authenticated_at,
   } = verify_exchange(auth, token, load_client, None)
     .await?
     .context(
@@ -86,10 +87,16 @@ where
         "User logged in (token exchange)"
       );
 
-      JwtOrTwoFactor::Jwt(auth.jwt_provider().encode_sub(user.id())?)
+      // A login when the provider authenticated the user, not now:
+      // the token may be replayed until it expires.
+      JwtOrTwoFactor::Jwt(
+        auth
+          .jwt_provider()
+          .encode_sub_with_auth_time(user.id(), authenticated_at)?,
+      )
     }
-    // The JWT is only issued once the second factor
-    // is completed on the same session.
+    // The JWT is only issued once the second factor is completed
+    // on the same session, which makes it a login right then.
     Some(ExternalTwoFactor::Passkey(response)) => {
       JwtOrTwoFactor::Passkey(response)
     }
@@ -347,6 +354,34 @@ mod tests {
         crate::LoginKind::Provider { provider_id, .. } if provider_id == "oidc"
       ));
     }
+  }
+
+  /// Like `/token`: the JWT counts as a login when the provider
+  /// authenticated the user, not now. A provider token can be
+  /// exchanged again until it expires.
+  #[tokio::test]
+  async fn test_jwt_is_a_login_when_the_provider_authenticated() {
+    let auth = TestAuth::with_user(Some(TestUser::default()));
+    let session = session();
+    let now = chrono::Utc::now().timestamp() as u64;
+    let token = TestToken {
+      issued_ago: chrono::Duration::minutes(30),
+      expires_in: chrono::Duration::hours(8),
+      ..TestToken::new(UsernameAdditionalClaims {
+        username: None,
+        extra: Default::default(),
+      })
+    }
+    .mint();
+    let JwtOrTwoFactor::Jwt(jwt) =
+      run(&auth, &session, &token).await.unwrap()
+    else {
+      panic!("expected a jwt")
+    };
+    let claims = auth.jwt.decode_claims(&jwt.jwt).unwrap();
+    assert!(claims.authenticated_at().abs_diff(now - 30 * 60) <= 5);
+    // Valid like any other token
+    assert!(claims.iat.abs_diff(now) <= 5);
   }
 
   /// Where the `/token` endpoint has to reject the

@@ -87,13 +87,21 @@ impl StandardCallbackQuery {
   }
 }
 
+/// The longest post-login `redirect` which is kept. The login
+/// is started by unauthenticated requests, which store it on the
+/// session until the callback.
+pub const MAX_REDIRECT_LENGTH: usize = 2048;
+
 /// Only allow post-login redirects back to the app itself,
 /// preventing open redirects through the `redirect` query param.
 /// The redirect is resolved against `host` (so absolute urls, paths
 /// and relative paths all work) and must be http(s) on the same
 /// hostname, any scheme or port. Anything else (other origins,
 /// protocol-relative `//evil`, scheme tricks) is dropped.
-fn sanitize_redirect(host: &str, redirect: &str) -> Option<String> {
+fn sanitize_redirect(
+  host: &str,
+  redirect: &str,
+) -> Option<reqwest::Url> {
   let redirect = redirect.trim();
   if redirect.is_empty() {
     return None;
@@ -107,25 +115,45 @@ fn sanitize_redirect(host: &str, redirect: &str) -> Option<String> {
   if !target.host_str()?.eq_ignore_ascii_case(host_name) {
     return None;
   }
-  Some(target.to_string())
+  Some(target)
 }
 
+/// The `redirect` of a login as it is stored on the session until
+/// the callback: sanitized ([sanitize_redirect]), and dropped if longer
+/// than [MAX_REDIRECT_LENGTH]. Without one, the login ends at `host`.
+fn login_redirect(
+  host: &str,
+  redirect: Option<String>,
+) -> Option<String> {
+  redirect
+    .filter(|redirect| redirect.len() <= MAX_REDIRECT_LENGTH)
+    .and_then(|redirect| sanitize_redirect(host, &redirect))
+    .map(String::from)
+    .filter(|redirect| redirect.len() <= MAX_REDIRECT_LENGTH)
+}
+
+/// The url the browser is sent to after an external login, with the
+/// `extra` query for the app (`redeem_ready=true`, `totp=true`,
+/// `passkey=...`). The query is placed before the redirect's fragment,
+/// where the app reads it.
 fn format_redirect(
   host: &str,
   redirect: Option<&str>,
   extra: &str,
 ) -> Redirect {
-  let redirect_url = if let Some(redirect) =
+  let redirect_url = if let Some(mut redirect) =
     redirect.and_then(|redirect| sanitize_redirect(host, redirect))
   {
-    let splitter = if extra.is_empty() {
-      ""
-    } else if redirect.contains('?') {
-      "&"
-    } else {
-      "?"
-    };
-    format!("{redirect}{splitter}{extra}")
+    if !extra.is_empty() {
+      let query = match redirect.query() {
+        Some(query) if !query.is_empty() => {
+          format!("{query}&{extra}")
+        }
+        _ => extra.to_string(),
+      };
+      redirect.set_query(Some(&query));
+    }
+    redirect.to_string()
   } else {
     format!(
       "{host}{}{extra}",
@@ -135,7 +163,12 @@ fn format_redirect(
   Redirect::to(&redirect_url)
 }
 
+/// The length of the suffix [unique_username] appends.
+const UNIQUE_USERNAME_SUFFIX_LENGTH: usize = 6;
+
 /// Append a random suffix to the username if it is already taken.
+/// The name is shortened to make room for it, so the result
+/// is at most [MAX_USERNAME_LENGTH][crate::validations::MAX_USERNAME_LENGTH].
 async fn unique_username<I: AuthImpl>(
   auth: &I,
   mut username: String,
@@ -145,10 +178,24 @@ async fn unique_username<I: AuthImpl>(
     .await?
     .is_some()
   {
+    truncate_chars(
+      &mut username,
+      crate::validations::MAX_USERNAME_LENGTH
+        - UNIQUE_USERNAME_SUFFIX_LENGTH,
+    );
     username.push('-');
-    username.push_str(&crate::rand::random_string(5));
+    username.push_str(&crate::rand::random_string(
+      UNIQUE_USERNAME_SUFFIX_LENGTH - 1,
+    ));
   }
   Ok(username)
+}
+
+/// Keeps the first `max` characters.
+fn truncate_chars(text: &mut String, max: usize) {
+  if let Some((end, _)) = text.char_indices().nth(max) {
+    text.truncate(end);
+  }
 }
 
 /// Whether an external login of the user has to be completed with a
@@ -346,6 +393,75 @@ mod tests {
     }
   }
 
+  struct TakenUsernames;
+
+  impl AuthImpl for TakenUsernames {
+    fn new() -> Self {
+      TakenUsernames
+    }
+    fn find_user_with_username(
+      &self,
+      _username: String,
+    ) -> crate::DynFuture<mogh_error::Result<Option<BoxAuthUser>>>
+    {
+      Box::pin(async {
+        Ok(Some(Box::new(TwoFactorUser {
+          external_skip_2fa: false,
+          totp: false,
+        }) as BoxAuthUser))
+      })
+    }
+    fn get_user(
+      &self,
+      _user_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<BoxAuthUser>> {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: crate::RequestAuthentication,
+      _ip: IpAddr,
+      _require_user_enabled: bool,
+      _req: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+      panic!("not needed for these tests")
+    }
+  }
+
+  /// The suffix fits: a taken name at the length limit stays valid.
+  #[tokio::test]
+  async fn test_unique_username_stays_within_the_limit() {
+    use crate::validations::{
+      MAX_USERNAME_LENGTH, validate_username,
+    };
+    for name in [
+      "alice".to_string(),
+      "a".repeat(MAX_USERNAME_LENGTH),
+      "é".repeat(MAX_USERNAME_LENGTH),
+    ] {
+      let unique = unique_username(&TakenUsernames, name.clone())
+        .await
+        .unwrap();
+      assert_ne!(unique, name);
+      assert!(unique.chars().count() <= MAX_USERNAME_LENGTH);
+      assert_eq!(
+        unique.chars().count(),
+        name
+          .chars()
+          .count()
+          .min(MAX_USERNAME_LENGTH - UNIQUE_USERNAME_SUFFIX_LENGTH)
+          + UNIQUE_USERNAME_SUFFIX_LENGTH
+      );
+      if name.is_ascii() {
+        validate_username(&unique).unwrap();
+      }
+    }
+  }
+
   #[test]
   fn test_parse_variant_request() {
     use mogh_auth_client::api::login::{
@@ -520,6 +636,61 @@ mod tests {
       location(redirect),
       "https://example.com/dest?totp=true"
     );
+  }
+
+  /// The query goes before the fragment, where the app reads it.
+  #[test]
+  fn test_format_redirect_keeps_the_fragment_last() {
+    let cases = [
+      (
+        "https://example.com/dest#frag",
+        "https://example.com/dest?totp=true#frag",
+      ),
+      (
+        "/dest?a=1#frag",
+        "https://example.com/dest?a=1&totp=true#frag",
+      ),
+      // A '?' in the fragment is not the query.
+      ("/x#a?b=1", "https://example.com/x?totp=true#a?b=1"),
+      ("/x?#frag", "https://example.com/x?totp=true#frag"),
+    ];
+    for (redirect, expected) in cases {
+      let redirect = format_redirect(
+        "https://example.com",
+        Some(redirect),
+        "totp=true",
+      );
+      assert_eq!(location(redirect), expected);
+    }
+    let redirect = format_redirect(
+      "https://example.com",
+      Some("/stacks/abc#logs"),
+      "passkey=eyJhIjoiYiJ9",
+    );
+    let url = reqwest::Url::parse(&location(redirect)).unwrap();
+    assert_eq!(url.query(), Some("passkey=eyJhIjoiYiJ9"));
+    assert_eq!(url.fragment(), Some("logs"));
+  }
+
+  #[test]
+  fn test_login_redirect_is_sanitized_and_bounded() {
+    let host = "https://example.com";
+    assert_eq!(
+      login_redirect(host, Some("/notes?tab=1".into())).as_deref(),
+      Some("https://example.com/notes?tab=1")
+    );
+    for dropped in [
+      None,
+      Some(String::new()),
+      Some("https://evil.example/steal".into()),
+      Some("//evil.example".into()),
+      Some(format!("/{}", "a".repeat(MAX_REDIRECT_LENGTH))),
+      Some(format!("/{}", "a".repeat(60 * 1024))),
+      // Short, but longer once resolved and encoded.
+      Some(format!("/{}", "\"".repeat(MAX_REDIRECT_LENGTH / 2))),
+    ] {
+      assert_eq!(login_redirect(host, dropped.clone()), None);
+    }
   }
 
   #[test]

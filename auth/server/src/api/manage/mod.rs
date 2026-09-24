@@ -77,8 +77,9 @@ pub enum ManageRequest {
   // API KEY
   CreateApiKey(CreateApiKey),
   DeleteApiKey(DeleteApiKey),
-  CreateApiKeyV2(CreateApiKeyV2),
-  DeleteApiKeyV2(DeleteApiKeyV2),
+  // SIGNING KEY
+  CreateSigningKey(CreateSigningKey),
+  DeleteSigningKey(DeleteSigningKey),
 }
 
 pub fn router<I: AuthImpl>() -> Router {
@@ -119,13 +120,14 @@ async fn handler<I: AuthImpl>(
   );
 
   check_not_workload(user.as_ref().as_ref(), &request)?;
-  // Before the window check, which `0` disables: an api key is
-  // refused the account requests whatever the window.
+  // Before the window check, which `0` disables: an api key or
+  // signing key is refused the account requests whatever the window.
   check_credential_kind(authenticated_at, &request)?;
 
   let auth = I::new();
   check_recent_login(
     auth.reauthentication_window_secs(),
+    auth.jwt_provider().validation().leeway,
     authenticated_at,
     unix_timestamp_secs(),
     &request,
@@ -154,9 +156,9 @@ async fn handler<I: AuthImpl>(
 
 /// Workloads only act through the short lived tokens they get by token
 /// exchange. Everything here either creates a way to log in which
-/// outlives that (api keys, passwords, 2fa, linked logins) or configures
-/// who can log in, so all of it is refused, including any request added
-/// in the future.
+/// outlives that (api keys, signing keys, passwords, 2fa, linked
+/// logins) or configures who can log in, so all of it is refused,
+/// including any request added in the future.
 fn check_not_workload(
   user: &dyn crate::user::AuthUserImpl,
   request: &ManageRequest,
@@ -192,15 +194,15 @@ fn requires_recent_login(request: &ManageRequest) -> bool {
       | ManageRequest::ListTrustedIssuers(_)
       // Removing a credential never gives more access.
       | ManageRequest::DeleteApiKey(_)
-      | ManageRequest::DeleteApiKeyV2(_)
+      | ManageRequest::DeleteSigningKey(_)
   )
 }
 
 /// The requests which manage resources rather than the caller's
 /// account: the login providers and trusted issuers, whose handlers
-/// require an admin. A credential without a login (an api key, where
-/// the app accepts them at all) may perform these — automation
-/// manages them — and none of the account requests, see
+/// require an admin. A credential without a login (an api key or
+/// signing key, where the app accepts them at all) may perform these
+/// — automation manages them — and none of the account requests, see
 /// [check_credential_kind].
 fn manages_resources(request: &ManageRequest) -> bool {
   matches!(
@@ -214,14 +216,18 @@ fn manages_resources(request: &ManageRequest) -> bool {
   )
 }
 
-/// `authenticated_at` is when the token was issued, or `None` for
-/// credentials without a login (api keys, and tokens the app accepts
-/// which [AuthImpl::jwt_provider] did not issue). Those take the resource
+/// `authenticated_at` is when the user logged in, as for
+/// [check_recent_login]
+/// ([JwtClaims::authenticated_at][crate::provider::jwt::JwtClaims::authenticated_at]),
+/// or `None` for credentials without a login (api keys, signing
+/// keys, and tokens the app accepts which [AuthImpl::jwt_provider]
+/// did not issue).
+/// Only whether there is a login matters here. Those take the resource
 /// requests ([manages_resources]) and the ones which need no login
 /// ([requires_recent_login]), and are refused the account requests,
 /// whatever [AuthImpl::reauthentication_window_secs] is (`0`
-/// included): a leaked api key must not be able to change the
-/// password, unenroll 2fa or mint replacement credentials.
+/// included): a leaked api key or signing key must not be able to
+/// change the password, unenroll 2fa or mint replacement credentials.
 fn check_credential_kind(
   authenticated_at: Option<u64>,
   request: &ManageRequest,
@@ -234,18 +240,27 @@ fn check_credential_kind(
   }
   Err(
     anyhow::anyhow!(
-      "{REAUTHENTICATION_REQUIRED}: this needs a recent login, credentials without a login (api keys) can't be used for it"
+      "{REAUTHENTICATION_REQUIRED}: this needs a recent login, credentials without a login (api keys, signing keys) can't be used for it"
     )
     .status_code(axum::http::StatusCode::FORBIDDEN),
   )
 }
 
-/// `authenticated_at` is when the token was issued: a session needs
-/// a login within the window for the account and the resource
-/// requests alike. `None` (an api key) has no login to be recent,
-/// [check_credential_kind] decides what it may do.
+/// `authenticated_at` is when the user logged in: the `auth_time` of
+/// the token, else when it was issued
+/// ([JwtClaims::authenticated_at][crate::provider::jwt::JwtClaims::authenticated_at]).
+/// A session needs a login within the window for the account and the
+/// resource requests alike. `None` (an api key or signing key) has
+/// no login to be recent, [check_credential_kind] decides what it may
+/// do.
+///
+/// `leeway_secs` is the clock skew the token validation tolerates
+/// ([JwtProvider::validation][crate::provider::jwt::JwtProvider::validation]):
+/// a token another instance with a clock running ahead issued a
+/// moment ago is a recent login, not one from the future.
 fn check_recent_login(
   window_secs: u64,
+  leeway_secs: u64,
   authenticated_at: Option<u64>,
   now: u64,
   request: &ManageRequest,
@@ -256,9 +271,12 @@ fn check_recent_login(
   let Some(at) = authenticated_at else {
     return Ok(());
   };
-  // A token from the future doesn't count as recent either,
-  // `saturating_sub` would make its age zero.
-  if at <= now && now - at <= window_secs {
+  // Token validation already refuses tokens issued further in the
+  // future than the leeway, a token from the future can't count as
+  // recent forever here (`saturating_sub` makes its age zero).
+  if at <= now.saturating_add(leeway_secs)
+    && now.saturating_sub(at) <= window_secs
+  {
     return Ok(());
   }
   Err(
@@ -391,6 +409,8 @@ mod tests {
 
   const NOW: u64 = 1_800_000_000;
   const WINDOW: u64 = 15 * 60;
+  /// The default of the token validation.
+  const LEEWAY: u64 = 10;
 
   /// Requests which can't change how anybody logs in.
   fn harmless_requests() -> Vec<ManageRequest> {
@@ -401,7 +421,7 @@ mod tests {
       ),
       ManageRequest::ListTrustedIssuers(ListTrustedIssuers {}),
       ManageRequest::DeleteApiKey(DeleteApiKey { key: "key".into() }),
-      ManageRequest::DeleteApiKeyV2(DeleteApiKeyV2 {
+      ManageRequest::DeleteSigningKey(DeleteSigningKey {
         public_key: "key".into(),
       }),
     ]
@@ -421,7 +441,7 @@ mod tests {
         ManageRequest::UpdateExternalSkip2fa(UpdateExternalSkip2fa {
           external_skip_2fa: true,
         }),
-        ManageRequest::CreateApiKeyV2(CreateApiKeyV2 {
+        ManageRequest::CreateSigningKey(CreateSigningKey {
           name: "key".into(),
           expires: 0,
           cidr_whitelist: Vec::new(),
@@ -438,7 +458,13 @@ mod tests {
     request: &ManageRequest,
   ) -> mogh_error::Result<()> {
     check_credential_kind(authenticated_at, request)?;
-    check_recent_login(window_secs, authenticated_at, NOW, request)
+    check_recent_login(
+      window_secs,
+      LEEWAY,
+      authenticated_at,
+      NOW,
+      request,
+    )
   }
 
   fn assert_reauthentication_required(
@@ -467,10 +493,20 @@ mod tests {
         check(WINDOW, Some(NOW - age), &request)
           .unwrap_or_else(|_| panic!("{method} at {age}s"));
       }
+      // Issued by an instance with its clock a little ahead, which
+      // the token validation accepts.
+      for ahead in [1, 5, LEEWAY] {
+        check(WINDOW, Some(NOW + ahead), &request)
+          .unwrap_or_else(|_| panic!("{method} {ahead}s ahead"));
+      }
       // Too old, or from the future.
-      for authenticated_at in
-        [Some(NOW - WINDOW - 1), Some(0), Some(NOW + 60)]
-      {
+      for authenticated_at in [
+        Some(NOW - WINDOW - 1),
+        Some(0),
+        Some(NOW + LEEWAY + 1),
+        Some(NOW + 60),
+        Some(u64::MAX),
+      ] {
         assert_reauthentication_required(
           check(WINDOW, authenticated_at, &request),
           &format!("{method} at {authenticated_at:?}"),

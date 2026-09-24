@@ -36,6 +36,15 @@ const MAX_CLAIMS_PER_RULE: usize = 16;
 const MAX_GROUPS_PER_RULE: usize = 64;
 const MAX_VALUE_LENGTH: usize = 512;
 
+/// Claims which verification fixes for every token it accepts: the
+/// issuer, one of the accepted audiences, and times. A rule matching
+/// only these identifies no workload, it accepts every token of the
+/// issuer. For a public platform (Github Actions, Gitlab.com) that is
+/// anybody's, the audience included: anyone can request a token for
+/// any audience there.
+const VERIFIED_CLAIMS: [&str; 6] =
+  ["iss", "aud", "exp", "iat", "nbf", "jti"];
+
 fn bad_request(message: impl std::fmt::Display) -> mogh_error::Error {
   anyhow!("{message}").status_code(StatusCode::BAD_REQUEST)
 }
@@ -145,6 +154,16 @@ fn validate_rule(
         condition.claim, rule.name
       )));
     }
+  }
+  // Conditions on these may narrow a rule down further (eg. one of
+  // several audiences), but can't be all it takes.
+  if rule.claims.iter().all(|condition| {
+    VERIFIED_CLAIMS.contains(&condition.claim.as_str())
+  }) {
+    return Err(bad_request(format!(
+      "Rule '{}' only matches claims every accepted token has (issuer, audience, times), which doesn't restrict anything. Add a claim identifying the workload, eg. 'sub' or 'repository_id'.",
+      rule.name
+    )));
   }
   rule.groups =
     clean_list("groups", rule.groups, MAX_GROUPS_PER_RULE)?;
@@ -658,6 +677,32 @@ mod tests {
       invalid(|i| i.rules[0].claims[0].pattern = "**".into()),
       invalid(|i| i.rules[0].claims[0].pattern = String::new()),
       invalid(|i| i.rules[0].claims[0].claim = " ".into()),
+      // Every token the issuer has for the audience matches these
+      invalid(|i| {
+        i.rules[0].claims = vec![WorkloadClaim {
+          claim: "aud".into(),
+          pattern: "https://app.example.com".into(),
+        }]
+      }),
+      invalid(|i| {
+        i.rules[0].claims = vec![
+          WorkloadClaim {
+            claim: " iss ".into(),
+            pattern: "https://token.actions.githubusercontent.com"
+              .into(),
+          },
+          WorkloadClaim {
+            claim: "aud".into(),
+            pattern: "https://app.example.com".into(),
+          },
+        ]
+      }),
+      invalid(|i| {
+        i.rules[0].claims = vec![WorkloadClaim {
+          claim: "exp".into(),
+          pattern: "1*".into(),
+        }]
+      }),
       invalid(|i| i.rules[0].name = String::new()),
       invalid(|i| {
         i.rules = (0..=MAX_RULES)
@@ -709,6 +754,14 @@ mod tests {
     let mut valid = issuer(vec![rule("", "Deploy")]);
     valid.rules[0].claims[0].pattern = "refs/heads/*".into();
     valid.keys = TrustedIssuerKeys::Static(jwks_json());
+    assert!(create_issuer(&auth, &ADMIN, valid).await.is_ok());
+
+    // An audience next to a claim identifying the workload is fine
+    let mut valid = issuer(vec![rule("", "Deploy")]);
+    valid.rules[0].claims.push(WorkloadClaim {
+      claim: "aud".into(),
+      pattern: "https://app.example.com".into(),
+    });
     assert!(create_issuer(&auth, &ADMIN, valid).await.is_ok());
   }
 

@@ -6,7 +6,8 @@ Provides trait-driven server and client implementations for robust application a
 - OIDC / social login
 - Two factor authentication with webauthn passkey or TOTP code
 - JWT token generation and validation utilities
-- Request rate limiting by IP for brute force mitigation
+- Request rate limiting by IP for brute force mitigation (implement
+  `general_rate_limiter`, it is off by default)
 - Typescript types / client to layer with app-specific typescript client.
 
 ## Usage (Server)
@@ -20,7 +21,7 @@ pub struct AuthUser(UserRecord);
 
 impl mogh_auth_server::user::AuthUserImpl for AuthUser {
   fn id(&self) -> &str {
-    &self.0.id.0
+    &self.0.id
   }
 
   fn username(&self) -> &str {
@@ -36,16 +37,7 @@ impl mogh_auth_server::user::AuthUserImpl for AuthUser {
   }
 
   fn passkey(&self) -> Option<Passkey> {
-    let passkey = self.0.passkey.as_ref()?;
-    serde_json::from_str(&serde_json::to_string(passkey).ok()?)
-      .inspect_err(|e| {
-        warn!(
-          "User {} ({}) | Invalid passkey on database | {e:?}",
-          self.username(),
-          self.id(),
-        )
-      })
-      .ok()
+    self.0.passkey.clone()
   }
 
   fn totp_secret(&self) -> Option<&str> {
@@ -56,44 +48,63 @@ impl mogh_auth_server::user::AuthUserImpl for AuthUser {
     }
   }
 
+  /// Stored by `update_user_stored_totp`, required for recovery code logins.
+  fn hashed_totp_recovery_codes(&self) -> &[String] {
+    &self.0.hashed_totp_recovery_codes
+  }
+
+  /// ⚠️ The default is `true`: users enrolled in 2FA skip it when logging in
+  /// through a login provider (and `POST /token`). Store it per user,
+  /// defaulting to `false`, so their second factor protects every login.
   fn external_skip_2fa(&self) -> bool {
     self.0.external_skip_2fa
   }
 
-  /// Admins can manage the stored external login providers over the API.
+  /// Disabled users are refused the auth management API (all but `GetUserId`).
+  fn is_enabled(&self) -> bool {
+    self.0.enabled
+  }
+
+  /// Admins can manage the login providers and trusted issuers over the API,
+  /// which amounts to full control of the app (eg. repointing a provider
+  /// logs its new issuer in as the linked users). With separate super
+  /// admins, return `enabled && super_admin` here, as Komodo and Cicada do.
   fn is_admin(&self) -> bool {
     self.0.admin
+  }
+
+  fn is_workload(&self) -> bool {
+    self.0.workload.is_some()
+  }
+
+  fn cidr_whitelist(&self) -> &[String] {
+    &self.0.cidr_whitelist
   }
 }
 ```
 
-### Implement AppImpl
+### Implement AuthImpl
+
+`example/server/src/auth.rs` implements all of it against a database. The
+essentials:
 
 ```rust
-pub struct AppAuthImpl {
-  client: RequestClientArgs,
-}
+pub struct AppAuthImpl;
 
 impl mogh_auth_server::AuthImpl for AppAuthImpl {
-  fn from_client(client: RequestClientArgs) -> Self
-  where
-    Self: Sized,
-  {
-    Self { client }
-  }
-
-  fn client(&self) -> &RequestClientArgs {
-    &self.client
+  /// Called for every request, keep it cheap.
+  fn new() -> Self {
+    Self
   }
 
   fn app_name(&self) -> &'static str {
     "AppName"
   }
 
+  /// The origin the app is reached at, eg. `https://example.com`. The path
+  /// the auth router is nested at is `path()`, "/auth" by default.
   fn host(&self) -> &str {
-    static AUTH_HOST: LazyLock<String> =
-      LazyLock::new(|| format!("{}/auth", core_config().host));
-    &AUTH_HOST
+    &core_config().host
   }
 
   fn post_link_redirect(&self) -> &str {
@@ -105,10 +116,39 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
   fn get_user(
     &self,
     user_id: String,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<BoxAuthUser>>
-  {
+  ) -> mogh_auth_server::DynFuture<mogh_error::Result<BoxAuthUser>> {
     Box::pin(async move {
       Ok(Box::new(AuthUser(get_user(&user_id).await?)) as BoxAuthUser)
+    })
+  }
+
+  /// Authenticates the requests of the app's own API
+  /// (`middleware::authenticate_request::<AppAuthImpl, REQUIRE_USER_ENABLED>`).
+  fn handle_request_authentication(
+    &self,
+    auth: RequestAuthentication,
+    ip: IpAddr,
+    require_user_enabled: bool,
+    mut req: Request,
+  ) -> mogh_auth_server::DynFuture<mogh_error::Result<Request>> {
+    Box::pin(async move {
+      // Verifies the credentials, and enforces the api key
+      // and the user cidr whitelists.
+      let user = get_user_from_request_authentication(
+        &AppAuthImpl,
+        auth,
+        ip,
+      )
+      .await?;
+      let user = get_user(user.id()).await?;
+      if require_user_enabled && !user.enabled {
+        return Err(
+          anyhow!("User is not enabled")
+            .status_code(StatusCode::FORBIDDEN),
+        );
+      }
+      req.extensions_mut().insert(user);
+      Ok(req)
     })
   }
 
@@ -131,6 +171,13 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
   // =========
 
   fn jwt_provider(&self) -> &JwtProvider {
+    static JWT_PROVIDER: LazyLock<JwtProvider> = LazyLock::new(|| {
+      // At least 32 random bytes, shared by all instances of the app.
+      JwtProvider::try_new(core_config().jwt_secret.as_bytes(), JWT_TTL_MS)
+        .expect("Invalid 'jwt_secret'")
+        .with_iss(core_config().host.clone())
+        .with_aud("AppName")
+    });
     &JWT_PROVIDER
   }
 
@@ -146,7 +193,10 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
     PASSKEY_PROVIDER.as_ref()
   }
 
+  /// ⚠️ Without this nothing is rate limited, see "Rate limiting" below.
   fn general_rate_limiter(&self) -> &RateLimiter {
+    static GENERAL_RATE_LIMITER: LazyLock<Arc<RateLimiter>> =
+      LazyLock::new(|| RateLimiter::new(false, 10, Duration::from_secs(60)));
     &GENERAL_RATE_LIMITER
   }
 
@@ -156,10 +206,6 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
 
   fn local_auth_enabled(&self) -> bool {
     core_config().local_auth
-  }
-
-  fn local_login_rate_limiter(&self) -> &RateLimiter {
-    &LOCAL_LOGIN_RATE_LIMITER
   }
 
   fn sign_up_local_user(
@@ -198,36 +244,20 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
     user_id: String,
     username: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async {
-      update_user_fields(
-        user_id,
-        UpdateUser {
-          name: Some(username),
-          ..Default::default()
-        },
-      )
-      .await
-      .map(|_| ())
-      .map_err(Into::into)
+    Box::pin(async move {
+      update_user_username(&user_id, username).await.map_err(Into::into)
     })
   }
 
   fn update_user_password(
     &self,
     user_id: String,
-    password: String,
+    hashed_password: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async {
-      update_user_fields(
-        user_id,
-        UpdateUser {
-          password: Some(password),
-          ..Default::default()
-        },
-      )
-      .await
-      .map(|_| ())
-      .map_err(Into::into)
+    Box::pin(async move {
+      update_user_password(&user_id, hashed_password)
+        .await
+        .map_err(Into::into)
     })
   }
 
@@ -240,31 +270,20 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
   /// callback paths, eg. `/auth/oidc/callback`.
   fn static_external_providers(&self) -> Vec<ExternalLoginProvider> {
     let config = core_config();
-    vec![
-      ExternalLoginProvider {
-        id: ExternalLoginKind::Oidc.reserved_id().to_string(),
-        name: String::from("OIDC"),
-        registration_disabled: false,
-        slug: String::new(),
-        token_exchange: Default::default(),
-        config: ExternalLoginProviderConfig::Oidc(config.oidc.clone()),
-      },
-      ExternalLoginProvider {
-        id: ExternalLoginKind::Github.reserved_id().to_string(),
-        name: String::from("Github"),
-        registration_disabled: false,
-        slug: String::new(),
-        token_exchange: Default::default(),
-        config: ExternalLoginProviderConfig::Github(
-          config.github_oauth.clone(),
-        ),
-      },
-    ]
+    vec![ExternalLoginProvider {
+      id: ExternalLoginKind::Oidc.reserved_id().to_string(),
+      name: String::from("OIDC"),
+      registration_disabled: false,
+      slug: String::new(),
+      token_exchange: Default::default(),
+      config: ExternalLoginProviderConfig::Oidc(config.oidc.clone()),
+    }]
   }
 
   /// Providers stored in the database, managed by admins over the API
   /// (`ListExternalLoginProviders`, `CreateExternalLoginProvider`, ...).
   /// The config includes the client secret, encrypt it at rest.
+  /// Called by unauthenticated requests, serve it from a cache.
   fn list_external_providers(
     &self,
   ) -> mogh_auth_server::DynFuture<
@@ -275,40 +294,8 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
     })
   }
 
-  fn create_external_provider(
-    &self,
-    provider: ExternalLoginProvider,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      // The id is generated by the auth server, store it as is.
-      insert_stored_login_provider(provider)
-        .await
-        .map_err(Into::into)
-    })
-  }
-
-  fn update_external_provider(
-    &self,
-    provider: ExternalLoginProvider,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      replace_stored_login_provider(provider)
-        .await
-        .map_err(Into::into)
-    })
-  }
-
-  fn delete_external_provider(
-    &self,
-    id: String,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      delete_stored_login_provider(&id).await?;
-      // Also remove the links to the provider from all users.
-      remove_external_logins_with_provider(&id).await?;
-      Ok(())
-    })
-  }
+  // create_external_provider, update_external_provider,
+  // delete_external_provider (which also removes the links to it)
 
   /// ⚠️ External user ids are only unique per provider,
   /// always match on both the provider id and the external id.
@@ -328,179 +315,89 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
     })
   }
 
-  fn sign_up_external_user(
-    &self,
-    username: String,
-    info: ExternalLoginInfo,
-    no_users_exist: bool,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
-    Box::pin(async move {
-      sign_up_external_user(
-        username,
-        info.provider_id,
-        info.external_id,
-        info.avatar_url,
-        no_users_exist || core_config().enable_new_users,
-      )
-      .await
-      .map_err(Into::into)
-    })
-  }
+  // sign_up_external_user, sync_external_user, link_external_login,
+  // unlink_external_login, unlink_local_login
 
-  /// Optional. Called on every external login, and directly after signup / link.
-  /// `groups` requires `groups_claim` in the OidcConfig, `admin` requires `admin_groups`.
-  /// The `groups` scope is requested automatically if the provider advertises it.
-  /// Both are None when the provider sent no group information,
-  /// the user should then be left as is.
-  fn sync_external_user(
-    &self,
-    user_id: String,
-    info: ExternalLoginInfo,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      if let Some(groups) = info.groups {
-        // Replace only the memberships managed by this provider,
-        // keeping any assigned manually in the app.
-        set_user_provider_groups(&user_id, &info.provider_id, groups)
-          .await?;
-      }
-      if let Some(admin) = info.admin {
-        set_user_admin(&user_id, admin).await?;
-      }
-      Ok(())
-    })
-  }
+  // =======
+  // = 2FA =
+  // =======
 
-  fn link_external_login(
-    &self,
-    user_id: String,
-    info: ExternalLoginInfo,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      link_external_login(
-        user_id,
-        info.provider_id,
-        info.external_id,
-        info.avatar_url,
-      )
-      .await
-      .map(|_| ())
-      .map_err(Into::into)
-    })
-  }
-
-  // ==========
-  // = UNLINK =
-  // ==========
-
-  fn unlink_external_login(
-    &self,
-    user_id: String,
-    provider_id: String,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      unlink_external_login(user_id, &provider_id).await?;
-      Ok(())
-    })
-  }
-
-  fn unlink_local_login(
-    &self,
-    user_id: String,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async move {
-      // Handle password updates using field updater
-      let update = UpdateUser {
-        password: Some(String::new()),
-        ..Default::default()
-      };
-      update_user_fields(user_id, update)
-        .await
-        .map(|_| ())
-        .map_err(Into::into)
-    })
-  }
-
-  // ===============
-  // = PASSKEY 2FA =
-  // ===============
-
-  fn update_user_stored_passkey(
-    &self,
-    user_id: String,
-    passkey: Option<Passkey>,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async {
-      update_user_passkey(user_id, passkey)
-        .await
-        .map(|_| ())
-        .map_err(Into::into)
-    })
-  }
-
-  // ============
-  // = TOTP 2FA =
-  // ============
+  // update_user_stored_passkey, remove_user_stored_totp,
+  // update_user_external_skip_2fa
 
   fn update_user_stored_totp(
     &self,
     user_id: String,
-    totp_secret: String,
-    _hashed_recovery_codes: Vec<String>,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async {
-      update_user_fields(
-        user_id,
-        UpdateUser {
-          totp_secret: Some(totp_secret),
-          ..Default::default()
-        },
-      )
-      .await
-      .map(|_| ())
-      .map_err(Into::into)
-    })
-  }
-
-  fn remove_user_stored_totp(
-    &self,
-    user_id: String,
-  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
-    Box::pin(async {
-      update_user_fields(
-        user_id,
-        UpdateUser {
-          totp_secret: Some(String::new()),
-          ..Default::default()
-        },
-      )
-      .await
-      .map(|_| ())
-      .map_err(Into::into)
-    })
-  }
-
-  // ============
-  // = SKIP 2FA =
-  // ============
-  fn update_user_external_skip_2fa(
-    &self,
-    user_id: String,
-    external_skip_2fa: bool,
+    encoded_secret: String,
+    hashed_recovery_codes: Vec<String>,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
-      update_user_fields(
-        user_id,
-        UpdateUser {
-          external_skip_2fa: Some(external_skip_2fa),
-          ..Default::default()
-        },
-      )
-      .await
-      .map(|_| ())
-      .map_err(Into::into)
+      // Store the recovery codes too, `hashed_totp_recovery_codes`
+      // returns them for recovery code logins.
+      update_user_totp(&user_id, encoded_secret, hashed_recovery_codes)
+        .await
+        .map_err(Into::into)
     })
   }
+
+  /// A recovery code was used, it can't be used again. ⚠️ Remove it only if
+  /// it is still there, in one conditional statement, and fail if it wasn't:
+  /// another login used it, maybe on another instance. The server serializes
+  /// the recovery code logins of a user within one instance only.
+  fn remove_totp_recovery_code(
+    &self,
+    user_id: String,
+    hashed_code: String,
+  ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
+    Box::pin(async move {
+      // eg. UPDATE ... WHERE id = ? AND <codes contain the hash>
+      if remove_user_recovery_code_if_present(&user_id, &hashed_code).await? {
+        Ok(())
+      } else {
+        Err(
+          anyhow!("Invalid recovery code")
+            .status_code(StatusCode::UNAUTHORIZED),
+        )
+      }
+    })
+  }
+
+  // ============
+  // = API KEYS =
+  // ============
+
+  // create_api_key, get_api_key_owner_id, delete_api_key
+
+  fn get_api_key(
+    &self,
+    key: String,
+    secret: String,
+  ) -> mogh_auth_server::DynFuture<mogh_error::Result<BoxAuthApiKey>> {
+    Box::pin(async move {
+      let api_key = find_api_key(&key).await?;
+      // Also runs for unknown keys, so timing doesn't reveal them,
+      // and off the async runtime: bcrypt takes a while.
+      verify_api_key_secret_async(
+        &AppAuthImpl,
+        secret,
+        api_key.as_ref().map(|key| key.hashed_secret.clone()),
+      )
+      .await?;
+      let api_key = api_key
+        .context("Invalid client credentials")
+        .status_code(StatusCode::UNAUTHORIZED)?;
+      Ok(
+        AuthApiKey {
+          user_id: api_key.user_id,
+          cidr_whitelist: api_key.cidr_whitelist,
+        }
+        .into(),
+      )
+    })
+  }
+
+  // signing keys: server_private_key, create_signing_key (public keys
+  // unique across all users), get_signing_key, delete_signing_key
 }
 ```
 
@@ -512,7 +409,7 @@ Requires Session middleware layer on or outide the auth api router.
 struct MemorySessionConfig;
 
 impl mogh_server::session::SessionConfig for MemorySessionConfig {
-  fn host() -> &str {
+  fn host(&self) -> &str {
     &core_config().host
   }
   fn host_env_field(&self) -> &str {
@@ -524,6 +421,64 @@ axum::Router::new()
   .nest("/auth", mogh_auth_server::api::router::<AppAuthImpl>())
   .layer(mogh_server::session::memory_session_layer(MemorySessionConfig))
 ```
+
+### Rate limiting
+
+⚠️ **Nothing is limited by client ip unless the app implements
+`AuthImpl::general_rate_limiter`.** The default is a disabled limiter (a warning
+is logged once when it is used), so password and api key guesses are
+unlimited:
+
+```rust
+fn general_rate_limiter(&self) -> &RateLimiter {
+  static LIMITER: LazyLock<Arc<RateLimiter>> =
+    LazyLock::new(|| RateLimiter::new(false, 10, Duration::from_secs(60)));
+  &LIMITER
+}
+```
+
+- It counts failed authentication by client ip (IPv6 clients per /64): invalid
+  tokens, api keys and signatures presented to `authenticate_request` and the
+  management api, second factors, external logins and token exchanges. Local
+  logins too, unless `local_login_rate_limiter` gives them their own.
+- The login steps checking a secret which can be guessed (`LoginLocalUser`,
+  `CompleteTotpLogin`, `CompleteTotpRecoveryLogin`, `CompletePasskeyLogin`)
+  count strictly, so a burst of concurrent attempts can't go past the limit
+  either.
+- Failed TOTP and recovery codes are also capped per user, whatever the ip
+  limiter (the disabled default included), the session or the client ip:
+  `MAX_SECOND_FACTOR_FAILURES` (10) per `SECOND_FACTOR_FAILURE_WINDOW`
+  (15 minutes), then `429 Too Many Requests` (`api::login::totp`). Only a client
+  which passed the first factor can send codes, but whoever holds it can keep
+  the user's second factor locked this way: the user or an admin then changes
+  the password, or unlinks the external login. The count is kept in process
+  memory, so each instance of a replicated app allows this many, and a restart
+  starts over.
+- Requests without any credentials are never counted.
+- The client ip is taken from forwarding headers only when the request comes
+  from a trusted proxy (`mogh_server`'s `trusted_proxies`, private ranges by
+  default).
+
+### Login sessions
+
+- Passwords are hashed with bcrypt, which only uses their first 72 bytes: sign
+  up and `UpdatePassword` refuse longer ones (`validations::MAX_PASSWORD_BYTES`),
+  rather than letting two passwords differing after 72 bytes both work.
+- The session id is cycled when the first factor passes (the password, or an
+  external login), so a session id planted in the browser beforehand (eg. a
+  cookie set by a sibling subdomain) can't be used to complete the login.
+- A TOTP or passkey enrollment (`BeginTotpEnrollment` / `BeginPasskeyEnrollment`)
+  can only be confirmed by the user who began it: the management api
+  authenticates by the `Authorization` header, not the session cookie.
+
+### Disabled users
+
+Implement `AuthUserImpl::is_enabled` to disable users. Disabled users can still
+log in (to see that they are disabled), and are refused the whole auth management
+api except `GetUserId`: no api keys, no changes to how they log in, and a disabled
+admin no longer manages login providers or trusted issuers. Refusing them the
+app's own api is `handle_request_authentication`'s `require_user_enabled`.
+
 ### App tokens
 
 The tokens issued by `JwtProvider` are standard JWTs: `iat` / `exp` are unix
@@ -531,16 +486,27 @@ timestamps in **seconds** (RFC 7519), validated with 10 seconds of clock skew
 tolerance. Tokens issued before 4.0 carried milliseconds and are rejected, so
 users have to log in once after upgrading.
 
+⚠️ They are signed with the secret the `JwtProvider` is built with: anyone who
+knows it, or guesses it offline from any token they got, can issue tokens for
+any user. Use a random secret of at least 32 bytes (`openssl rand -base64 48`),
+shared by all instances of the app, and build the provider with
+`JwtProvider::try_new`, which refuses shorter ones (`JwtProvider::new` logs a
+warning). With an empty secret no token is issued or accepted. Generating a
+random secret when none is configured also works, users are then logged out on
+restart.
+
 ### Reauthentication
 
 Requests of the management API which change how a user can log in (username,
-password, 2FA, linked logins, new api keys), or how anybody can (login
-providers, trusted issuers), are only accepted with a token issued in the
-last 15 minutes, so a token which leaked is not enough to take the account over
-for good. Reading, `GetUserId` and deleting api keys are not affected.
+password, 2FA, linked logins, new api keys and signing keys), or how anybody
+can (login providers, trusted issuers), are only accepted with a token from a
+login in the last 15 minutes, so a token which leaked is not enough to take the
+account over for good. Reading, `GetUserId` and deleting api keys or signing
+keys are not affected.
 
 ```rust
-/// Seconds. `0` disables the check for sessions (api keys stay refused).
+/// Seconds. `0` disables the check for sessions (api keys and signing keys
+/// stay refused).
 fn reauthentication_window_secs(&self) -> u64 {
   15 * 60
 }
@@ -552,17 +518,35 @@ fn reauthentication_window_secs(&self) -> u64 {
   again, including their second factor, and retries. `mogh_ui` does this on
   its own: it tells the user why and sends them to `/login?backto=<page>`
   (`setOnReauthenticationRequired` to change that).
-- Api keys are not a login, and are always refused the account requests,
-  whatever the window (`0` included): a leaked key must not be able to set a
+- Api keys and signing keys are not a login, and are always refused the
+  account requests, whatever the window (`0` included): a leaked key must not
+  be able to set a
   password, unenroll 2FA or mint a replacement key. The requests which manage
   resources rather than the caller's account — the login providers and
   trusted issuers, whose handlers require an admin — take them, so an admin's
   key can run Terraform against them; whether keys reach the management api
   at all is the app's `get_user_id_from_request_authentication`.
-- The time is the `iat` of a `JwtProvider` token. Other tokens which
-  `get_user_id_from_request_authentication` accepts have no known login and
-  count as api keys: they are refused the account requests whatever the window,
-  and may make only the resource requests.
+- The time of a login is the `iat` of the `JwtProvider` token it issued, with
+  the 10 seconds of clock skew its validation tolerates (instances behind a
+  load balancer). Other tokens which `get_user_id_from_request_authentication`
+  accepts have no known login and count as api keys: they are refused the
+  account requests whatever the window, and may make only the resource
+  requests.
+- A token from a [token exchange](#token-exchange-rfc-8693) (`/token`, or
+  `ExchangeExternalForJwt` without a second factor) counts as a login when the
+  provider authenticated the user, not when it was exchanged: the provider
+  token's `auth_time`, else its `iat` (the app token's `auth_time` claim,
+  `JwtClaims::authenticated_at`). A provider token can be exchanged again until
+  it expires, so a leaked old one gets the app but not the account. Exchange a
+  freshly issued provider token for these requests. ⚠️ A fresh token is not
+  a fresh login: identity providers with single sign-on sessions issue new
+  tokens silently, which keep the original `auth_time`. A token without
+  `auth_time` (which OIDC only requires when it is requested, eg. with
+  `max_age`, and some providers like Google leave out otherwise) counts from
+  its `iat` though, so a silently issued or refreshed one does count as a
+  fresh login. To get a recent login through token exchange, the client must make
+  the provider authenticate the user again, eg. with OIDC `prompt=login` or
+  `max_age=0` on the authorization request.
 
 ### Failed external logins
 
@@ -579,9 +563,39 @@ fn external_login_error_redirect(&self) -> Option<&str> {
 ```
 
 Failed logins then redirect to `{login page}?login_error=<reason>`, failed links
-to `{post_link_redirect}?link_error=<reason>`. The `mogh_ui` `useAuthState` hook
-shows both as a notification. Server errors are logged and only reported as
-"Login failed".
+to `{post_link_redirect}?link_error=<reason>`. A request to a `/link` route
+without a link begun on the session (`BeginExternalLoginLink`) is no link, and
+fails to the login page. The link begun on the session is used up by the first
+`/link` request, whatever its outcome, and refused once it is older than 10
+minutes. Server errors are logged, and the redirect reports them
+only as "Login failed, see the server logs for details". Without the redirect,
+the JSON error of a server error carries the full trace like every other
+`mogh_error` response, unless the app hides it with
+`mogh_error::set_server_error_detail`.
+
+The `mogh_ui` `useAuthState` hook shows both as a notification. Anybody can
+send a user a link to the app with a made up reason, so the reason itself is
+only shown after a flow the same tab started through `mogh_ui` (`externalLogin`,
+`LoginPage`, `LinkedLogins`) within the last 30 minutes, and a generic message
+otherwise. After a failed login `LoginPage` doesn't redirect to the provider on
+its own again, which would only fail again, in a loop.
+
+The external login routes are plain `GET`s, which any web page a user visits
+can send from their browser. Only the failures of a callback which redeems a
+code (and the login rules after it) count against the client ip in
+`general_rate_limiter`. An unknown provider, or a login or link which was never
+started on the session, is refused without counting it, so it can't lock the
+ip out.
+
+The `redirect` of `/{slug}/login?redirect=` (where the browser lands after the
+login) must be on the app's host and at most 2048 characters, otherwise the
+login ends at `host`. The login's query (`redeem_ready=true`, `totp=true`,
+`passkey=...`) goes before its fragment.
+
+A new external user is signed up with the provider's name for them if it passes
+`validate_username`, else with that name reduced to `[a-zA-Z0-9._@-]` (`John
+Smith` becomes `John-Smith`), else with a name made from the provider's slug
+(`github-x8k2...`). A taken name gets a random suffix.
 
 ### Login records
 
@@ -610,20 +624,73 @@ fn record_login(&self, login: Login) -> DynFuture<mogh_error::Result<()>> {
 Refused logins (a wrong password, a token no provider accepts) are not
 reported: the server rate limits and logs them.
 
-### Api keys (v2)
+### Signing keys
 
-Clients sign each request with their private key instead of sending a secret
-(`X-API-SIGNATURE` / `X-API-TIMESTAMP`). The rust client has the helpers behind
-its `pki` feature: `mogh_auth_client::signature::signed_request_headers`.
+A signing key is a key pair registered with the user (`CreateSigningKey`,
+`DeleteSigningKey`): the server stores its public key, and clients sign each
+request with its private key instead of sending a secret (`X-API-SIGNATURE` /
+`X-API-TIMESTAMP`). An api key (`CreateApiKey`) is the key + secret sent as
+they are (`X-API-KEY` / `X-API-SECRET`). The rust client has the helpers
+behind its `pki` feature:
+`mogh_auth_client::signature::signed_request_headers`.
 
+```rust
+let path = "/read/GetVersion";
+let body = serde_json::to_vec(&GetVersion {})?;
+let mut request = reqwest
+  .post(format!("{address}{path}"))
+  .header("content-type", "application/json")
+  .body(body.clone());
+for (header, value) in signed_request_headers(
+  &private_key, &server_public_key, "POST", path, &body,
+)? {
+  request = request.header(header, value);
+}
+```
+
+- The signature is a Noise handshake with the server key over the string
+  `{METHOD}|{path_and_query}|{timestamp}|{sha256(body) hex}`, eg.
+  `GET|/api/notes?page=2|1718000000000|e3b0c442...b855` (no body): the
+  uppercased method, the path and query, the timestamp in unix milliseconds
+  (the value of `X-API-TIMESTAMP`), and the lowercase hex sha256 of the body
+  (of empty input for no body, and for a CONNECT request, eg. a websocket over
+  HTTP/2). Sign the body exactly as sent, and the path and query as the server
+  receives them: percent encoded, without scheme and host (it is the same over
+  HTTP/2). So the headers are made for each request, they can't be default
+  headers of a client.
+- The server reads the body of a signed request before authenticating it,
+  limited like axum's body extractors (the router's `DefaultBodyLimit`, 2 MB by
+  default, else `413 Payload Too Large`). A signed request which can't verify,
+  found out before (without `server_private_key`, or with the
+  `X-API-TIMESTAMP` missing or outside the tolerance), is refused with `401`
+  without its body being read, and so is a client the general rate limiter has
+  locked out, with `429`. Anybody can send a current timestamp, so the body of
+  any other signed request is read (up to the limit), even when its signature
+  turns out to be invalid.
+- Apps without `AuthImpl::server_private_key` (the default) answer signed
+  requests with `401 Signing keys are not enabled`.
 - The signature is accepted for one second around the server time by default,
-  `AuthImpl::api_key_v2_timestamp_tolerance_ms` raises that for clients without
-  synchronized clocks. It is also how long a captured request can be replayed,
-  always use TLS.
-- A public key given to `CreateApiKeyV2` can be base64 or pem, anything else is
-  refused. Implement `get_api_key_v2_owner_id` if `get_api_key_v2` rejects keys
-  which should stay deletable (eg. expired ones).
+  `AuthImpl::signing_key_timestamp_tolerance_ms` raises that for clients without
+  synchronized clocks. It is measured when the headers arrive, the time the
+  body takes to upload doesn't count. It is also how long a captured request
+  can be replayed (the exact same request, it can't carry another body), always
+  use TLS.
+- A public key given to `CreateSigningKey` can be base64 or pem, anything else
+  is refused, and so is one already stored (`409 Conflict`). ⚠️ Public keys
+  are not secret: store them unique across all users (eg. a unique index),
+  which also covers two requests racing. Implement `get_signing_key_owner_id`
+  if `get_signing_key` rejects keys which should stay deletable (eg. expired
+  ones).
 - Invalid signatures count against the general rate limiter.
+
+Since 5.0 the body is signed: a hard switch, clients signing the 4.x string
+(`{METHOD}|{uri}|{timestamp}`, without the body hash) are refused until they
+upgrade. 5.0 also renamed "api keys v2" to signing keys: the requests are
+`CreateSigningKey` / `DeleteSigningKey` (were `CreateApiKeyV2` /
+`DeleteApiKeyV2`, also on the wire), and the `AuthImpl` methods
+`create_signing_key`, `get_signing_key`, `get_signing_key_owner_id`,
+`delete_signing_key` and `signing_key_timestamp_tolerance_ms` (were
+`*_api_key_v2*`).
 
 ### Token exchange (RFC 8693)
 
@@ -695,12 +762,39 @@ continue, and rejects users who need a second factor for external logins.
   providers issue tokens valid for hours. `max_token_age_secs` limits this
   to the time since the token was issued. Clients should exchange a token
   right after receiving it, and keep the app token.
+- The app token counts as a login when the provider authenticated the user
+  (the token's `auth_time`, else its `iat`), not at the exchange. An exchanged
+  old token is not a recent login for the [reauthentication](#reauthentication)
+  window, so it can't change passwords, 2FA or api keys. A token carrying
+  `auth_time` which the provider refreshed, or issued from a single sign-on
+  session, keeps the original `auth_time`, so it isn't one either. ⚠️ Without
+  `auth_time` its `iat` is used, and a token the provider refreshed or
+  re-issued without a login counts as a fresh one. OIDC only requires
+  `auth_time` when it is requested (eg. with `max_age`), and some providers
+  (eg. Google) leave it out otherwise. To get a recent login through the
+  exchange, the client must make the provider authenticate the user again (eg.
+  OIDC `prompt=login` or `max_age=0`, which also asks for `auth_time`).
 - 'allowed_groups' and the user cidr whitelist apply like for a login,
   and `AuthImpl::sync_external_user` is called. Groups can only come
   from the token itself here, there is no user info request.
 - Users who need a second factor for external logins are rejected
   by `/token`, and continue with it using `ExchangeExternalForJwt`.
+  ⚠️ That is only users for whom `AuthUserImpl::external_skip_2fa` is `false`.
+  It defaults to `true`, so without an implementation a provider token alone
+  gets an app token for a user enrolled in 2FA.
 - Errors use the OAuth format: `{"error":"invalid_grant","error_description":"..."}`.
+  A malformed request is `invalid_request`, a token rejected for any reason is
+  `invalid_grant` (as for the RFC 7521 / 7523 assertion grants and common token
+  services). This deliberately deviates from RFC 8693 section 2.2.2, which
+  would report both as `invalid_request`. Except when another login provider
+  (or trusted issuer) of the same issuer couldn't be loaded: a token the others
+  rejected (signature, audience, expiry, `allowed_groups`) is then `503`
+  `temporarily_unavailable`, since that one might have accepted it. A token one
+  of them verified whose user is unknown, or which matches no rule, stays
+  `invalid_grant`, as does a user one of them accepted who fails the login
+  rules.
+- Google ID tokens are only accepted with the `iss` `https://accounts.google.com`.
+  The scheme-less variant `accounts.google.com` can't be verified.
 
 ### Workload identity
 
@@ -766,14 +860,19 @@ fn get_or_create_workload_user(
   identity: WorkloadIdentity,
 ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
   Box::pin(async move {
-    // One user per (issuer_id, rule_id). Apply the groups and admin
-    // status every time, they are the full definition of the user.
-    let user = get_or_create_service_user(
+    // One user per (issuer_id, rule_id), under a unique key on both.
+    // Called concurrently for the same rule (a CI matrix starting):
+    // `INSERT ... ON CONFLICT DO NOTHING`, then read the user back.
+    create_service_user_if_missing(
       &identity.issuer_id,
       &identity.rule_id,
       &identity.rule_name,
     )
     .await?;
+    let user =
+      find_service_user(&identity.issuer_id, &identity.rule_id).await?;
+    // Apply the groups and admin status every time,
+    // they are the full definition of the user.
     set_user_groups(&user.id, identity.groups).await?;
     set_user_admin(&user.id, identity.admin).await?;
     // `identity.claims` tell which repository / run / service account it was.
@@ -788,9 +887,21 @@ fn get_or_create_workload_user(
   so a workload can't create an api key (or password, 2fa, linked login,
   login provider, ...) which outlives its rule. ⚠️ Apps with their own ways to
   create credentials must refuse workload users there as well.
+- ⚠️ `get_or_create_workload_user` is called concurrently for the same rule, and
+  has to return the same user to all of them without failing any: keep a unique
+  key on (`issuer_id`, `rule_id`), create with an upsert or an insert ignoring
+  the conflict and read the user back, and make usernames which can't collide
+  (or retry). The library serializes the calls of a rule within one instance
+  of the app, not across several. The example app shows it (`example/server`).
 - Rules of static issuers need an `id` which is unique within the issuer,
   it identifies the user of the rule. Tokens matching a rule without one
   are refused. Ids of rules managed over the API are generated.
+- A rule managed over the API needs a condition on a claim which identifies
+  the workload (eg. `sub`, `repository_id`). Conditions on claims every
+  accepted token has (`iss`, `aud`, `exp`, `iat`, `nbf`, `jti`) can only narrow
+  it further: an audience is no restriction on a public platform, where anyone
+  can request a token for any audience. This is best effort, `repo:*` still
+  matches every repository there.
 - An admin user is only accepted if the rule has `admin` set.
 - The user cidr whitelist applies. Users requiring a second factor are refused.
 - The app token is valid for `token_ttl_secs`, capped at the app default.
