@@ -1,11 +1,15 @@
 use std::{
   path::{Path, PathBuf},
-  sync::Arc,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
 };
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use der::AnyRef;
+use zeroize::Zeroize as _;
 
 mod private;
 mod public;
@@ -15,6 +19,9 @@ mod tests;
 
 pub use private::Pkcs8PrivateKey;
 pub use public::SpkiPublicKey;
+
+pub(crate) use private::check_raw_private_key;
+pub(crate) use public::check_raw_public_key;
 
 use crate::PkiKind;
 
@@ -31,12 +38,20 @@ fn algorithm() -> spki::AlgorithmIdentifier<AnyRef<'static>> {
 /// Wraps a base64 body in pem framing,
 /// with lines wrapped at 64 characters per RFC 7468.
 fn encode_pem(label: &str, base64_body: &str) -> String {
-  let mut pem = format!("-----BEGIN {label}-----\n");
+  let begin = format!("-----BEGIN {label}-----\n");
+  let end = format!("-----END {label}-----\n");
+  // Sized up front: growing would leave copies of a private key
+  // body behind in freed memory.
+  let lines = base64_body.len().div_ceil(64);
+  let mut pem = String::with_capacity(
+    begin.len() + base64_body.len() + lines + end.len(),
+  );
+  pem.push_str(&begin);
   for line in base64_body.as_bytes().chunks(64) {
     pem.push_str(&String::from_utf8_lossy(line));
     pem.push('\n');
   }
-  pem.push_str(&format!("-----END {label}-----\n"));
+  pem.push_str(&end);
   pem
 }
 
@@ -52,10 +67,12 @@ impl EncodedKeyPair {
   pub fn generate(pki_kind: PkiKind) -> anyhow::Result<Self> {
     let builder =
       snow::Builder::new(pki_kind.noise_params().parse()?);
-    let keypair = builder
+    let mut keypair = builder
       .generate_keypair()
       .context("Failed to generate keypair")?;
-    let private = Pkcs8PrivateKey::from_raw_bytes(&keypair.private)?;
+    let private = Pkcs8PrivateKey::from_raw_bytes(&keypair.private);
+    keypair.private.zeroize();
+    let private = private?;
     let public = SpkiPublicKey::from_raw_bytes(&keypair.public)?;
     Ok(Self { private, public })
   }
@@ -87,6 +104,10 @@ impl EncodedKeyPair {
     Ok(keys)
   }
 
+  /// Loads the pair from the private key file, or generates and
+  /// writes a new one when there is no file at the path. An existing
+  /// file that holds no valid key (an empty file) is an error, never
+  /// replaced.
   pub fn load_maybe_generate(
     pki_kind: PkiKind,
     private_key_path: impl AsRef<Path>,
@@ -101,7 +122,20 @@ impl EncodedKeyPair {
       return Self::generate_write_sync(pki_kind, path);
     }
 
-    let private = Pkcs8PrivateKey::from_file(private_key_path)?;
+    let private = Pkcs8PrivateKey::from_file(path).map_err(|e| {
+      // Only an empty file is safe to delete: an unreadable file,
+      // or a real key in a form this can't load, is the identity
+      // the node is registered under.
+      if file_is_blank(path) {
+        e.context(format!(
+          "Failed to load the private key at {path:?} (the file is empty: delete it to have a new key generated)"
+        ))
+      } else {
+        e.context(format!(
+          "Failed to load the private key at {path:?}"
+        ))
+      }
+    })?;
     let public = private.compute_public_key_using_dh(pki_kind)?;
 
     Ok(Self { private, public })
@@ -137,6 +171,26 @@ impl EncodedKeyPair {
   }
 }
 
+/// Whether the file at `path` reads as empty or whitespace only,
+/// as [Pkcs8PrivateKey::from_file] refuses it. False when it can't
+/// be read.
+fn file_is_blank(path: &Path) -> bool {
+  std::fs::read_to_string(path)
+    .map(zeroize::Zeroizing::new)
+    .is_ok_and(|contents| contents.trim().is_empty())
+}
+
+/// Whether the private key file at `path` holds the key of
+/// `public`.
+fn file_holds_key(
+  pki_kind: PkiKind,
+  path: &Path,
+  public: &SpkiPublicKey,
+) -> bool {
+  EncodedKeyPair::from_file(pki_kind, path)
+    .is_ok_and(|on_disk| on_disk.public == *public)
+}
+
 /// `<path><suffix>`: a sibling of the key file, keeping the full
 /// file name (`cperiphery.key.next`, not `cperiphery.next`).
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -151,15 +205,29 @@ const NEXT_SUFFIX: &str = ".next";
 /// [RotatableKeyPair::finish_rotation].
 const OLD_SUFFIX: &str = ".old";
 
+/// A key pair loaded from a private key spec, which a file backed
+/// pair can replace while in use: [Self::rotate] in one step, or
+/// [Self::begin_rotation] in two phases.
+///
+/// One rotation at a time: [Self::rotate], [Self::begin_rotation]
+/// and [Self::finish_rotation] error while another rotation of the
+/// pair is in flight. Reads ([Self::load], [Self::retired],
+/// [Self::rotation_pending]) never count as one. Nothing
+/// coordinates separate processes: only one process may rotate a
+/// given key file.
 pub struct RotatableKeyPair {
   keys: ArcSwap<EncodedKeyPair>,
   path: Option<PathBuf>,
+  /// Whether a rotation is in flight, see [RotationGuard].
+  rotating: AtomicBool,
 }
 
 impl RotatableKeyPair {
   /// Parses from either direct private key (raw / der / pem),
   /// or from file containing raw / der / pem.
-  /// Use `file:/path/to/private.key` to specify file.
+  /// Use `file:/path/to/private.key` to specify file: a key is
+  /// generated and written there when the file does not exist.
+  /// An empty key, or an existing empty file, is an error.
   pub fn from_private_key_spec(
     pki_kind: PkiKind,
     private_key_spec: &str,
@@ -181,22 +249,64 @@ impl RotatableKeyPair {
     Ok(Self {
       keys: ArcSwap::new(Arc::new(keys)),
       path,
+      rotating: AtomicBool::new(false),
     })
   }
 
   /// If 'path' is Some, generates, writes, and stores new key pair.
   /// Returns the public key, maybe new if using file.
+  ///
+  /// Writing the private key file is the switch: once it holds the
+  /// new key, the pair in memory is the new one too, so this
+  /// process and the next start agree. A write can fail after the
+  /// new key is in place (syncing the directory after the rename),
+  /// so on a failed write the file is read back to decide: holding
+  /// the new key, the rotation goes ahead (with a warning),
+  /// otherwise the error is returned and memory keeps the previous
+  /// key. The `.pub` sidecar is refreshed on a best effort basis.
+  /// The write is synchronous (no await, so the future can't be
+  /// dropped between the switch and the in-memory swap). Errors
+  /// while another rotation is in flight.
   pub async fn rotate(
     &self,
     pki_kind: PkiKind,
   ) -> anyhow::Result<SpkiPublicKey> {
+    self.rotate_with(pki_kind, |private, path| {
+      private.write_pem_sync(path)
+    })
+  }
+
+  /// [Self::rotate], writing the private key file with `write`.
+  fn rotate_with(
+    &self,
+    pki_kind: PkiKind,
+    write: impl FnOnce(&Pkcs8PrivateKey, &Path) -> anyhow::Result<()>,
+  ) -> anyhow::Result<SpkiPublicKey> {
     let Some(path) = self.path.as_deref() else {
       return Ok(self.keys.load().public.clone());
     };
-    let keys =
-      EncodedKeyPair::generate_write_async(pki_kind, path).await?;
+    let _rotating = RotationGuard::acquire(&self.rotating)?;
+    let keys = EncodedKeyPair::generate(pki_kind)?;
+    if let Err(e) = write(&keys.private, path) {
+      // An error doesn't mean the file is unchanged: memory follows
+      // whatever key the file now holds.
+      if !file_holds_key(pki_kind, path, &keys.public) {
+        return Err(e);
+      }
+      tracing::warn!(
+        "Rotated the private key at {path:?}, though writing it reported an error | {e:#}"
+      );
+    }
     let public_key = keys.public.clone();
     self.keys.store(Arc::new(keys));
+    sync_parent_dir(path);
+    if let Err(e) =
+      public_key.write_pem_sync(path.with_extension("pub"))
+    {
+      tracing::warn!(
+        "Rotated the private key, but failed to refresh the public key file | {e:#}"
+      );
+    }
     Ok(public_key)
   }
 
@@ -222,8 +332,12 @@ impl RotatableKeyPair {
   /// registered key. Resumes an existing candidate (a rotation
   /// interrupted before commit; the caller re-registers it, which
   /// must be idempotent). Errors when the pair is not file backed,
-  /// and while a [retired][Self::retired] key of an earlier
-  /// rotation is still waiting to be finished.
+  /// while another rotation is in flight (until the returned
+  /// [KeyRotation] is committed, aborted or dropped), and while a
+  /// [retired][Self::retired] key of an earlier rotation is still
+  /// waiting to be finished. A `<path>.old` holding the live key (a
+  /// commit interrupted before its switch) is not a retired key, and
+  /// is removed.
   pub fn begin_rotation(
     &self,
     pki_kind: PkiKind,
@@ -233,11 +347,19 @@ impl RotatableKeyPair {
         "The private key is not file backed, so it cannot be rotated"
       );
     };
+    let guard = RotationGuard::acquire(&self.rotating)?;
     let old_path = sibling(path, OLD_SUFFIX);
-    if old_path.try_exists()? {
-      anyhow::bail!(
+    let unfinished = || {
+      format!(
         "A previous rotation is not finished: the retired key at {old_path:?} must be revoked and cleaned up first"
-      );
+      )
+    };
+    if self
+      .load_retired(pki_kind, &old_path, true)
+      .with_context(unfinished)?
+      .is_some()
+    {
+      return Err(anyhow!(unfinished()));
     }
     let next_path = sibling(path, NEXT_SUFFIX);
     let candidate = match next_path.try_exists()? {
@@ -261,10 +383,12 @@ impl RotatableKeyPair {
     };
     Ok(KeyRotation {
       pair: self,
+      pki_kind,
       live_path: path.to_path_buf(),
       next_path,
       old_path,
       candidate,
+      _rotating: guard,
     })
   }
 
@@ -281,6 +405,16 @@ impl RotatableKeyPair {
   /// [Self::finish_rotation] removes it: the caller revokes its
   /// public key wherever it was registered, then finishes. `None`
   /// when no rotation is waiting to be finished.
+  ///
+  /// Never the live pair: a `<path>.old` holding the live key was
+  /// left by a commit that did not switch (interrupted, or its
+  /// rename failed), so there is nothing to revoke. `None` is
+  /// returned, and the file is left for the next
+  /// [begin_rotation][Self::begin_rotation] to remove (until then
+  /// [Self::rotation_pending] stays true).
+  ///
+  /// Only reads, without the rotation guard: it never makes a
+  /// concurrent rotation fail as already in progress.
   pub fn retired(
     &self,
     pki_kind: PkiKind,
@@ -288,20 +422,52 @@ impl RotatableKeyPair {
     let Some(path) = self.path.as_deref() else {
       return Ok(None);
     };
-    let old_path = sibling(path, OLD_SUFFIX);
+    // Never settles: during a commit `.old` holds the live key
+    // until the switch, so only a holder of the guard may remove
+    // it.
+    self.load_retired(pki_kind, &sibling(path, OLD_SUFFIX), false)
+  }
+
+  /// Loads `<path>.old`, see [Self::retired]. `settle` removes one
+  /// holding the live key: only under the rotation guard.
+  fn load_retired(
+    &self,
+    pki_kind: PkiKind,
+    old_path: &Path,
+    settle: bool,
+  ) -> anyhow::Result<Option<EncodedKeyPair>> {
     if !old_path.try_exists()? {
       return Ok(None);
     }
-    EncodedKeyPair::from_file(pki_kind, &old_path)
-      .with_context(|| {
-        format!("Failed to load the retired key at {old_path:?}")
-      })
-      .map(Some)
+    let retired = match EncodedKeyPair::from_file(pki_kind, old_path)
+    {
+      Ok(retired) => retired,
+      // Finished meanwhile ([Self::retired] loads without the
+      // rotation guard).
+      Err(_) if !old_path.try_exists()? => return Ok(None),
+      Err(e) => {
+        return Err(e).with_context(|| {
+          format!("Failed to load the retired key at {old_path:?}")
+        });
+      }
+    };
+    if retired.public != self.keys.load().public {
+      return Ok(Some(retired));
+    }
+    if settle {
+      tracing::info!(
+        "Removing {old_path:?}: it holds the live key, left by a key rotation which did not switch"
+      );
+      remove_file_if_exists(old_path)?;
+    }
+    Ok(None)
   }
 
   /// Whether a rotation was interrupted: a candidate (`<path>.next`)
   /// or a retired key (`<path>.old`) is waiting, see
-  /// [Self::begin_rotation] and [Self::retired].
+  /// [Self::begin_rotation] and [Self::retired]. Also true for a
+  /// `<path>.old` holding the live key (a commit that did not
+  /// switch), until [Self::begin_rotation] removes it.
   pub fn rotation_pending(&self) -> bool {
     self.path.as_deref().is_some_and(|path| {
       sibling(path, NEXT_SUFFIX).exists()
@@ -310,31 +476,89 @@ impl RotatableKeyPair {
   }
 
   /// Deletes the retired key of a committed rotation. Idempotent.
+  /// Errors while a rotation is in flight, as its commit may be
+  /// writing `<path>.old` right then.
   pub fn finish_rotation(&self) -> anyhow::Result<()> {
     let Some(path) = self.path.as_deref() else {
       return Ok(());
     };
-    let old_path = sibling(path, OLD_SUFFIX);
-    match std::fs::remove_file(&old_path) {
-      Ok(()) => Ok(()),
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      Err(e) => Err(e).with_context(|| {
-        format!("Failed to delete the retired key at {old_path:?}")
-      }),
+    let _rotating = RotationGuard::acquire(&self.rotating)?;
+    remove_file_if_exists(&sibling(path, OLD_SUFFIX))
+  }
+}
+
+/// Marks a rotation of a [RotatableKeyPair] in flight, until
+/// dropped.
+struct RotationGuard<'a>(&'a AtomicBool);
+
+impl<'a> RotationGuard<'a> {
+  fn acquire(rotating: &'a AtomicBool) -> anyhow::Result<Self> {
+    rotating
+      .compare_exchange(
+        false,
+        true,
+        Ordering::Acquire,
+        Ordering::Relaxed,
+      )
+      .map_err(|_| {
+        anyhow!("A key rotation is already in progress")
+      })?;
+    Ok(Self(rotating))
+  }
+}
+
+impl Drop for RotationGuard<'_> {
+  fn drop(&mut self) {
+    self.0.store(false, Ordering::Release);
+  }
+}
+
+fn remove_file_if_exists(path: &Path) -> anyhow::Result<()> {
+  match std::fs::remove_file(path) {
+    Ok(()) => Ok(()),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(e) => {
+      Err(e).with_context(|| format!("Failed to delete {path:?}"))
     }
   }
 }
 
+/// Flushes the directory entries beside `path` (a rename into
+/// place) to disk, so a switched key survives a power loss before
+/// the caller acts on it (revokes the previous key). Best effort:
+/// the switch already happened, so a failure is only logged.
+fn sync_parent_dir(path: &Path) {
+  #[cfg(unix)]
+  {
+    let parent = match path.parent() {
+      Some(parent) if !parent.as_os_str().is_empty() => parent,
+      _ => Path::new("."),
+    };
+    if let Err(e) =
+      std::fs::File::open(parent).and_then(|dir| dir.sync_all())
+    {
+      tracing::warn!(
+        "Failed to sync the key directory {parent:?} to disk | {e:#}"
+      );
+    }
+  }
+  #[cfg(not(unix))]
+  let _ = path;
+}
+
 /// An in-flight rotation, see [RotatableKeyPair::begin_rotation].
 /// Dropping it without [commit][Self::commit] or
-/// [abort][Self::abort] leaves the candidate file for the next
+/// [abort][Self::abort] ends the rotation and leaves the candidate
+/// file for the next
 /// [begin_rotation][RotatableKeyPair::begin_rotation] to resume.
 pub struct KeyRotation<'a> {
   pair: &'a RotatableKeyPair,
+  pki_kind: PkiKind,
   live_path: PathBuf,
   next_path: PathBuf,
   old_path: PathBuf,
   candidate: EncodedKeyPair,
+  _rotating: RotationGuard<'a>,
 }
 
 impl KeyRotation<'_> {
@@ -352,24 +576,62 @@ impl KeyRotation<'_> {
   /// is first written to `<path>.old` (to be revoked, see
   /// [RotatableKeyPair::retired]), then the candidate is renamed
   /// over the live path: one atomic rename, so the live file never
-  /// goes missing. From here every signature uses the new key.
+  /// goes missing. From here every signature uses the new key, and
+  /// the switch is synced to disk before this returns.
   /// The `.pub` sidecar is refreshed on a best effort basis.
+  ///
+  /// Refuses (changing nothing) when `<path>.next` no longer holds
+  /// the candidate, or a retired key is already waiting. When the
+  /// rename fails, `<path>.old` is removed again, as nothing
+  /// switched.
   pub fn commit(self) -> anyhow::Result<()> {
+    // The file renamed into place must hold the key memory
+    // switches to, or a restart would load another key.
+    let on_disk =
+      EncodedKeyPair::from_file(self.pki_kind, &self.next_path)
+        .with_context(|| {
+          format!(
+            "Failed to load the rotation candidate at {:?}",
+            self.next_path
+          )
+        })?;
+    if on_disk.public != self.candidate.public {
+      return Err(anyhow!(
+        "The rotation candidate at {:?} changed since the rotation began",
+        self.next_path
+      ));
+    }
+    if self.old_path.try_exists()? {
+      return Err(anyhow!(
+        "A retired key is already waiting at {:?}",
+        self.old_path
+      ));
+    }
     let previous = self.pair.load().clone();
     previous
       .private
       .write_pem_sync(&self.old_path)
       .context("Failed to keep the previous key for revocation")?;
-    std::fs::rename(&self.next_path, &self.live_path).with_context(
-      || {
+    if let Err(e) = std::fs::rename(&self.next_path, &self.live_path)
+    {
+      // Nothing switched: `.old` must not offer the live key for
+      // revocation.
+      if let Err(e) = std::fs::remove_file(&self.old_path) {
+        tracing::warn!(
+          "Failed to remove {:?} after the failed key switch | {e:#}",
+          self.old_path
+        );
+      }
+      return Err(e).with_context(|| {
         format!(
           "Failed to move the new key {:?} into place at {:?}",
           self.next_path, self.live_path
         )
-      },
-    )?;
+      });
+    }
     let public = self.candidate.public.clone();
     self.pair.keys.store(Arc::new(self.candidate));
+    sync_parent_dir(&self.live_path);
     if let Err(e) =
       public.write_pem_sync(self.live_path.with_extension("pub"))
     {
@@ -383,15 +645,11 @@ impl KeyRotation<'_> {
   /// Drops the candidate (deletes `<path>.next`). Nothing else
   /// changed.
   pub fn abort(self) -> anyhow::Result<()> {
-    match std::fs::remove_file(&self.next_path) {
-      Ok(()) => Ok(()),
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      Err(e) => Err(e).with_context(|| {
-        format!(
-          "Failed to delete the rotation candidate at {:?}",
-          self.next_path
-        )
-      }),
-    }
+    remove_file_if_exists(&self.next_path).with_context(|| {
+      format!(
+        "Failed to delete the rotation candidate at {:?}",
+        self.next_path
+      )
+    })
   }
 }

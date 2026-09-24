@@ -1,21 +1,25 @@
 use anyhow::Context;
+use zeroize::Zeroizing;
 
-use crate::PkiKind;
+use crate::{PkiKind, key::check_raw_public_key};
 
 /// Wrapper around [snow::HandshakeState] to streamline this implementation
 pub struct MutualNoiseHandshake(snow::HandshakeState);
 
 impl MutualNoiseHandshake {
+  /// Takes the private key in any form
+  /// [crate::Pkcs8PrivateKey::maybe_raw_bytes] accepts.
   pub fn new_initiator(
     maybe_pkcs8_private_key: &str,
     prologue: &[u8],
   ) -> anyhow::Result<MutualNoiseHandshake> {
-    let private_key = crate::key::Pkcs8PrivateKey::maybe_raw_bytes(
-      maybe_pkcs8_private_key,
-    )?;
+    let private_key =
+      Zeroizing::new(crate::key::Pkcs8PrivateKey::maybe_raw_bytes(
+        maybe_pkcs8_private_key,
+      )?);
     Ok(MutualNoiseHandshake(
       snow::Builder::new(PkiKind::MUTUAL.parse()?)
-        .local_private_key(&private_key)
+        .local_private_key(&*private_key)
         .context("Invalid private key")?
         .prologue(prologue)
         .context("Invalid prologue")?
@@ -24,17 +28,20 @@ impl MutualNoiseHandshake {
     ))
   }
 
-  /// Should pass base64 encoded private key.
+  /// Takes the private key in any form
+  /// [crate::Pkcs8PrivateKey::maybe_raw_bytes] accepts (the base64
+  /// pkcs8 der, usually).
   pub fn new_responder(
     maybe_pkcs8_private_key: &str,
     prologue: &[u8],
   ) -> anyhow::Result<MutualNoiseHandshake> {
-    let private_key = crate::key::Pkcs8PrivateKey::maybe_raw_bytes(
-      maybe_pkcs8_private_key,
-    )?;
+    let private_key =
+      Zeroizing::new(crate::key::Pkcs8PrivateKey::maybe_raw_bytes(
+        maybe_pkcs8_private_key,
+      )?);
     Ok(MutualNoiseHandshake(
       snow::Builder::new(PkiKind::MUTUAL.parse()?)
-        .local_private_key(&private_key)
+        .local_private_key(&*private_key)
         .context("Invalid private key")?
         .prologue(prologue)
         .context("Invalid prologue")?
@@ -61,10 +68,14 @@ impl MutualNoiseHandshake {
   /// Gets the remote public key bytes.
   /// Note that this should only be called after m2 is read on client side,
   /// or m3 is read on server side.
+  /// Low order and non canonical keys are refused (see
+  /// [crate::SpkiPublicKey::from_raw_bytes]).
   pub fn remote_public_key(&self) -> anyhow::Result<&[u8]> {
-    self
+    let remote = self
       .0
       .get_remote_static()
-      .context("Failed to get remote public key")
+      .context("Failed to get remote public key")?;
+    check_raw_public_key(remote)?;
+    Ok(remote)
   }
 }

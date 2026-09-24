@@ -1,6 +1,4 @@
-//! # Mogh PKI
-//!
-//! Utilities for Public Key Infrastructure
+#![doc = include_str!("../README.md")]
 
 mod key;
 mod kinds;
@@ -13,20 +11,26 @@ pub mod cli;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkiKind {
-  /// The client has server public key pinned, and transmits
-  /// its public key in one zero trust call by encrypting
-  /// some mutually known information (such as request body)
-  /// into a signature.
+  /// The client has the server public key pinned, and proves its
+  /// own public key in a single message, which authenticates
+  /// information both sides know (the prologue, such as the
+  /// request) without encrypting it.
+  ///
+  /// Only the server can validate the message, and whoever holds
+  /// the server private key can forge one for any client key. The
+  /// message can be replayed: bind a timestamp or nonce into the
+  /// prologue and enforce a window. See
+  /// [one_way::OneWayNoiseHandshake].
   ///
   /// Uses Noise IK handshake.
-  /// https://noiseprotocol.org/noise.html#handshake-patterns
+  /// <https://noiseprotocol.org/noise.html#handshake-patterns>
   OneWay,
   /// Multistep handshake where each side
   /// gains zero trust knowledge of the other's
-  /// public key for verificiation.
+  /// public key for verification.
   ///
   /// Uses Noise XX handshake.
-  /// https://noiseprotocol.org/noise.html#handshake-patterns
+  /// <https://noiseprotocol.org/noise.html#handshake-patterns>
   Mutual,
 }
 

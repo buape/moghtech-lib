@@ -1,17 +1,45 @@
 use anyhow::Context;
 use data_encoding::BASE64;
 
-use crate::{PkiKind, key::SpkiPublicKey};
+use crate::{
+  PkiKind,
+  key::{SpkiPublicKey, check_raw_private_key, check_raw_public_key},
+};
 
-/// Wrapper around [snow::HandshakeState] to streamline this implementation
+/// Wrapper around [snow::HandshakeState] to streamline this implementation.
+///
+/// One message of a Noise IK handshake ([PkiKind::OneWay]): the
+/// initiator, which has the responder's static public key pinned,
+/// sends its own static public key (encrypted) in a message that
+/// authenticates the `prologue`. What it gives, and what it does
+/// not:
+/// - The prologue is authenticated, not encrypted: both sides must
+///   already know it (the request being signed).
+/// - Only the holder of the responder's private key can validate a
+///   message, and that holder can also forge one for any client
+///   public key (key compromise impersonation). This is no publicly
+///   verifiable signature: the responder's private key is as
+///   sensitive as every client key together.
+/// - A message validates again whenever it is replayed with the
+///   same prologue. Bind a freshness value into the prologue (a
+///   timestamp, a nonce) and have the responder enforce a window,
+///   as mogh_auth signed requests do (the prologue covers the
+///   method, path, a timestamp and the body hash).
 pub struct OneWayNoiseHandshake(snow::HandshakeState);
 
 impl OneWayNoiseHandshake {
+  /// `private_key` and `remote_public_key` are the raw 32 byte
+  /// X25519 keys (see [crate::Pkcs8PrivateKey::maybe_raw_bytes] and
+  /// [SpkiPublicKey::maybe_pem_to_raw_bytes]), not the base64 text
+  /// or der. Anything else is an error.
   pub fn new_initiator(
     private_key: &[u8],
     remote_public_key: &[u8],
     prologue: &[u8],
   ) -> anyhow::Result<OneWayNoiseHandshake> {
+    check_raw_private_key(private_key)?;
+    check_raw_public_key(remote_public_key)
+      .context("Invalid remote public key")?;
     Ok(OneWayNoiseHandshake(
       snow::Builder::new(PkiKind::ONE_WAY.parse()?)
         .local_private_key(private_key)
@@ -25,10 +53,14 @@ impl OneWayNoiseHandshake {
     ))
   }
 
+  /// `private_key` is the raw 32 byte X25519 key (see
+  /// [crate::Pkcs8PrivateKey::maybe_raw_bytes]), not the base64 text.
+  /// Anything else is an error.
   pub fn new_responder(
     private_key: &[u8],
     prologue: &[u8],
   ) -> anyhow::Result<OneWayNoiseHandshake> {
+    check_raw_private_key(private_key)?;
     Ok(OneWayNoiseHandshake(
       snow::Builder::new(PkiKind::ONE_WAY.parse()?)
         .local_private_key(private_key)
@@ -51,7 +83,11 @@ impl OneWayNoiseHandshake {
   }
 
   /// Reads base64 encoded signature from other side of handshake,
-  /// and produces the client public key.
+  /// and produces the client public key. Low order and non
+  /// canonical client keys are refused (see
+  /// [SpkiPublicKey::from_raw_bytes]).
+  ///
+  /// It does not prevent replay, see [OneWayNoiseHandshake].
   pub fn validate_signature(
     &mut self,
     signature: &str,
