@@ -9,11 +9,54 @@
 //! `X-Forwarded-For` is walked from the right (the entry appended by
 //! the nearest proxy), skipping trusted proxy hops, and the first
 //! untrusted address is the client. Entries further left were
-//! written by untrusted parties and are ignored.
+//! written by untrusted parties and are ignored. `X-Real-IP` is
+//! only read when `X-Forwarded-For` has no entries, and is walked
+//! the same way (a proxy which adds its own line after one the
+//! client sent is the nearest, so its line wins, except under
+//! [TrustedProxies::All], where the first line is used).
 //!
 //! The [RequestIp] extractor reads the [TrustedProxies] policy from
 //! the request extensions (add it with [TrustedProxies::layer]),
 //! falling back to [TrustedProxies::default] (private ranges).
+//!
+//! # What the trusted proxy must do
+//!
+//! Every trusted proxy must **append to (or overwrite)
+//! `X-Forwarded-For`**, not only set `X-Real-IP`. A proxy passes
+//! headers it does not set through untouched, and `X-Forwarded-For`
+//! takes precedence over `X-Real-IP`. So behind a proxy which only
+//! sets `X-Real-IP`, a client sending its own `X-Forwarded-For`
+//! chooses its ip, which passes CIDR whitelists and dodges per ip
+//! rate limits. For nginx:
+//!
+//! ```nginx
+//! proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+//! proxy_set_header X-Real-IP $remote_addr;
+//! ```
+//!
+//! Caddy and Traefik set `X-Forwarded-For` by default.
+//!
+//! # Narrowing the default
+//!
+//! The default ([TrustedProxies::private]) trusts every loopback and
+//! private peer. That is only safe when every such peer is a proxy
+//! which sets `X-Forwarded-For`. Any path which makes public clients
+//! arrive from a private address lets them choose their ip, eg:
+//!
+//! - Docker's userland `docker-proxy` (IPv6 clients of a port
+//!   published to an IPv4-only network arrive from the bridge
+//!   gateway, eg `172.17.0.1`).
+//! - Rootless Docker / Podman port forwarding, and Docker Desktop.
+//! - A Kubernetes Service with `externalTrafficPolicy: Cluster`
+//!   (SNAT to a node ip).
+//! - Other hosts / containers on the private network or VPN which
+//!   can reach the app directly.
+//!
+//! In those setups use [TrustedProxies::None] (`["none"]`) when
+//! nothing is in front of the app, or list the exact proxy
+//! address(es), eg `["172.18.0.5"]` with the proxy container given
+//! a static ip. Listing the whole container network is not enough:
+//! it includes the gateway the forwarded traffic arrives from.
 //!
 //! The [cidr] module provides CIDR set parsing and matching,
 //! also used to restrict requests by source ip.
@@ -46,15 +89,35 @@ pub enum TrustedProxies {
   /// is within one of the networks.
   Cidrs(CidrSet),
   /// Trust forwarding headers from any peer, and every
-  /// `X-Forwarded-For` hop. Only safe when the server is
-  /// unreachable except through a proxy which sets the headers.
+  /// `X-Forwarded-For` hop, so the **leftmost** entry is the
+  /// client (legacy behavior).
+  ///
+  /// ⚠️ Only safe when the server is unreachable except through
+  /// proxies which **replace** any client-sent `X-Forwarded-For`,
+  /// eg the Caddy and Traefik defaults. Behind a proxy which
+  /// **appends** (nginx `$proxy_add_x_forwarded_for`, HAProxy
+  /// `option forwardfor`, AWS ALB append mode) the leftmost entry
+  /// is whatever the client sent, so clients choose their ip.
+  /// Likewise behind a proxy which adds its own `X-Real-IP` line
+  /// rather than replacing a client-sent one (eg HAProxy
+  /// `http-request add-header`), as the first line is used.
+  /// List the proxy addresses / networks ([Self::Cidrs]) instead.
   All,
 }
 
 impl Default for TrustedProxies {
-  /// Trusts loopback and private (RFC 1918 / ULA) peers,
-  /// which covers a reverse proxy on the same host or
-  /// container network.
+  /// Trusts loopback and private (RFC 1918 / ULA) peers
+  /// ([Self::private]), which covers a reverse proxy on the same
+  /// host or container network.
+  ///
+  /// ⚠️ Any private peer is believed, not only the proxy. When
+  /// public clients can reach the app from a private address (a
+  /// published port through Docker's userland proxy, rootless
+  /// Docker / Podman, Docker Desktop, Kubernetes SNAT, or hosts
+  /// on the same network / VPN), they choose their own ip. Narrow
+  /// it to the exact proxy address, or [Self::None] when nothing
+  /// is in front of the app. See the
+  /// [crate docs](crate#narrowing-the-default).
   fn default() -> Self {
     Self::private()
   }
@@ -76,6 +139,9 @@ static DEFAULT_TRUSTED_PROXIES: LazyLock<TrustedProxies> =
 
 impl TrustedProxies {
   /// Loopback and private (RFC 1918 / ULA) ranges ([PRIVATE_RANGES]).
+  ///
+  /// ⚠️ Believes every private peer, see the caveat on
+  /// [TrustedProxies::default].
   pub fn private() -> Self {
     Self::Cidrs(
       CidrSet::parse(PRIVATE_RANGES)
@@ -86,9 +152,11 @@ impl TrustedProxies {
   /// Build the policy from a config list, for piping an app's
   /// `trusted_proxies` / internal CIDR config through.
   ///
-  /// - Empty: [Self::private] (the default).
-  /// - `all` (alone): [Self::All].
-  /// - `none` (alone): [Self::None].
+  /// - Empty: [Self::private] (the default, see its caveat on
+  ///   [TrustedProxies::default]).
+  /// - `all` (alone): [Self::All], only safe behind proxies which
+  ///   replace (not append to) `X-Forwarded-For`.
+  /// - `none` (alone): [Self::None], for an app reached directly.
   /// - Otherwise the CIDR ranges / ips given, where the keyword
   ///   `private` expands to [PRIVATE_RANGES] (eg
   ///   `["private", "203.0.113.10"]`).
@@ -230,11 +298,21 @@ pub fn get_ip_from_headers_and_extensions(
 ///
 /// 1. If the peer is not a trusted proxy, the peer is the client
 ///    and headers are ignored.
-/// 2. Otherwise `X-Forwarded-For` is walked right to left, and the
-///    first entry which is not a trusted proxy is the client. If every
-///    entry is trusted, the leftmost is used.
-/// 3. Otherwise `X-Real-IP` is used.
+/// 2. Otherwise `X-Forwarded-For` is walked right to left (across
+///    all header instances, the last one being the nearest), and
+///    the first entry which is not a trusted proxy is the client.
+///    If every entry is trusted, the leftmost is used.
+/// 3. Otherwise, when `X-Forwarded-For` has no entries, `X-Real-IP`
+///    is walked the same way. A proxy which adds its own
+///    `X-Real-IP` line after a client-sent one is nearer, so its
+///    line wins rather than the first (except under
+///    [TrustedProxies::All], where the first line is used).
 /// 4. Otherwise the peer is the client.
+///
+/// ⚠️ A client-sent `X-Forwarded-For` which a trusted proxy passes
+/// through takes precedence over the proxy's `X-Real-IP`, so the
+/// proxy must append to (or overwrite) `X-Forwarded-For`, see the
+/// [crate docs](crate#what-the-trusted-proxy-must-do).
 ///
 /// Errors with `401 Unauthorized` when the peer is unknown (no
 /// `ConnectInfo`, ie the app is not served with
@@ -269,16 +347,48 @@ pub fn get_client_ip(
   // which cannot be attributed, so nothing left of it is either.
   let lenient = matches!(trusted_proxies, TrustedProxies::All);
 
-  // Walk X-Forwarded-For from the nearest hop back to the client,
-  // across possibly multiple header instances.
+  // X-Real-IP is only a fallback for proxies which don't
+  // set X-Forwarded-For.
+  for (name, label) in [
+    ("x-forwarded-for", "X-Forwarded-For"),
+    ("x-real-ip", "X-Real-IP"),
+  ] {
+    if let Some(ip) = walk_forwarding_header(
+      headers,
+      name,
+      label,
+      trusted_proxies,
+      lenient,
+    )? {
+      return Ok(ip);
+    }
+  }
+
+  peer
+    .context("No socket peer address available for the request, and no forwarding headers were sent.")
+    .status_code(StatusCode::UNAUTHORIZED)
+}
+
+/// Walk a forwarding header from the nearest hop back to the
+/// client, across possibly multiple header instances (each a comma
+/// separated list, the last instance added by the nearest proxy).
+/// Returns the first entry which is not a trusted proxy, else the
+/// leftmost entry, or `None` when the header has no entries.
+fn walk_forwarding_header(
+  headers: &HeaderMap,
+  name: &str,
+  label: &str,
+  trusted_proxies: &TrustedProxies,
+  lenient: bool,
+) -> mogh_error::Result<Option<IpAddr>> {
   let mut leftmost = None;
-  for value in headers.get_all("x-forwarded-for").iter().rev() {
+  for value in headers.get_all(name).iter().rev() {
     let value = match value.to_str() {
       Ok(value) => value,
       Err(_) if lenient => continue,
       Err(_) => {
         return Err(
-          anyhow!("X-Forwarded-For header is not valid UTF-8")
+          anyhow!("{label} header is not valid UTF-8")
             .status_code(StatusCode::UNAUTHORIZED),
         );
       }
@@ -293,32 +403,12 @@ pub fn get_client_ip(
         Err(e) => return Err(e),
       };
       if !trusted_proxies.trusts(ip) {
-        return Ok(ip);
+        return Ok(Some(ip));
       }
       leftmost = Some(ip);
     }
   }
-  if let Some(ip) = leftmost {
-    return Ok(ip);
-  }
-
-  if let Some(real_ip) = headers.get("x-real-ip") {
-    match real_ip.to_str().map(str::trim) {
-      Ok("") => {}
-      Ok(real_ip) => return parse_forwarded_ip(real_ip),
-      Err(_) if lenient => {}
-      Err(_) => {
-        return Err(
-          anyhow!("X-Real-IP header is not valid UTF-8")
-            .status_code(StatusCode::UNAUTHORIZED),
-        );
-      }
-    }
-  }
-
-  peer
-    .context("No socket peer address available for the request, and no forwarding headers were sent.")
-    .status_code(StatusCode::UNAUTHORIZED)
+  Ok(leftmost)
 }
 
 /// Parse a forwarding header entry as an ip, tolerating
@@ -442,6 +532,73 @@ mod tests {
   }
 
   #[test]
+  fn real_ip_instances_are_walked_from_the_nearest() {
+    let trusted = proxies(&["10.0.0.0/8"]);
+    // The client sent its own line and the proxy added the real
+    // one after it (eg HAProxy `http-request add-header`).
+    let h =
+      headers(&[("x-real-ip", "10.9.9.9"), ("x-real-ip", CLIENT)]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap(),
+      ip(CLIENT)
+    );
+    // The same, merged into one comma separated line.
+    let h = headers(&[("x-real-ip", "10.9.9.9, 203.0.113.7")]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap(),
+      ip(CLIENT)
+    );
+    // Two proxies each adding a line, the nearer one is trusted.
+    let h =
+      headers(&[("x-real-ip", CLIENT), ("x-real-ip", "10.0.0.2")]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap(),
+      ip(CLIENT)
+    );
+    // Every line from a trusted hop: the leftmost.
+    let h = headers(&[
+      ("x-real-ip", "10.0.0.5"),
+      ("x-real-ip", "10.0.0.2"),
+    ]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap(),
+      ip("10.0.0.5")
+    );
+    // A malformed line which must be examined fails closed.
+    let h =
+      headers(&[("x-real-ip", CLIENT), ("x-real-ip", "unknown")]);
+    let err =
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
+  #[test]
+  fn forwarded_for_takes_precedence_over_real_ip() {
+    let trusted = proxies(&["10.0.0.0/8"]);
+    // A proxy which only sets X-Real-IP passes the client's own
+    // X-Forwarded-For through, which wins. Documented: the proxy
+    // must append to (or overwrite) X-Forwarded-For.
+    let h = headers(&[
+      ("x-forwarded-for", "10.0.0.7"),
+      ("x-real-ip", CLIENT),
+    ]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap(),
+      ip("10.0.0.7")
+    );
+    // Once the proxy appends to X-Forwarded-For, the client's
+    // entry is never examined.
+    let h = headers(&[
+      ("x-forwarded-for", "10.0.0.7, 203.0.113.7"),
+      ("x-real-ip", CLIENT),
+    ]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap(),
+      ip(CLIENT)
+    );
+  }
+
+  #[test]
   fn unknown_peer_is_unauthorized_unless_all_trusted() {
     let h = headers(&[("x-forwarded-for", CLIENT)]);
     let err =
@@ -464,6 +621,28 @@ mod tests {
   #[test]
   fn all_trusted_takes_leftmost_forwarded_for() {
     let h = headers(&[("x-forwarded-for", "1.2.3.4, 10.0.0.1")]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &TrustedProxies::All)
+        .unwrap(),
+      ip("1.2.3.4")
+    );
+    // Behind a public proxy which appends, the leftmost entry is
+    // the client's own claim (documented on `All`) ...
+    let public_proxy = Some(ip("198.51.100.50"));
+    let h = headers(&[("x-forwarded-for", "10.0.0.1, 203.0.113.7")]);
+    assert_eq!(
+      get_client_ip(&h, public_proxy, &TrustedProxies::All).unwrap(),
+      ip("10.0.0.1")
+    );
+    // ... while listing the proxy address takes the entry it added.
+    assert_eq!(
+      get_client_ip(&h, public_proxy, &proxies(&["198.51.100.50"]))
+        .unwrap(),
+      ip(CLIENT)
+    );
+    // X-Real-IP lines likewise: the first one (legacy).
+    let h =
+      headers(&[("x-real-ip", "1.2.3.4"), ("x-real-ip", CLIENT)]);
     assert_eq!(
       get_client_ip(&h, Some(ip(PROXY)), &TrustedProxies::All)
         .unwrap(),
@@ -523,6 +702,12 @@ mod tests {
         .unwrap(),
       ip(PROXY)
     );
+    let h = headers(&[("x-real-ip", "unknown")]);
+    assert_eq!(
+      get_client_ip(&h, Some(ip(PROXY)), &TrustedProxies::All)
+        .unwrap(),
+      ip(PROXY)
+    );
   }
 
   #[test]
@@ -533,6 +718,10 @@ mod tests {
       get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap_err();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     let h = headers(&[("x-forwarded-for", "203.0.113.7, unknown")]);
+    let err =
+      get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    let h = headers(&[("x-real-ip", "not-an-ip")]);
     let err =
       get_client_ip(&h, Some(ip(PROXY)), &trusted).unwrap_err();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
@@ -604,6 +793,36 @@ mod tests {
       TrustedProxies::None
     );
     assert!(TrustedProxies::parse(["garbage"]).is_err());
+  }
+
+  #[test]
+  fn default_policy_believes_any_private_peer() {
+    // A public client published through Docker's userland proxy
+    // arrives from the bridge gateway, so the default believes the
+    // header it sent (documented on `TrustedProxies::default`).
+    let gateway = Some(ip("172.17.0.1"));
+    let h = headers(&[("x-forwarded-for", "10.0.0.7")]);
+    assert_eq!(
+      get_client_ip(&h, gateway, &TrustedProxies::default()).unwrap(),
+      ip("10.0.0.7")
+    );
+    // Narrowed to the proxy container's address it is not, while
+    // the proxy itself still is.
+    let narrowed =
+      TrustedProxies::from_config(["172.18.0.5"]).unwrap();
+    assert_eq!(
+      get_client_ip(&h, gateway, &narrowed).unwrap(),
+      ip("172.17.0.1")
+    );
+    assert_eq!(
+      get_client_ip(&h, Some(ip("172.18.0.5")), &narrowed).unwrap(),
+      ip("10.0.0.7")
+    );
+    // Nothing in front of the app: never believed.
+    assert_eq!(
+      get_client_ip(&h, gateway, &TrustedProxies::None).unwrap(),
+      ip("172.17.0.1")
+    );
   }
 
   #[test]
