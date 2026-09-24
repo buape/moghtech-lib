@@ -1,6 +1,6 @@
 {
   "name": "mogh_auth_client",
-  "version": "4.2.0",
+  "version": "5.0.0",
   "description": "Mogh auth client package",
   "repository": {
     "url": "https://github.com/moghtech/lib"
@@ -12,7 +12,9 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsc && node --test \"test/*.test.mjs\"",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "jwt-decode": "^4.0.0"

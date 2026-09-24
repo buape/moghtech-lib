@@ -43,6 +43,7 @@ export type ManageResponses = {
   // API KEY
   CreateApiKey: Types.CreateApiKeyResponse;
   DeleteApiKey: Types.DeleteApiKeyResponse;
-  CreateApiKeyV2: Types.CreateApiKeyV2Response;
-  DeleteApiKeyV2: Types.DeleteApiKeyV2Response;
+  // SIGNING KEY
+  CreateSigningKey: Types.CreateSigningKeyResponse;
+  DeleteSigningKey: Types.DeleteSigningKeyResponse;
 };
