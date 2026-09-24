@@ -1,3 +1,8 @@
+use std::sync::{
+  Arc,
+  atomic::{AtomicU8, Ordering},
+};
+
 use anyhow::Context as _;
 use axum::{
   body::Body,
@@ -11,9 +16,84 @@ pub use axum::http::{
   header::{self, IntoHeaderName},
 };
 
-use crate::serialize_error;
+use crate::{Serror, serialize_error};
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// How much of an [Error] with a server error (5xx) status its
+/// response body carries. Set it for the whole process with
+/// [set_server_error_detail]. Other statuses always carry the full
+/// message and trace, as those messages are meant for the caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum ServerErrorDetail {
+  /// The top-level message and the full context chain (`trace`).
+  /// This is the default.
+  #[default]
+  Full = 0,
+  /// Only the top-level message, with an empty `trace`. An error
+  /// returned with `?` and no added context has the inner error's
+  /// own message on top, which may still name internal hosts, urls
+  /// or paths.
+  Message = 1,
+  /// The status code's canonical reason (eg "Internal Server
+  /// Error") as the message, with an empty `trace`.
+  Generic = 2,
+}
+
+static SERVER_ERROR_DETAIL: AtomicU8 =
+  AtomicU8::new(ServerErrorDetail::Full as u8);
+
+/// Sets how much detail every [Error] response with a server error
+/// (5xx) status carries, for the whole process.
+///
+/// The default, [ServerErrorDetail::Full], sends the full anyhow
+/// context chain to the caller, for every status. Every `?` on a
+/// foreign error gives a 500, so the caller can see internal
+/// details such as database driver messages, request urls, internal
+/// hostnames and file paths. Apps whose callers should not see these
+/// can opt in to hiding them here, typically once at startup.
+///
+/// When details are hidden, the response carries the full error in
+/// a [HiddenServerError] extension, so a middleware can still log it.
+///
+/// This is an app wide setting: libraries should not call it.
+pub fn set_server_error_detail(detail: ServerErrorDetail) {
+  SERVER_ERROR_DETAIL.store(detail as u8, Ordering::Relaxed);
+}
+
+/// The current process wide [ServerErrorDetail], see
+/// [set_server_error_detail].
+pub fn server_error_detail() -> ServerErrorDetail {
+  match SERVER_ERROR_DETAIL.load(Ordering::Relaxed) {
+    1 => ServerErrorDetail::Message,
+    2 => ServerErrorDetail::Generic,
+    _ => ServerErrorDetail::Full,
+  }
+}
+
+/// Response extension holding the full error of a server error
+/// (5xx) response whose body left out details, see
+/// [set_server_error_detail]. Response extensions are not sent to
+/// the caller. Read it in a middleware to log what the caller no
+/// longer sees:
+///
+/// ```
+/// use axum::{Router, middleware::map_response, response::Response};
+/// use mogh_error::HiddenServerError;
+///
+/// async fn log_hidden_errors(res: Response) -> Response {
+///   if let Some(HiddenServerError(e)) = res.extensions().get() {
+///     eprintln!("{} | {e:#}", res.status());
+///   }
+///   res
+/// }
+///
+/// let app: Router = Router::new().layer(map_response(log_hidden_errors));
+/// ```
+#[derive(Debug, Clone)]
+pub struct HiddenServerError(pub Arc<anyhow::Error>);
 
 #[allow(non_snake_case)]
 pub fn Ok<T>(value: T) -> Result<T> {
@@ -24,6 +104,11 @@ pub fn Ok<T>(value: T) -> Result<T> {
 /// The standard `impl From<E> for Error` will attach StatusCode::INTERNAL_SERVER_ERROR,
 /// so if an alternative StatusCode is desired, you should use `.status_code` ([AddStatusCode] or [AddStatusCodeError])
 /// to add the status and `.header` ([AddHeaders] or [AddHeadersError]) before using `?`.
+///
+/// The response body is the serialized [Serror]: the top-level
+/// message and, by default, the full context chain as `trace`, for
+/// every status. See [set_server_error_detail] to hide the details
+/// of server errors (5xx).
 #[derive(Debug)]
 pub struct Error {
   pub status: StatusCode,
@@ -68,11 +153,32 @@ impl Error {
   }
 }
 
-impl IntoResponse for Error {
-  fn into_response(self) -> axum::response::Response {
-    let mut response = axum::response::Response::new(Body::new(
-      serialize_error(&self.error),
-    ));
+impl Error {
+  /// Builds the response, applying `server_error_detail` if the
+  /// status is a server error (5xx).
+  fn response_with_detail(
+    self,
+    server_error_detail: ServerErrorDetail,
+  ) -> axum::response::Response {
+    let detail = if self.status.is_server_error() {
+      server_error_detail
+    } else {
+      ServerErrorDetail::Full
+    };
+    let body = match detail {
+      ServerErrorDetail::Full => serialize_error(&self.error),
+      ServerErrorDetail::Message => {
+        serialize_message(self.error.to_string())
+      }
+      ServerErrorDetail::Generic => serialize_message(
+        self
+          .status
+          .canonical_reason()
+          .unwrap_or("Server Error")
+          .to_string(),
+      ),
+    };
+    let mut response = axum::response::Response::new(Body::new(body));
     *response.status_mut() = self.status;
 
     let headers = response.headers_mut();
@@ -84,7 +190,32 @@ impl IntoResponse for Error {
       headers.extend(self_headers);
     }
 
+    if detail != ServerErrorDetail::Full {
+      response
+        .extensions_mut()
+        .insert(HiddenServerError(Arc::new(self.error)));
+    }
+
     response
+  }
+}
+
+/// Serializes a [Serror] with the message and no trace.
+fn serialize_message(error: String) -> String {
+  let serror = Serror {
+    error,
+    trace: Vec::new(),
+  };
+  serde_json::to_string(&serror)
+    .unwrap_or_else(|_| format!("{serror:#?}"))
+}
+
+impl IntoResponse for Error {
+  /// The body is the serialized [Serror]. For a server error (5xx)
+  /// status, it carries as much detail as [set_server_error_detail]
+  /// allows (all of it by default).
+  fn into_response(self) -> axum::response::Response {
+    self.response_with_detail(server_error_detail())
   }
 }
 
@@ -242,14 +373,7 @@ where
           .body(axum::body::Body::from(body))
           .unwrap()
       }
-      Err(e) => axum::response::Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(
-          header::CONTENT_TYPE,
-          HeaderValue::from_static("application/json"),
-        )
-        .body(axum::body::Body::from(serialize_error(&e)))
-        .unwrap(),
+      Err(e) => Error::from(e).into_response(),
     };
     Response(res)
   }
@@ -282,17 +406,11 @@ impl JsonString {
         )
         .body(axum::body::Body::from(body))
         .unwrap(),
-      JsonString::Err(error) => axum::response::Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header(
-          header::CONTENT_TYPE,
-          HeaderValue::from_static("application/json"),
-        )
-        .body(axum::body::Body::from(serialize_error(
-          &anyhow::Error::from(error)
-            .context("Failed to serialize response body"),
-        )))
-        .unwrap(),
+      JsonString::Err(error) => Error::from(
+        anyhow::Error::from(error)
+          .context("Failed to serialize response body"),
+      )
+      .into_response(),
     }
   }
 }
@@ -397,6 +515,84 @@ mod tests {
     assert_eq!(serror.trace, vec!["root cause"]);
   }
 
+  fn internal_error() -> Error {
+    anyhow::anyhow!("connection refused (db.internal:5432)")
+      .context("Failed to query users")
+      .into()
+  }
+
+  fn hidden_error(
+    response: &axum::response::Response,
+  ) -> Option<String> {
+    response
+      .extensions()
+      .get::<HiddenServerError>()
+      .map(|HiddenServerError(e)| format!("{e:#}"))
+  }
+
+  #[test]
+  fn server_error_detail_defaults_to_full() {
+    assert_eq!(ServerErrorDetail::default(), ServerErrorDetail::Full);
+    let response =
+      internal_error().response_with_detail(ServerErrorDetail::Full);
+    assert!(hidden_error(&response).is_none());
+    let serror: Serror =
+      serde_json::from_str(&body_string(response)).unwrap();
+    assert_eq!(serror.error, "Failed to query users");
+    assert_eq!(
+      serror.trace,
+      vec!["connection refused (db.internal:5432)"]
+    );
+  }
+
+  #[test]
+  fn server_error_detail_message_drops_trace() {
+    let response = internal_error()
+      .header(header::RETRY_AFTER, HeaderValue::from_static("30"))
+      .response_with_detail(ServerErrorDetail::Message);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+      response.headers()[header::CONTENT_TYPE],
+      "application/json"
+    );
+    assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+    assert_eq!(
+      hidden_error(&response).unwrap(),
+      "Failed to query users: connection refused (db.internal:5432)"
+    );
+    let serror: Serror =
+      serde_json::from_str(&body_string(response)).unwrap();
+    assert_eq!(serror.error, "Failed to query users");
+    assert!(serror.trace.is_empty());
+  }
+
+  #[test]
+  fn server_error_detail_generic_uses_canonical_reason() {
+    let response = internal_error()
+      .status_code(StatusCode::SERVICE_UNAVAILABLE)
+      .response_with_detail(ServerErrorDetail::Generic);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(hidden_error(&response).is_some());
+    let body = body_string(response);
+    assert!(!body.contains("db.internal"));
+    let serror: Serror = serde_json::from_str(&body).unwrap();
+    assert_eq!(serror.error, "Service Unavailable");
+    assert!(serror.trace.is_empty());
+  }
+
+  #[test]
+  fn server_error_detail_leaves_client_errors_alone() {
+    let response = internal_error()
+      .status_code(StatusCode::BAD_REQUEST)
+      .response_with_detail(ServerErrorDetail::Generic);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(hidden_error(&response).is_none());
+    let serror: Serror =
+      serde_json::from_str(&body_string(response)).unwrap();
+    assert_eq!(serror.error, "Failed to query users");
+    assert_eq!(serror.trace.len(), 1);
+  }
+
   #[test]
   fn custom_headers_override_default_content_type() {
     let response = Error::msg("boom")
@@ -446,6 +642,32 @@ mod tests {
       "application/json"
     );
     assert_eq!(body_string(response), r#"{"a":1}"#);
+  }
+
+  #[test]
+  fn response_from_unserializable_value_is_serror() {
+    // serde_json rejects non string map keys
+    let value =
+      std::collections::HashMap::from([((1, 2), 3), ((4, 5), 6)]);
+    let Response(response) = Response::from(value);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+      response.headers()[header::CONTENT_TYPE],
+      "application/json"
+    );
+    let serror: Serror =
+      serde_json::from_str(&body_string(response)).unwrap();
+    assert_eq!(serror.error, "Failed to serialize response body");
+    assert_eq!(serror.trace.len(), 1);
+
+    let response = JsonString::from(std::collections::HashMap::from(
+      [((1, 2), 3)],
+    ))
+    .into_response();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let serror: Serror =
+      serde_json::from_str(&body_string(response)).unwrap();
+    assert_eq!(serror.error, "Failed to serialize response body");
   }
 
   #[test]
