@@ -7,9 +7,10 @@
 //! it issues a request under (as the standard HTTP header, or as a
 //! field of whatever frame the transport uses) and the callee
 //! parents its own span under it with [set_remote_parent], so both
-//! sides of the request land in one trace. Without an exporting
-//! layer there is no valid span context, [current_traceparent]
-//! returns `None`, and nothing is sent.
+//! sides of the request land in one trace. Callees should only do
+//! this for trusted callers, see [set_remote_parent]. Without an
+//! exporting layer there is no valid span context,
+//! [current_traceparent] returns `None`, and nothing is sent.
 //!
 //! These go through tracing-opentelemetry's span extension, which
 //! only sees the layer [init](crate::init) installed when both
@@ -46,6 +47,15 @@ pub fn current_traceparent() -> Option<String> {
 /// already started cannot change parent. Returns whether it
 /// applied. A malformed value, a span the subscriber disabled, or
 /// no exporting layer leave the span as it is.
+///
+/// ⚠️ The `traceparent` is caller controlled: honoring it lets the
+/// caller choose the trace the span joins. Only apply it for
+/// trusted callers (eg. authenticated service to service
+/// requests). Public traffic (browsers, api keys) should start a
+/// fresh trace, per the W3C Trace Context security considerations.
+///
+/// A header value is not a `&str`, convert it first:
+/// `headers.get(TRACEPARENT_HEADER).and_then(|v| v.to_str().ok())`.
 pub fn set_remote_parent(
   span: &tracing::Span,
   traceparent: &str,

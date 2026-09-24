@@ -86,7 +86,19 @@ pub trait LogConfig {
   }
 
   /// Enable opentelemetry exporting.
-  /// Empty string disables exporting.
+  /// An empty (or whitespace only) string disables exporting.
+  ///
+  /// The collector's OTLP/HTTP (protobuf) traces url, eg
+  /// `http://localhost:4318/v1/traces`. gRPC (port 4317) is not
+  /// supported. A url with a path is used as given, and one without
+  /// (`http://localhost:4318`) gets the standard `/v1/traces`.
+  ///
+  /// Failed exports are logged at WARN / ERROR under the
+  /// `opentelemetry*` targets (ie `opentelemetry_sdk`), which
+  /// [init](crate::init) lets through while exporting even when
+  /// they are not in [targets](LogConfig::targets). Call
+  /// [shutdown](crate::shutdown) before exiting, or the spans still
+  /// queued are lost.
   fn otlp_endpoint(&self) -> &str {
     ""
   }
@@ -94,6 +106,14 @@ pub trait LogConfig {
   /// Set the OTEL service name for exported traces
   fn opentelemetry_service_name(&self) -> String {
     String::from("MoghApp")
+  }
+
+  /// Set the OTEL `service.version` for exported traces, usually
+  /// `Some(env!("CARGO_PKG_VERSION").into())` in the application
+  /// crate. `None` (the default) leaves it unset, so
+  /// `OTEL_RESOURCE_ATTRIBUTES` can still supply it.
+  fn opentelemetry_service_version(&self) -> Option<String> {
+    None
   }
 
   /// Set the OTEL scope name for exported traces
@@ -201,6 +221,7 @@ mod tests {
     assert!(config.ansi());
     assert!(config.timestamps());
     assert!(config.otlp_endpoint().is_empty());
+    assert!(config.opentelemetry_service_version().is_none());
     assert!(config.targets().is_empty());
   }
 }
