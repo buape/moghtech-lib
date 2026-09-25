@@ -180,12 +180,16 @@ fn replace(
   };
 
   if let Some(existing) = existing {
-    match copy_identity(&file, existing) {
+    // Read before copy_identity may give the temp file away: its
+    // owner as created is the writer as the kernel sees it.
+    let created = file.metadata()?;
+    match copy_identity(&file, &created, existing) {
       Ok(()) => {}
       // eg. a non-root process can't give a file to another user,
       // or the owner is outside the user namespace.
       Err(e) if not_permitted(&e) => {
-        if in_place && sticky_permits_in_place(path, &file, existing)?
+        if in_place
+          && sticky_permits_in_place(path, &created, existing)?
         {
           return Ok(false);
         }
@@ -262,15 +266,16 @@ fn same_file(opened: &Metadata, _existing: &Metadata) -> bool {
   opened.is_file()
 }
 
-/// Gives the new temp file the existing file's owner, group and mode.
+/// Gives the new temp file (`created`: its metadata as created) the
+/// existing file's owner, group and mode.
 #[cfg(unix)]
 fn copy_identity(
   temp: &File,
+  created: &Metadata,
   existing: &Metadata,
 ) -> std::io::Result<()> {
   use std::os::unix::fs::{MetadataExt, fchown};
 
-  let created = temp.metadata()?;
   let uid =
     (created.uid() != existing.uid()).then_some(existing.uid());
   let gid =
@@ -281,7 +286,14 @@ fn copy_identity(
 
   // Set through the handle rather than the path, so it can't be
   // redirected. After the chown, which clears setuid / setgid.
-  temp.set_permissions(existing.permissions())
+  let res = temp.set_permissions(existing.permissions());
+  if res.is_err() && uid.is_some() {
+    // Given away (CAP_CHOWN), but no longer this process's to set
+    // the mode of (no CAP_FOWNER): take it back, or it can't be
+    // removed from a sticky directory.
+    let _ = fchown(temp, Some(created.uid()), Some(created.gid()));
+  }
+  res
 }
 
 /// Only unix has an owner and mode to carry over. The read only flag
@@ -289,6 +301,7 @@ fn copy_identity(
 #[cfg(not(unix))]
 fn copy_identity(
   _temp: &File,
+  _created: &Metadata,
   _existing: &Metadata,
 ) -> std::io::Result<()> {
   Ok(())
@@ -311,21 +324,24 @@ fn not_permitted(e: &std::io::Error) -> bool {
 /// or of the directory replace it, so another user's file there is
 /// not written either: it may have been planted to receive the
 /// contents.
+///
+/// The writer is the owner of the temp file as it was `created`
+/// (the process's filesystem uid, which the kernel's check goes
+/// by), not its owner now: [copy_identity] may have given it to the
+/// existing file's owner before failing to set its mode.
 #[cfg(unix)]
 fn sticky_permits_in_place(
   path: &Path,
-  temp: &File,
+  created: &Metadata,
   existing: &Metadata,
 ) -> std::io::Result<bool> {
   use std::os::unix::fs::MetadataExt;
-  // The temp file was created by, so is owned by, this process.
-  let writer = temp.metadata()?.uid();
   let dir = std::fs::metadata(parent_dir(path))?;
   Ok(sticky_permits(
     dir.mode(),
     dir.uid(),
     existing.uid(),
-    writer,
+    created.uid(),
   ))
 }
 
@@ -333,7 +349,7 @@ fn sticky_permits_in_place(
 #[cfg(not(unix))]
 fn sticky_permits_in_place(
   _path: &Path,
-  _temp: &File,
+  _created: &Metadata,
   _existing: &Metadata,
 ) -> std::io::Result<bool> {
   Ok(true)
@@ -998,6 +1014,53 @@ mod tests {
       // The writer's own file, or own directory.
       assert!(sticky_permits(0o41777, 0, 1000, 1000));
       assert!(sticky_permits(0o41777, 1000, 1001, 1000));
+    }
+
+    /// The writer is the temp file's owner as created, not as it is
+    /// after the chown: with CAP_CHOWN but no CAP_FOWNER, the temp
+    /// file is given to the planted file's owner before setting its
+    /// mode fails, and the check used to take that owner as the
+    /// writer, writing another user's file in place.
+    #[test]
+    fn sticky_dirs_go_by_the_writer_as_created() {
+      use super::super::sticky_permits_in_place;
+      // A sticky directory owned by root, like /tmp.
+      let Some(sticky) = ["/tmp", "/var/tmp", "/dev/shm"]
+        .into_iter()
+        .map(Path::new)
+        .find(|dir| {
+          std::fs::metadata(dir).is_ok_and(|dir| {
+            dir.mode() & 0o1000 != 0 && dir.uid() == 0
+          })
+        })
+      else {
+        eprintln!("No sticky directory owned by root, skipping");
+        return;
+      };
+      let dir = temp_dir("sticky-writer");
+      let own = dir.join("own");
+      super::super::write(&own, "").unwrap();
+      // The temp file as this process creates it.
+      let created = std::fs::metadata(&own).unwrap();
+      std::fs::remove_dir_all(&dir).unwrap();
+      if created.uid() == 0 {
+        eprintln!("Root, skipping");
+        return;
+      }
+      // Another user's (root's) file, planted in the directory.
+      let planted = std::fs::metadata("/").unwrap();
+      let path = sticky.join("planted");
+      assert!(
+        !sticky_permits_in_place(&path, &created, &planted).unwrap()
+      );
+      // What the temp file looks like once given to that user.
+      assert!(
+        sticky_permits_in_place(&path, &planted, &planted).unwrap()
+      );
+      // The writer's own file.
+      assert!(
+        sticky_permits_in_place(&path, &created, &created).unwrap()
+      );
     }
 
     /// The existing file's group is carried over to the new file,
