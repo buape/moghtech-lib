@@ -404,6 +404,11 @@ fn begin_external_login_link() {}
 /// from [GetLoginOptions][crate::api::login::GetLoginOptions]
 /// (see [LoginOptionsProvider][crate::api::login::LoginOptionsProvider]).
 /// The slug is not the provider id.
+///
+/// The response sets a new session cookie (the session id changes),
+/// and the redirect to `/link` must carry it: only the session which
+/// began the link can use it, for 10 minutes. Browsers do this when
+/// the request is sent with credentials.
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]

@@ -184,4 +184,29 @@ mod tests {
       assert!(name.eq_ignore_ascii_case(header), "{name}");
     }
   }
+
+  /// Every status the server's `token_exchange_error` answers with
+  /// is declared, with the OAuth error body.
+  #[test]
+  fn test_token_exchange_responses() {
+    let spec = serde_json::to_value(MoghAuthApi::openapi()).unwrap();
+    let responses = spec["paths"]["/token"]["post"]["responses"]
+      .as_object()
+      .unwrap();
+    let mut statuses = responses.keys().cloned().collect::<Vec<_>>();
+    statuses.sort();
+    assert_eq!(statuses, ["200", "400", "429", "500", "503"]);
+    for (status, response) in responses {
+      let schema = response["content"]["application/json"]["schema"]
+        ["$ref"]
+        .as_str()
+        .unwrap();
+      let expected = if status == "200" {
+        "#/components/schemas/TokenExchangeResponse"
+      } else {
+        "#/components/schemas/TokenExchangeError"
+      };
+      assert_eq!(schema, expected, "{status}");
+    }
+  }
 }

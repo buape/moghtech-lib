@@ -39,8 +39,9 @@ pub const TOKEN_TYPE_ACCESS_TOKEN: &str =
   responses(
     (status = 200, description = "The app token", body = TokenExchangeResponse),
     (status = 400, description = "The request or the token was rejected", body = TokenExchangeError),
-    (status = 429, description = "Too many failed requests", body = TokenExchangeError),
-    (status = 500, description = "Request failed", body = TokenExchangeError)
+    (status = 429, description = "Too many failed requests, retry later (`temporarily_unavailable`)", body = TokenExchangeError),
+    (status = 500, description = "Request failed", body = TokenExchangeError),
+    (status = 503, description = "A login provider or trusted issuer of the token's issuer can't be loaded right now, retry later (`temporarily_unavailable`)", body = TokenExchangeError)
   ),
 )]
 fn token_exchange() {}
@@ -135,12 +136,17 @@ impl std::fmt::Debug for TokenExchangeResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TokenExchangeError {
-  /// The OAuth error code:
-  /// - `invalid_request`: The request is malformed or uses unsupported parameters.
-  /// - `unsupported_grant_type`: `grant_type` is not token exchange.
-  /// - `invalid_grant`: The subject token was rejected.
-  /// - `temporarily_unavailable`: Too many failed requests.
-  /// - `server_error`
+  /// The OAuth error code, and the http status it comes with:
+  /// - `invalid_request` (`400`): The request is malformed or uses unsupported parameters.
+  /// - `unsupported_grant_type` (`400`): `grant_type` is not token exchange.
+  /// - `invalid_grant` (`400`): The subject token was rejected.
+  /// - `temporarily_unavailable`: Retry later. Either `429`, too many
+  ///   failed requests, or `503`, a login provider or trusted issuer of
+  ///   the token's issuer can't be loaded right now (eg. its keys can't
+  ///   be fetched). With several of them sharing the issuer, a token the
+  ///   others rejected is `503` rather than `invalid_grant` while one is
+  ///   unavailable, as that one might have accepted it.
+  /// - `server_error` (`500`)
   pub error: String,
   /// Human readable details.
   #[serde(default, skip_serializing_if = "Option::is_none")]
