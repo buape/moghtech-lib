@@ -1,11 +1,17 @@
-use std::{net::SocketAddr, str::FromStr as _, sync::Arc};
+use std::{
+  net::SocketAddr, str::FromStr as _, sync::Arc, time::Duration,
+};
 
 use anyhow::Context as _;
 use axum::{
   Router,
   http::{HeaderValue, header},
 };
-use axum_server::{Handle, tls_rustls::RustlsConfig};
+use axum_server::{
+  Handle,
+  accept::DefaultAcceptor,
+  tls_rustls::{RustlsAcceptor, RustlsConfig},
+};
 use rustls::{
   ServerConfig as TlsServerConfig,
   crypto::CryptoProvider,
@@ -19,14 +25,15 @@ pub use mogh_request_ip::TrustedProxies;
 
 // Dev dependencies used by the integration tests only.
 #[cfg(test)]
-use reqwest as _;
+use h2 as _;
 #[cfg(test)]
-use tokio as _;
+use reqwest as _;
 #[cfg(test)]
 use tower as _;
 
 pub mod cors;
 pub mod session;
+mod timeout;
 pub mod ui;
 
 pub trait ServerConfig {
@@ -99,6 +106,29 @@ pub trait ServerConfig {
   fn trusted_proxies(&self) -> TrustedProxies {
     TrustedProxies::default()
   }
+  /// How long [serve_app] waits for a client to send the headers of
+  /// a request. Clients which don't are disconnected, so they can't
+  /// hold connections open by sending nothing, or their headers
+  /// slowly (slowloris). Counted:
+  /// - For the first request, from the connection being accepted
+  ///   (after the TLS handshake), over http/1 and http/2 alike.
+  /// - On a kept alive http/1 connection, from the previous
+  ///   response, so idle kept alive connections are closed after
+  ///   that long too.
+  /// - On an http/2 connection, from the start of each later
+  ///   request's headers. Between requests an idle http/2
+  ///   connection stays open as long as the client answers the
+  ///   keep alive pings sent every 20 seconds: hyper's http/2
+  ///   server has no idle timeout.
+  ///
+  /// It bounds how long each connection can wait for headers, not
+  /// how many connections there are: front the app with a proxy to
+  /// limit those, and to close idle http/2 connections.
+  ///
+  /// Default: 30 seconds. `None` waits without a limit.
+  fn header_read_timeout(&self) -> Option<Duration> {
+    Some(Duration::from_secs(30))
+  }
 }
 
 /// Applies a security header layer to the app,
@@ -158,6 +188,9 @@ pub fn configure_app(
 
 /// Serves the app with socket connect info,
 /// security headers, and trusted proxies applied.
+///
+/// Clients which don't send the headers of a request in time are
+/// disconnected, see [ServerConfig::header_read_timeout].
 pub async fn serve_app(
   app: Router,
   config: impl ServerConfig,
@@ -171,6 +204,8 @@ pub async fn serve_app(
   let socket_addr = SocketAddr::from_str(&addr)
     .context("Failed to parse listen address")?;
 
+  let header_read_timeout = config.header_read_timeout();
+
   // Run the server
   if config.ssl_enabled() {
     // Run the server with TLS (https)
@@ -179,8 +214,16 @@ pub async fn serve_app(
     let ssl_config =
       rustls_config(config.ssl_cert_file(), config.ssl_key_file())
         .context("Invalid ssl cert / key")?;
-    let mut server =
-      axum_server::bind_rustls(socket_addr, ssl_config);
+    let mut server = axum_server::bind(socket_addr).acceptor(
+      timeout::HeaderTimeoutAcceptor {
+        inner: RustlsAcceptor::new(ssl_config),
+        timeout: header_read_timeout,
+      },
+    );
+    timeout::configure_http(
+      server.http_builder(),
+      header_read_timeout,
+    );
     if let Some(handle) = handle.into() {
       server = server.handle(handle);
     }
@@ -192,7 +235,16 @@ pub async fn serve_app(
     // Run the server without TLS (http)
     info!("🔓 Server SSL Disabled");
     info!("Server starting on http://{socket_addr}");
-    let mut server = axum_server::bind(socket_addr);
+    let mut server = axum_server::bind(socket_addr).acceptor(
+      timeout::HeaderTimeoutAcceptor {
+        inner: DefaultAcceptor,
+        timeout: header_read_timeout,
+      },
+    );
+    timeout::configure_http(
+      server.http_builder(),
+      header_read_timeout,
+    );
     if let Some(handle) = handle.into() {
       server = server.handle(handle);
     }

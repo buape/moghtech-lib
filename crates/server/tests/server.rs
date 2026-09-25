@@ -731,3 +731,336 @@ async fn serve_app_rejects_invalid_tls_files() {
   assert!(error.contains("Invalid ssl cert / key"), "{error}");
   assert!(error.contains("No certificate"), "{error}");
 }
+
+/// Serves with a short header read timeout.
+struct TimeoutServer {
+  tls: bool,
+}
+
+const HEADER_READ_TIMEOUT: std::time::Duration =
+  std::time::Duration::from_millis(300);
+
+impl ServerConfig for TimeoutServer {
+  fn bind_ip(&self) -> &str {
+    "127.0.0.1"
+  }
+  fn port(&self) -> u16 {
+    0
+  }
+  fn ssl_enabled(&self) -> bool {
+    self.tls
+  }
+  fn ssl_cert_file(&self) -> &str {
+    TlsServer.ssl_cert_file()
+  }
+  fn ssl_key_file(&self) -> &str {
+    TlsServer.ssl_key_file()
+  }
+  fn header_read_timeout(&self) -> Option<std::time::Duration> {
+    Some(HEADER_READ_TIMEOUT)
+  }
+}
+
+/// Serves an app answering slowly (longer than the timeout).
+async fn serve_with_timeout(
+  tls: bool,
+) -> (
+  mogh_server::axum_server::Handle<std::net::SocketAddr>,
+  std::net::SocketAddr,
+) {
+  let handle = mogh_server::axum_server::Handle::new();
+  let mut server = tokio::spawn(mogh_server::serve_app(
+    Router::new().route(
+      "/",
+      get(async || {
+        tokio::time::sleep(HEADER_READ_TIMEOUT * 3).await;
+        "ok"
+      }),
+    ),
+    TimeoutServer { tls },
+    handle.clone(),
+  ));
+  let addr = tokio::select! {
+    addr = handle.listening() => addr.expect("server failed to bind"),
+    res = &mut server => panic!("server stopped: {res:?}"),
+  };
+  (handle, addr)
+}
+
+/// Whether the server disconnected the client, which sent `sent`
+/// and then nothing more, once the header read timeout passed.
+async fn disconnects_after_sending(
+  addr: std::net::SocketAddr,
+  sent: &[u8],
+) -> bool {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+  let mut stream =
+    tokio::net::TcpStream::connect(addr).await.unwrap();
+  stream.write_all(sent).await.unwrap();
+  let start = std::time::Instant::now();
+  let mut response = Vec::new();
+  let read = tokio::time::timeout(
+    std::time::Duration::from_secs(5),
+    stream.read_to_end(&mut response),
+  )
+  .await;
+  // Closed (or reset) once the timeout passed, not before.
+  read.is_ok() && start.elapsed() >= HEADER_READ_TIMEOUT / 2
+}
+
+/// The http/2 connection preface.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// An http/2 frame.
+fn h2_frame(
+  kind: u8,
+  flags: u8,
+  stream: u32,
+  payload: &[u8],
+) -> Vec<u8> {
+  let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+  frame.extend([kind, flags]);
+  frame.extend(stream.to_be_bytes());
+  frame.extend(payload);
+  frame
+}
+
+/// An empty http/2 SETTINGS frame.
+fn h2_settings() -> Vec<u8> {
+  h2_frame(0x4, 0, 0, &[])
+}
+
+/// The client connection preface.
+fn h2_start() -> Vec<u8> {
+  [H2_PREFACE, &h2_settings()].concat()
+}
+
+/// A client which never finishes its headers (slowloris), or sends
+/// nothing at all, used to hold the connection open forever: hyper
+/// only applies a header read timeout with a timer, only to http/1,
+/// and only once the server told http/1 from http/2.
+#[tokio::test]
+async fn serve_app_disconnects_clients_not_sending_headers() {
+  let (handle, addr) = serve_with_timeout(false).await;
+  for sent in [
+    &b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow: "[..],
+    b"",
+    b"P",
+    // The start of the http/2 preface.
+    b"PRI * HTTP/2.0\r\n\r\nSM\r\n",
+    // The http/2 preface, and no request.
+    &h2_start(),
+    // A HEADERS frame without END_HEADERS, never continued.
+    &[h2_start(), h2_frame(0x1, 0x1, 1, &[0x82])].concat(),
+    // A HEADERS frame ending the block (GET / over http), whose
+    // payload never arrives whole.
+    &[
+      h2_start(),
+      h2_frame(0x1, 0x5, 1, &[0x82, 0x86, 0x84])[..10].to_vec(),
+    ]
+    .concat(),
+  ] {
+    assert!(
+      disconnects_after_sending(addr, sent).await,
+      "{:?}",
+      String::from_utf8_lossy(sent)
+    );
+  }
+
+  // A request sent in time is answered, however long the handler
+  // takes, and the connection is kept alive for the next one.
+  let client = reqwest::Client::new();
+  for _ in 0..2 {
+    let response =
+      client.get(format!("http://{addr}/")).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "ok");
+  }
+  handle.shutdown();
+}
+
+/// An http/2 client which keeps sending frames, but never a
+/// request's headers (eg. pings), used to hold the connection open.
+#[tokio::test]
+async fn serve_app_disconnects_http2_clients_only_pinging() {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+  let (handle, addr) = serve_with_timeout(false).await;
+  let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+  let (mut read, mut write) = stream.into_split();
+  write.write_all(&h2_start()).await.unwrap();
+  let start = std::time::Instant::now();
+  let pinging = tokio::spawn(async move {
+    for ping in 0u64.. {
+      tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+      let ping = h2_frame(0x6, 0, 0, &ping.to_be_bytes());
+      if write.write_all(&ping).await.is_err() {
+        break;
+      }
+    }
+  });
+  let mut received = Vec::new();
+  let closed = tokio::time::timeout(
+    std::time::Duration::from_secs(5),
+    read.read_to_end(&mut received),
+  )
+  .await;
+  assert!(closed.is_ok(), "still open");
+  assert!(start.elapsed() >= HEADER_READ_TIMEOUT / 2);
+  pinging.abort();
+  handle.shutdown();
+}
+
+/// Requests over http/2 are answered however long the handler
+/// takes, and later requests on the same connection too, however
+/// long it was idle.
+#[tokio::test]
+async fn serve_app_answers_http2_requests() {
+  let (handle, addr) = serve_with_timeout(false).await;
+  let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+  let (client, connection) =
+    h2::client::handshake(stream).await.unwrap();
+  let connection = tokio::spawn(connection);
+  let mut client = client.ready().await.unwrap();
+  for idle in [false, true] {
+    if idle {
+      tokio::time::sleep(HEADER_READ_TIMEOUT * 2).await;
+    }
+    let request = Request::builder()
+      .uri(format!("http://{addr}/"))
+      .body(())
+      .unwrap();
+    let (response, _) = client.send_request(request, true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut text = Vec::new();
+    while let Some(data) = body.data().await {
+      let data = data.unwrap();
+      let _ = body.flow_control().release_capacity(data.len());
+      text.extend_from_slice(&data);
+    }
+    assert_eq!(text, b"ok");
+    client = client.ready().await.unwrap();
+  }
+  connection.abort();
+  handle.shutdown();
+}
+
+/// Accepts any server certificate, for the self signed test one.
+#[derive(Debug)]
+struct AcceptAnyCert(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+  fn verify_server_cert(
+    &self,
+    _end_entity: &rustls::pki_types::CertificateDer<'_>,
+    _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+    _server_name: &rustls::pki_types::ServerName<'_>,
+    _ocsp_response: &[u8],
+    _now: rustls::pki_types::UnixTime,
+  ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+  {
+    Ok(rustls::client::danger::ServerCertVerified::assertion())
+  }
+
+  fn verify_tls12_signature(
+    &self,
+    message: &[u8],
+    cert: &rustls::pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+  ) -> Result<
+    rustls::client::danger::HandshakeSignatureValid,
+    rustls::Error,
+  > {
+    rustls::crypto::verify_tls12_signature(
+      message,
+      cert,
+      dss,
+      &self.0.signature_verification_algorithms,
+    )
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    message: &[u8],
+    cert: &rustls::pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+  ) -> Result<
+    rustls::client::danger::HandshakeSignatureValid,
+    rustls::Error,
+  > {
+    rustls::crypto::verify_tls13_signature(
+      message,
+      cert,
+      dss,
+      &self.0.signature_verification_algorithms,
+    )
+  }
+
+  fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    self.0.signature_verification_algorithms.supported_schemes()
+  }
+}
+
+/// [serve_app_disconnects_clients_not_sending_headers], over TLS:
+/// the timeout counts from the end of the handshake.
+#[tokio::test]
+async fn serve_app_disconnects_tls_clients_not_sending_headers() {
+  let (handle, addr) = serve_with_timeout(true).await;
+  for sent in [
+    b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec(),
+    Vec::new(),
+    h2_start(),
+  ] {
+    let shown = String::from_utf8_lossy(&sent).into_owned();
+    let disconnected = tokio::task::spawn_blocking(move || {
+      use std::io::{Read as _, Write as _};
+      let provider = std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+      );
+      let config =
+        rustls::ClientConfig::builder_with_provider(provider.clone())
+          .with_safe_default_protocol_versions()
+          .unwrap()
+          .dangerous()
+          .with_custom_certificate_verifier(std::sync::Arc::new(
+            AcceptAnyCert(provider),
+          ))
+          .with_no_client_auth();
+      let connection = rustls::ClientConnection::new(
+        std::sync::Arc::new(config),
+        "localhost".try_into().unwrap(),
+      )
+      .unwrap();
+      let socket = std::net::TcpStream::connect(addr).unwrap();
+      socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+      let mut stream = rustls::StreamOwned::new(connection, socket);
+      // Completes the handshake.
+      stream.flush().unwrap();
+      while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock).unwrap();
+      }
+      stream.write_all(&sent).unwrap();
+      stream.flush().unwrap();
+      let start = std::time::Instant::now();
+      let mut response = Vec::new();
+      let read = stream.read_to_end(&mut response);
+      // Closed (without close_notify, or reset) rather than timing
+      // out on the client side.
+      let closed = match read {
+        Ok(_) => true,
+        Err(e) => !matches!(
+          e.kind(),
+          std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+        ),
+      };
+      closed && start.elapsed() >= HEADER_READ_TIMEOUT / 2
+    })
+    .await
+    .unwrap();
+    assert!(disconnected, "{shown:?}");
+  }
+  handle.shutdown();
+}

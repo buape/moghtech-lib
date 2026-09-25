@@ -35,6 +35,24 @@ decides which socket peers may set the client ip through `X-Forwarded-For` /
 `X-Real-IP`. Use `configure_app` to apply the same layers when serving the app
 yourself.
 
+`serve_app` disconnects clients which don't send the headers of a request within
+`ServerConfig::header_read_timeout` (default 30 seconds, `None` to wait without
+a limit), so a client can't hold a connection open by sending nothing, or its
+headers slowly (slowloris). The first request's headers are due that long after
+the connection is accepted (after the TLS handshake), over http/1 and http/2
+alike. After that:
+
+- On a kept alive http/1 connection, the next request's headers are due that
+  long after the previous response, so idle kept alive connections are closed.
+- On an http/2 connection, each later request's headers must arrive whole within
+  that long of their start. An idle http/2 connection (no request pending) stays
+  open as long as the client answers the keep alive pings `serve_app` sends
+  every 20 seconds: hyper's http/2 server has no idle timeout.
+
+This bounds how long each connection can wait for headers, not how many
+connections there are: front the app with a proxy to limit those, and to close
+idle http/2 connections.
+
 ⚠️ The default trusted proxies are all loopback and private addresses, not only
 the proxy. When public clients can reach the app from a private address (a port
 published through Docker's userland proxy, rootless Docker / Podman, Kubernetes
