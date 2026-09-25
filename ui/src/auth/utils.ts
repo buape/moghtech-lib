@@ -1,3 +1,5 @@
+import { withoutFlowReturnParams } from "./external-flow";
+
 export function sanitizeQuery() {
   sanitizeQueryInner(new URLSearchParams(location.search));
 }
@@ -50,13 +52,20 @@ export function sameOriginPath(
  * current url, if it is a path on this origin (see
  * [sameOriginPath]), otherwise `fallback`.
  *
+ * Without the query params an external login returns with
+ * (`redeem_ready`, `totp`, `passkey`, `login_error`, `link_error`, see
+ * `useAuthState`): the server adds its own to the url the login returns
+ * to, one already there would be taken for the server's.
+ *
  * Every use of `backto` goes through this. The login page's
  * navigation after logging in, its back button, and the redirect of
  * an external login ([externalLogin]).
  */
 export function backtoPath(fallback = "/"): string {
-  return sameOriginPath(
-    new URLSearchParams(location.search).get("backto"),
-    fallback,
+  return withoutFlowReturnParams(
+    sameOriginPath(
+      new URLSearchParams(location.search).get("backto"),
+      fallback,
+    ),
   );
 }

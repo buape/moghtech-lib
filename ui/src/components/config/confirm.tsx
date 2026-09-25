@@ -7,7 +7,11 @@ import { MonacoDiffEditor, MonacoLanguage } from "../monaco";
 import { deepCompare } from "../../utils";
 import { fmtSnakeCaseToUpperSpaceCase } from "../../formatting";
 import { useCtrlKeyListener, useKeyListener } from "../../hooks";
-import { confirmDialogOpen, useCountOpenConfirm } from "./confirm-open";
+import {
+  confirmDialogOpen,
+  saveButtonFocus,
+  useCountOpenConfirm,
+} from "./confirm-open";
 
 export interface ConfirmUpdateProps<T> {
   original: T;
@@ -20,7 +24,7 @@ export interface ConfirmUpdateProps<T> {
   fullWidth?: boolean;
   /** Ctrl / Cmd + Enter opens the dialog. Default: true */
   openKeyListener?: boolean;
-  /** Enter in the open dialog confirms. Default: true */
+  /** See `ConfirmUpdateModalProps.confirmKeyListener`. Default: true */
   confirmKeyListener?: boolean;
   enableFancyToml?: boolean;
   /** Fields whose values are never shown, see `ConfigProps.secretKeys`. */
@@ -114,7 +118,11 @@ export interface ConfirmUpdateModalProps<T> {
   disabled?: boolean;
   language?: MonacoLanguage;
   fileContentsLanguage?: MonacoLanguage;
-  /** Enter in the open dialog confirms. Default: true */
+  /**
+   * Enter in the open dialog confirms, which opens with its Save button
+   * focused. When false, Enter only does what the focused element does,
+   * and the dialog opens with its close button focused. Default: true
+   */
   confirmKeyListener?: boolean;
   enableFancyToml?: boolean;
   /** Fields whose values are never shown, see `ConfigProps.secretKeys`. */
@@ -217,8 +225,9 @@ export function ConfirmUpdateModal<T>({
         </Stack>
         <Group justify="flex-end">
           <Button
-            // Focused when the dialog opens, so Enter saves natively.
-            data-autofocus
+            // Focused when the dialog opens while Enter confirms, then
+            // Enter saves natively.
+            {...saveButtonFocus(confirmKeyListener)}
             leftSection={<Save size="1rem" />}
             onClick={(e) => {
               e.stopPropagation();

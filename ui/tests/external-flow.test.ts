@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  flowReturnError,
+  flowReturnParam,
   markExternalFlow,
   takeExternalFlow,
+  withoutFlowReturnParams,
 } from "../src/auth/external-flow.ts";
 
 type ExternalFlow = typeof import("../src/auth/external-flow.ts");
@@ -119,4 +122,112 @@ test("the back button at the provider drops the flow", async () => {
   } finally {
     delete global.addEventListener;
   }
+});
+
+const SPOOFED = "Your account is locked. Call support at +1-555-0100";
+
+/** The server's redirect after an external login (`format_redirect`). */
+function serverReturn(path: string, extra: string) {
+  const url = new URL(path, "http://app.example");
+  url.search = url.search ? `${url.search}&${extra}` : extra;
+  return url.searchParams;
+}
+
+test("the server's params are read from their last value", () => {
+  // Planted before the server's own
+  const search = serverReturn(
+    "/?redeem_ready=0&totp=false&passkey=x",
+    "redeem_ready=true",
+  );
+  assert.equal(flowReturnParam(search, "redeem_ready"), "true");
+  assert.equal(flowReturnParam(search, "totp"), "false");
+  assert.equal(
+    flowReturnParam(serverReturn("/?passkey=x", "passkey=real"), "passkey"),
+    "real",
+  );
+  assert.equal(flowReturnParam(new URLSearchParams(), "totp"), null);
+});
+
+test("a login error next to a login which went through isn't the server's", () => {
+  for (const extra of ["redeem_ready=true", "totp=true", "passkey=e30"]) {
+    const search = serverReturn(
+      `/?login_error=${encodeURIComponent(SPOOFED)}`,
+      extra,
+    );
+    // Even on the return from the tab's own flow
+    assert.deepEqual(flowReturnError(search, true), {
+      link: false,
+      text: SPOOFED,
+      source: "stray",
+    });
+  }
+  const link = serverReturn("/profile?link_error=x", "redeem_ready=true");
+  assert.equal(flowReturnError(link, true)?.source, "stray");
+});
+
+test("only the one reason of the tab's own flow is the server's", () => {
+  // The server's failure: the configured page, with the reason added.
+  const failed = serverReturn(
+    "/login?theme=dark",
+    `login_error=${encodeURIComponent("User registration is disabled")}`,
+  );
+  assert.deepEqual(flowReturnError(failed, true), {
+    link: false,
+    text: "User registration is disabled",
+    source: "server",
+  });
+  // Not after a flow this tab started
+  assert.equal(flowReturnError(failed, false)?.source, "unverified");
+  // A second reason: one of them was in the url already
+  const twice = serverReturn(
+    `/login?login_error=${encodeURIComponent(SPOOFED)}`,
+    "login_error=Rejected",
+  );
+  assert.deepEqual(flowReturnError(twice, true), {
+    link: false,
+    text: SPOOFED,
+    source: "unverified",
+  });
+  const both = serverReturn("/profile?login_error=x", "link_error=Rejected");
+  assert.equal(flowReturnError(both, true)?.source, "unverified");
+  assert.deepEqual(
+    flowReturnError(new URLSearchParams("link_error=Rejected"), true),
+    { link: true, text: "Rejected", source: "server" },
+  );
+  // Nothing to show
+  assert.equal(flowReturnError(new URLSearchParams(""), true), undefined);
+  assert.equal(
+    flowReturnError(new URLSearchParams("login_error="), true),
+    undefined,
+  );
+});
+
+test("a login error planted in the return path doesn't come back", () => {
+  // `/login?backto=<this>`: the provider returns to it, the server adds
+  // its param after the query already there.
+  const backto = `/?login_error=${encodeURIComponent(SPOOFED)}&redeem_ready=0`;
+  const returned = serverReturn(
+    withoutFlowReturnParams(backto),
+    "redeem_ready=true",
+  );
+  assert.equal(flowReturnError(returned, true), undefined);
+  assert.equal(returned.getAll("redeem_ready").join(), "true");
+});
+
+test("withoutFlowReturnParams keeps everything else as it is", () => {
+  assert.equal(withoutFlowReturnParams("/"), "/");
+  assert.equal(withoutFlowReturnParams("/a?b=%20+c#d"), "/a?b=%20+c#d");
+  assert.equal(
+    withoutFlowReturnParams("/a?totp=true&b=%20+c&&passkey#d?totp=1"),
+    "/a?b=%20+c#d?totp=1",
+  );
+  assert.equal(withoutFlowReturnParams("/a?login_error=x#h"), "/a#h");
+  assert.equal(withoutFlowReturnParams("/a?redeem_ready"), "/a");
+  // Same names once decoded
+  assert.equal(withoutFlowReturnParams("/a?link%5Ferror=x&b"), "/a?b");
+  // Similar names aren't the same
+  assert.equal(
+    withoutFlowReturnParams("/a?totp_code=1&my_login_error=x"),
+    "/a?totp_code=1&my_login_error=x",
+  );
 });

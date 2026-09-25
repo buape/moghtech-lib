@@ -36,6 +36,11 @@ export interface ConfirmModalProps extends Omit<
   disableModal?: boolean;
 }
 
+/**
+ * A button opening a dialog, where the action is confirmed by typing
+ * `confirmText`. Every open starts with an empty input: text typed for
+ * an earlier open (confirmed or cancelled) doesn't confirm the next.
+ */
 export function ConfirmModal({
   children,
   icon,
@@ -53,8 +58,15 @@ export function ConfirmModal({
   disableModal,
   ...modalProps
 }: ConfirmModalProps) {
-  const [opened, { open, close }] = useDisclosure();
+  const [opened, { open: _open, close }] = useDisclosure();
   const [input, setInput] = useState("");
+  // The component (and its state) stays mounted while the dialog is
+  // closed, eg. next to a container which can be restarted again: each
+  // open starts over.
+  const open = () => {
+    setInput("");
+    _open();
+  };
 
   if (disableModal) {
     return (

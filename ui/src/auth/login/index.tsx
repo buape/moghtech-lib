@@ -128,13 +128,14 @@ export function LoginPage({
   };
 
   // A mistyped code can be tried again. Once the server has ended the
-  // login (too many invalid codes, or the session expired) more codes
-  // can't succeed, so go back to the first factor.
+  // login (too many invalid codes, the login expired, or the session
+  // expired) more codes can't succeed, so go back to the first factor.
   const secondFactorOnError = (e: unknown) => {
     const error =
       (e as { result?: { error?: string } } | undefined)?.result?.error ?? "";
     if (
       error.includes("Too many invalid codes") ||
+      error.includes("Login has expired") ||
       error.includes("has not been initiated")
     ) {
       cancelSecondFactor();

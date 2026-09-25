@@ -18,7 +18,7 @@ no CommonJS build):
 
 Install the peer dependencies next to it (npm does this by default),
 `prettier` included: the editor formats yaml / typescript with it
-(Alt + Shift + F), loaded only when used.
+(Alt + Shift + F, not in a read only editor), loaded only when used.
 
 ```ts
 import "mogh_ui/index.scss";
@@ -32,11 +32,22 @@ import { ThemeProvider } from "mogh_ui";
   store of `mogh_auth_client`, and the app has to read them from there.
   A store with its own key (`createLoginTokens({ key })`) isn't used by
   them.
+- The login page's `backto` (`backtoPath`) is only followed to a path on
+  the app's origin, and without the query params an external login
+  returns with (`redeem_ready`, `totp`, `passkey`, `login_error`,
+  `link_error`): the server adds its own to the url the provider sends
+  the user back to, and `useAuthState` would take one already there for
+  the server's. `externalLogin` drops them from the current url too.
 - `Config` shows one confirm dialog behind all of its Save buttons.
   Ctrl / Cmd + Enter (outside of text inputs) opens it while there are
-  changes, and Enter in the open dialog saves. `ConfirmUpdate` does the
-  same for a single Save button. When several are mounted, only the first
-  one takes a key press, and none opens while a confirm dialog is open.
+  changes, and Enter in the open dialog saves (it opens with its Save
+  button focused). `ConfirmUpdate` does the same for a single Save button,
+  and with `confirmKeyListener={false}` Enter doesn't save: the dialog
+  opens with its close button focused. When several are mounted, only
+  the first one takes a key press, and none opens while a confirm dialog
+  is open.
+- `ConfirmModal` starts every open with an empty input: text typed for an
+  earlier open doesn't confirm the next one.
 - `useKeyListener` / `useShiftKeyListener` / `useCtrlKeyListener`: a
   handler returning `false` declines the press, which then keeps its
   browser default (eg. Enter on a focused button).

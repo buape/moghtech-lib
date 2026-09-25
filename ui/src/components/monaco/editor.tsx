@@ -10,6 +10,11 @@ import {
   MonacoEditorProps,
   MonacoLanguage,
 } from "./common";
+import {
+  formatDocumentAction,
+  FormatLanguage,
+  isFormatLanguage,
+} from "./format-action";
 
 const MIN_EDITOR_HEIGHT = 56;
 
@@ -18,7 +23,7 @@ let editorInstanceCounter = 0;
 
 /** Prettier embeds the full typescript parser - only load it on demand. */
 async function formatWithCursor(
-  language: "yaml" | "typescript" | "javascript",
+  language: FormatLanguage,
   source: string,
   cursorOffset: number,
 ) {
@@ -86,38 +91,21 @@ export function MonacoEditorImpl({
   }, [editor]);
 
   useEffect(() => {
-    if (
-      language !== "typescript" &&
-      language !== "javascript" &&
-      language !== "yaml"
-    )
-      return;
+    if (!isFormatLanguage(language)) return;
     if (!editor) return;
     // An action (unlike `addCommand`) is bound to this editor only, and
-    // is removed with it / when the language changes.
-    const action = editor.addAction({
-      id: "mogh.format-document",
-      label: "Format Document (Prettier)",
-      keybindings: [
-        monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
-      ],
-      run: async (editor) => {
-        const model = editor.getModel();
-        if (!model) return;
-        const position = editor.getPosition();
-        let beforeOffset = (position && model.getOffsetAt(position)) ?? 0;
-        const curr = editor.getValue();
-        const { formatted, cursorOffset } = await formatWithCursor(
-          language,
-          curr,
-          beforeOffset,
-        );
-        // Disposed / switched model while formatting.
-        if (model.isDisposed() || editor.getModel() !== model) return;
-        editor.setValue(formatted);
-        editor.setPosition(model.getPositionAt(cursorOffset));
-      },
-    });
+    // is removed with it / when the language changes. Off while the
+    // editor is read only (see `formatDocumentAction`).
+    const action = editor.addAction(
+      formatDocumentAction({
+        language,
+        keybindings: [
+          monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
+        ],
+        readOnlyOption: monaco.editor.EditorOption.readOnly,
+        format: formatWithCursor,
+      }),
+    );
     return () => action.dispose();
   }, [editor, language]);
 

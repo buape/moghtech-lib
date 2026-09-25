@@ -1,5 +1,6 @@
 // State of the external login / link flows, shared by the auth
-// hooks and the login page. Not exported from the package.
+// hooks and the login page. Not exported from the package. No imports:
+// the unit tests load it in Node.
 
 /**
  * Whether an external login failed on this page load: the server
@@ -72,4 +73,107 @@ export function takeExternalFlowReturn(): boolean {
   if (return_checked) return false;
   return_checked = true;
   return takeExternalFlow();
+}
+
+/**
+ * The query params the server adds to the url an external login / link
+ * returns to (read by `useAuthState`). A successful login returns with
+ * one of `redeem_ready`, `totp` or `passkey`, a failed one with
+ * `login_error` / `link_error` (sent to the page configured for it).
+ */
+const FLOW_RETURN_PARAMS = [
+  "redeem_ready",
+  "totp",
+  "passkey",
+  "login_error",
+  "link_error",
+];
+
+/** The params only a login which went through returns with. */
+const FLOW_SUCCESS_PARAMS = ["redeem_ready", "totp", "passkey"];
+
+/**
+ * `path` (a path on this origin, eg. from `sameOriginPath`) without the
+ * query params an external login returns with ([FLOW_RETURN_PARAMS]).
+ *
+ * The provider sends the tab back to this path, and the server adds its
+ * params after the query already there. One already in the path would
+ * be read as the server's: eg. a `login_error` made up by whoever wrote
+ * the link (`/login?backto=/?login_error=...`), shown as the reason
+ * after the tab's own flow, or a `redeem_ready=0` which drops the login.
+ * The rest of the path is kept as it is.
+ */
+export function withoutFlowReturnParams(path: string): string {
+  const hashStart = path.indexOf("#");
+  const hash = hashStart === -1 ? "" : path.slice(hashStart);
+  const beforeHash = hashStart === -1 ? path : path.slice(0, hashStart);
+  const queryStart = beforeHash.indexOf("?");
+  if (queryStart === -1) return path;
+  const pairs = beforeHash.slice(queryStart + 1).split("&");
+  // Each pair's name as the page reads it (decoded, `+` for a space).
+  const kept = pairs.filter((pair) => {
+    const [name] = new URLSearchParams(pair).keys();
+    return name === undefined || !FLOW_RETURN_PARAMS.includes(name);
+  });
+  if (kept.length === pairs.length) return path;
+  const query = kept.filter((pair) => pair.length).join("&");
+  return beforeHash.slice(0, queryStart) + (query ? `?${query}` : "") + hash;
+}
+
+/**
+ * A query param the server added to the url an external login returned
+ * to: its last value, the server adds its own after the query the url
+ * already had.
+ */
+export function flowReturnParam(
+  search: URLSearchParams,
+  name: string,
+): string | null {
+  const values = search.getAll(name);
+  return values.length ? values[values.length - 1] : null;
+}
+
+/** Why an external login / link failed, as the url says. */
+export interface FlowReturnError {
+  /** A link failed (`link_error`), rather than a login (`login_error`). */
+  link: boolean;
+  /** The reason in the url. Anyone can put text in a link. */
+  text: string;
+  /**
+   * - `server`: the server's own reason. The page load is the return
+   *   from a flow this tab started ([takeExternalFlowReturn]), and the
+   *   url carries only the one reason the server adds.
+   * - `unverified`: anyone could have written it, show a generic reason.
+   * - `stray`: the url also carries what a login which went through
+   *   returns with (`redeem_ready`, `totp`, `passkey`), which the
+   *   server's failure never does: not a failure, ignore it.
+   */
+  source: "server" | "unverified" | "stray";
+}
+
+/**
+ * The `login_error` / `link_error` of the page's query, and how far it
+ * can be trusted. Pass the query as the page loaded, before any of it
+ * is removed.
+ * @param flowReturn Whether the page load is the return from a flow the
+ * tab started ([takeExternalFlowReturn]).
+ */
+export function flowReturnError(
+  search: URLSearchParams,
+  flowReturn: boolean,
+): FlowReturnError | undefined {
+  const logins = search.getAll("login_error");
+  const links = search.getAll("link_error");
+  const link = !logins.length;
+  const text = (link ? links : logins)[0];
+  if (!text) return undefined;
+  let source: FlowReturnError["source"];
+  if (FLOW_SUCCESS_PARAMS.some((param) => search.has(param))) {
+    source = "stray";
+  } else if (flowReturn && logins.length + links.length === 1) {
+    source = "server";
+  } else {
+    source = "unverified";
+  }
+  return { link, text, source };
 }

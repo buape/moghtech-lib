@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { backtoPath, sameOriginPath } from "../src/auth/utils.ts";
+import "./resolve-extensionless.ts";
+
+const { backtoPath, sameOriginPath } = await import("../src/auth/utils.ts");
 
 const ORIGIN = "http://app.example:9230";
 
@@ -75,4 +77,37 @@ test("backtoPath reads the backto query param", () => {
   assert.equal(backtoPath("/home"), "/home");
   at("");
   assert.equal(backtoPath(), "/");
+});
+
+test("backtoPath drops what an external login returns with", () => {
+  // The provider sends the tab back to `backto`, with the server's
+  // params added after the query already there.
+  const planted =
+    "/?login_error=Your%20account%20is%20locked.%20Call%20%2B1-555-0100" +
+    "&redeem_ready=0";
+  at(`?backto=${encodeURIComponent(planted)}`);
+  assert.equal(backtoPath(), "/");
+  for (const param of [
+    "redeem_ready=0",
+    "totp=true",
+    "passkey=e30",
+    "login_error=spoofed",
+    "link_error=spoofed",
+    // Read the same once decoded
+    "login%5Ferror=spoofed",
+    "redeem%5Fready=0",
+  ]) {
+    at(`?backto=${encodeURIComponent(`/tools?tab=a&${param}&b=c#h`)}`);
+    assert.equal(backtoPath(), "/tools?tab=a&b=c#h", param);
+    at(`?backto=${encodeURIComponent(`/tools?${param}`)}`);
+    assert.equal(backtoPath(), "/tools", param);
+  }
+  // The rest of the query stays as it is.
+  at(`?backto=${encodeURIComponent("/tools?q=a%20b+c&totp=true&x=%2F")}`);
+  assert.equal(backtoPath(), "/tools?q=a%20b+c&x=%2F");
+  // Only names, not values, and not the fragment (which isn't read).
+  at(`?backto=${encodeURIComponent("/n?note=login_error#login_error=x")}`);
+  assert.equal(backtoPath(), "/n?note=login_error#login_error=x");
+  at(`?backto=${encodeURIComponent("/n?x=%26login_error%3Dy")}`);
+  assert.equal(backtoPath(), "/n?x=%26login_error%3Dy");
 });

@@ -8,8 +8,11 @@ import * as MoghAuth from "mogh_auth_client";
 import { useState } from "react";
 import {
   externalLoginState,
+  flowReturnError,
+  flowReturnParam,
   markExternalFlow,
   takeExternalFlowReturn,
+  withoutFlowReturnParams,
 } from "./external-flow";
 import { guardJwt, SEND_REJECTED_ONCE, sendableJwt } from "./rejected-jwt";
 import { backtoPath, sanitizeQueryInner } from "./utils";
@@ -39,7 +42,9 @@ export function authClient() {
  * Log in with an external login provider: redirects to it, like
  * `authClient().externalLogin`. From the login page the provider
  * sends the user back to [backtoPath], which never leaves the app,
- * from anywhere else back to the current page.
+ * from anywhere else back to the current page. Either way without the
+ * query params the login returns with (see [useAuthState]), which only
+ * the server adds.
  *
  * Also notes that this tab started the login, so the reason a failed
  * login comes back with is shown (see [useAuthState]).
@@ -47,16 +52,18 @@ export function authClient() {
  * @param providerSlug The provider `slug` from `GetLoginOptions`.
  */
 export function externalLogin(providerSlug: string) {
-  // The client builds the redirect from the url's `backto`,
-  // only hand it a checked one.
+  // The client builds the redirect from the url (on the login page
+  // from its `backto`), only hand it a checked one.
+  const current = location.pathname + location.search + location.hash;
+  let url = current;
   const search = new URLSearchParams(location.search);
   if (search.has("backto")) {
     search.set("backto", backtoPath());
-    history.replaceState(
-      history.state,
-      "",
-      `${location.pathname}?${search}${location.hash}`,
-    );
+    url = `${location.pathname}?${search}${location.hash}`;
+  }
+  url = withoutFlowReturnParams(url);
+  if (url !== current) {
+    history.replaceState(history.state, "", url);
   }
   markExternalFlow();
   authClient().externalLogin(providerSlug);
@@ -284,8 +291,14 @@ function removeQueryParams(...params: string[]) {
  *   Anyone can put text in a link, so the server's reason is only
  *   shown after an external login / link this tab started through
  *   mogh_ui ([externalLogin], `LoginPage`, `LinkedLogins`), on the
- *   page load it came back to. Otherwise the notification says the
- *   login didn't complete, and the text is only logged to the console.
+ *   page load it came back to, when the url carries only the one reason
+ *   the server adds. Otherwise the notification says the login didn't
+ *   complete, and the text is only logged to the console. Next to what
+ *   a login which went through returns with (`redeem_ready`, `totp`,
+ *   `passkey`) it isn't the server's at all, and is only logged.
+ *
+ * The server adds its params after the query already in the url, so
+ * `redeem_ready`, `totp` and `passkey` are read from their last value.
  *
  * The first page load after leaving for the provider ends the flow,
  * whatever it came back with (also a successful login or link, or a
@@ -317,10 +330,12 @@ export function useAuthState() {
   const search = new URLSearchParams(location.search);
   // Whether the tab is back from an external login / link it started.
   const external_flow_return = takeExternalFlowReturn();
+  // Judged on the url as it loaded, before any of it is removed.
+  const external_error = flowReturnError(search, external_flow_return);
 
   // A link can carry anything here: a challenge which can't be
   // read must not crash the app, which renders this on every page.
-  const _passkey = search.get("passkey");
+  const _passkey = flowReturnParam(search, "passkey");
   let passkeyRequest:
     | ReturnType<typeof MoghAuth.Passkey.prepareRequestChallengeResponse>
     | undefined;
@@ -363,42 +378,44 @@ export function useAuthState() {
 
   // An external login / link which failed comes back with the reason
   // (`AuthImpl::external_login_error_redirect` on the server).
-  const external_error = search.get("login_error") ?? search.get("link_error");
   if (external_error && !external_error_shown) {
     external_error_shown = true;
-    const link = !search.has("login_error");
-    if (!link) {
-      // Don't auto redirect to the provider again, it would loop.
-      externalLoginState.failed = true;
-    }
-    let message: string;
-    if (external_flow_return) {
-      message =
-        external_error.length > MAX_EXTERNAL_ERROR_LENGTH
-          ? external_error.slice(0, MAX_EXTERNAL_ERROR_LENGTH) + "..."
-          : external_error;
+    const { link, text, source } = external_error;
+    const param = link ? "link_error" : "login_error";
+    if (source === "stray") {
+      // Next to a login which went through: not the server's.
+      console.warn(`Ignored ${param} in the url:`, text);
     } else {
-      // Not a flow started here, the text may come from anyone.
-      console.warn(
-        `Unverified ${link ? "link_error" : "login_error"} in the url:`,
-        external_error,
-      );
-      message = link
-        ? "Linking the external login didn't complete."
-        : "The external login didn't complete.";
+      if (!link) {
+        // Don't auto redirect to the provider again, it would loop.
+        externalLoginState.failed = true;
+      }
+      let message: string;
+      if (source === "server") {
+        message =
+          text.length > MAX_EXTERNAL_ERROR_LENGTH
+            ? text.slice(0, MAX_EXTERNAL_ERROR_LENGTH) + "..."
+            : text;
+      } else {
+        // Not a flow started here, the text may come from anyone.
+        console.warn(`Unverified ${param} in the url:`, text);
+        message = link
+          ? "Linking the external login didn't complete."
+          : "The external login didn't complete.";
+      }
+      notifications.show({
+        title: link ? "Failed to link login" : "Login failed",
+        message,
+        color: "red",
+        autoClose: 10_000,
+      });
     }
-    notifications.show({
-      title: link ? "Failed to link login" : "Login failed",
-      message,
-      color: "red",
-      autoClose: 10_000,
-    });
     search.delete("login_error");
     search.delete("link_error");
     removeQueryParams("login_error", "link_error");
   }
 
-  const jwt_redeem_ready = search.get("redeem_ready") === "true";
+  const jwt_redeem_ready = flowReturnParam(search, "redeem_ready") === "true";
 
   // guard against multiple reqs sent
   // maybe isPending would do this but not sure about with render loop, this for sure will.
@@ -410,6 +427,6 @@ export function useAuthState() {
   return {
     jwt_redeem_ready: jwt_redeem_ready && !redeemFailed,
     passkey_pending: !!passkeyRequest,
-    totp: search.get("totp") === "true",
+    totp: flowReturnParam(search, "totp") === "true",
   };
 }
