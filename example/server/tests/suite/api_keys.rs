@@ -492,6 +492,72 @@ async fn signature_is_bound_to_the_request_and_time() {
   }
 }
 
+/// The body of a signed request is read before it is authenticated,
+/// up to `AuthImpl::signed_request_body_limit` (2 MB by default): a
+/// larger one is refused before its signature is looked at, whether
+/// it is valid or not.
+#[tokio::test]
+async fn signed_request_body_is_limited() {
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+  let private_key = admin
+    .manage(CreateSigningKey {
+      name: "generated".into(),
+      expires: 0,
+      cidr_whitelist: Vec::new(),
+      public_key: String::new(),
+    })
+    .await
+    .unwrap()
+    .private_key
+    .unwrap();
+  let server_public_key =
+    admin.read(GetCoreInfo {}).await.unwrap().public_key;
+
+  let path = "/read/GetRequestInfo";
+  // Valid JSON of the given length: `{}` and whitespace.
+  let body = |len: usize| {
+    let mut body = b"{}".to_vec();
+    body.resize(len, b' ');
+    body
+  };
+  let send = |body: Vec<u8>, valid: bool| {
+    let timestamp = unix_timestamp_ms() as i64;
+    let signature = if valid {
+      sign_request(
+        &private_key,
+        &server_public_key,
+        "POST",
+        path,
+        timestamp,
+        &body,
+      )
+      .unwrap()
+    } else {
+      String::from("AAAA")
+    };
+    let request = admin
+      .reqwest
+      .post(format!("{}{path}", app.address))
+      .header("x-api-signature", signature)
+      .header("x-api-timestamp", timestamp)
+      .header("content-type", "application/json")
+      .body(body);
+    async move { request.send().await.unwrap().status() }
+  };
+
+  const MB: usize = 1024 * 1024;
+  assert_eq!(send(body(MB), true).await, StatusCode::OK);
+  assert_eq!(send(body(2 * MB), true).await, StatusCode::OK);
+  for valid in [true, false] {
+    assert_eq!(
+      send(body(2 * MB + 1), valid).await,
+      StatusCode::PAYLOAD_TOO_LARGE,
+      "valid signature: {valid}"
+    );
+  }
+}
+
 #[tokio::test]
 async fn signature_headers_cannot_carry_another_body() {
   let app = TestApp::spawn().await;

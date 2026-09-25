@@ -427,3 +427,25 @@ fn data_encoding_base32_decode(input: &str) -> Vec<u8> {
   }
   out
 }
+
+/// The `name=value` of the session cookie a response sets, if any.
+fn set_session_cookie(res: &reqwest::Response) -> Option<String> {
+  res
+    .headers()
+    .get_all("set-cookie")
+    .iter()
+    .map(|value| value.to_str().unwrap())
+    .find(|cookie| {
+      cookie.starts_with("id=") || cookie.starts_with("__Host-id=")
+    })
+    .map(|cookie| cookie.split(';').next().unwrap().to_string())
+}
+
+/// `name=value` of the session cookie a response sets.
+pub fn session_cookie(res: &reqwest::Response) -> String {
+  set_session_cookie(res).expect("No session cookie set")
+}
+
+pub fn sets_session_cookie(res: &reqwest::Response) -> bool {
+  set_session_cookie(res).is_some()
+}

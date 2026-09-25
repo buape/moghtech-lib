@@ -203,6 +203,26 @@ test("a finished external login or link doesn't vouch for a later login error", 
   await expectNotVouched();
 });
 
+test("a login error planted in backto doesn't come back with the login", async ({
+  page,
+}) => {
+  const spoofed = "Your account is locked. Call support at +1-555-0100";
+  const username = uniqueName("planted-backto");
+  await addIdpUser(page, username);
+  // The provider sends the tab back to `backto`, and the server adds
+  // its `redeem_ready=true` after the query already there.
+  const backto =
+    `/tools?tab=a&login_error=${encodeURIComponent(spoofed)}` +
+    "&redeem_ready=0";
+  await page.goto(`/login?backto=${encodeURIComponent(backto)}`);
+  await page.getByRole("button", { name: /OIDC/ }).click();
+  await pickIdpUser(page, username);
+  await expectLoggedInAs(page, username);
+  await expect(page).toHaveURL(`${APP_URL}/tools?tab=a`);
+  await expect(page.locator("body")).not.toContainText("+1-555-0100");
+  await expect(notification(page, "Login failed")).toHaveCount(0);
+});
+
 /** A fresh admin token, manage requests need a recent login. */
 async function adminJwt(request: APIRequestContext): Promise<string> {
   const login = await request.post("/auth/login/LoginLocalUser", {

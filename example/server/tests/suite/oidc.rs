@@ -595,6 +595,81 @@ async fn a_failed_link_uses_up_the_begun_link() {
   assert!(get_user(&admin).await.linked_logins.is_empty());
 }
 
+/// Beginning a link gives the session a new id, like the first
+/// factor of a login: a session planted in the browser beforehand
+/// (session fixation) can't start the link, and link the login its
+/// holder completes at the provider to the user.
+#[tokio::test]
+async fn beginning_a_link_gets_a_new_session_id() {
+  let app = TestApp::spawn_with(oidc_app_options(json!({}))).await;
+  app.add_idp_user("alice", &[]);
+  let admin = app.sign_up("admin").await;
+
+  // Without a cookie store: the cookies are set by hand.
+  let reqwest = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .build()
+    .unwrap();
+  let get = |url: String, cookie: Option<String>| {
+    let request = reqwest.get(url);
+    match cookie {
+      Some(cookie) => request.header("cookie", cookie),
+      None => request,
+    }
+    .send()
+  };
+  let location = |res: &reqwest::Response| {
+    res.headers()["location"].to_str().unwrap().to_string()
+  };
+
+  // A live session of the attacker.
+  let res = get(format!("{}/auth/oidc/login", app.address), None)
+    .await
+    .unwrap();
+  assert!(res.status().is_redirection());
+  let planted = session_cookie(&res);
+
+  // The victim's browser was made to carry it (eg. by a sibling
+  // subdomain), and they begin a link.
+  let path = "/auth/manage/BeginExternalLoginLink";
+  let res = admin
+    .authenticate(
+      &reqwest::Method::POST,
+      path,
+      reqwest
+        .post(format!("{}{path}", app.address))
+        .header("cookie", &planted)
+        .json(&json!({})),
+    )
+    .unwrap()
+    .send()
+    .await
+    .unwrap();
+  assert!(res.status().is_success(), "{}", res.status());
+  let cycled = session_cookie(&res);
+  assert_ne!(cycled, planted);
+
+  // The planted session holds no link of the victim.
+  let link_url = format!("{}/auth/oidc/link", app.address);
+  let res = get(link_url.clone(), Some(planted)).await.unwrap();
+  let landed = reqwest::Url::parse(&location(&res)).unwrap();
+  assert_eq!(landed.path(), "/login", "{landed}");
+  let error = external_error(&landed, "login_error");
+  assert!(error.contains("not been initiated"), "{error}");
+
+  // The victim's own cookie starts and completes it.
+  app.idp.set_auto_user(Some("alice-sub"));
+  let res = get(link_url, Some(cycled.clone())).await.unwrap();
+  let authorize = location(&res);
+  assert!(authorize.starts_with(&app.idp.issuer), "{authorize}");
+  let res = get(authorize, None).await.unwrap();
+  let callback = location(&res);
+  let res = get(callback, Some(cycled)).await.unwrap();
+  assert_eq!(location(&res), format!("{}/profile", app.address));
+  let user = get_user(&admin).await;
+  assert_eq!(user.linked_logins.len(), 1);
+  assert_eq!(user.linked_logins[0].external_id, "alice-sub");
+}
 /// A link denied at the provider goes back to where links are
 /// managed, and uses up the attempt.
 #[tokio::test]

@@ -80,6 +80,22 @@ test("totp: unenroll goes back to password only", async ({ page }) => {
   await expectLoggedInAs(page, username);
 });
 
+test("a confirm dialog starts over on every open", async ({ page }) => {
+  await signUp(page, uniqueName("confirm-again"));
+  await enrollTotp(page);
+  const dialog = page.getByRole("dialog");
+  const confirm = dialog.getByRole("button", { name: "Unenroll TOTP 2FA" });
+  await page.getByRole("button", { name: "Unenroll TOTP 2FA" }).click();
+  await dialog.getByRole("textbox").fill("Unenroll");
+  await expect(confirm).toBeEnabled();
+  // Typed, then cancelled: the text doesn't confirm the next open.
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole("button", { name: "Unenroll TOTP 2FA" }).click();
+  await expect(dialog.getByRole("textbox")).toHaveValue("");
+  await expect(confirm).toBeDisabled();
+});
+
 test("passkey: enroll and log in with a virtual authenticator", async ({
   page,
 }) => {

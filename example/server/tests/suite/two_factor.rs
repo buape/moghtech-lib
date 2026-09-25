@@ -511,21 +511,64 @@ async fn first_factor_gets_a_new_session_id() {
   assert!(res.status().is_success(), "{}", res.text().await.unwrap());
 }
 
-/// `name=value` of the session cookie a response sets.
-fn session_cookie(res: &reqwest::Response) -> String {
-  res
-    .headers()
-    .get_all("set-cookie")
-    .iter()
-    .map(|value| value.to_str().unwrap())
-    .find(|cookie| {
-      cookie.starts_with("id=") || cookie.starts_with("__Host-id=")
+/// A pending second factor only lives as long as its session, which
+/// expires after a while without changes. The steps of the other
+/// flows, which anybody holding the cookie can request, don't change
+/// a session without that flow in flight: they can't keep a pending
+/// login alive (eg. after the password it came from was changed).
+/// The pending login itself expires after
+/// `Session::MAX_SECOND_FACTOR_LOGIN_AGE` (10 minutes) regardless.
+#[tokio::test]
+async fn other_flows_do_not_keep_a_pending_login_alive() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    static_oidc: true,
+    ..Default::default()
+  })
+  .await;
+  let admin = app.sign_up("admin").await;
+  let enrolled = enroll(&admin).await;
+  let client = begin_login(&app, "admin").await;
+
+  let get =
+    |path: &str| client.reqwest.get(format!("{}{path}", app.address));
+  for (path, request) in [
+    "/auth/oidc/callback?state=x&code=y",
+    "/auth/oidc/callback?error=x",
+    "/auth/external/unknown/callback",
+    "/auth/oidc/link",
+    "/auth/external/unknown/link",
+  ]
+  .map(|path| (path, get(path)))
+  .into_iter()
+  .chain([(
+    "ExchangeForJwt",
+    client
+      .reqwest
+      .post(format!("{}/auth/login/ExchangeForJwt", app.address))
+      .json(&json!({})),
+  )]) {
+    let res = request.send().await.unwrap();
+    assert!(
+      res.status().is_redirection()
+        || res.status() == StatusCode::UNAUTHORIZED,
+      "{path}: {}",
+      res.status()
+    );
+    // A saved session gets its cookie again, with a new expiry.
+    assert!(
+      !sets_session_cookie(&res),
+      "{path} saved the session: {:?}",
+      res.headers().get_all("set-cookie")
+    );
+  }
+
+  // The login is still pending.
+  client
+    .login(CompleteTotpLogin {
+      code: next_code(&enrolled.totp),
     })
-    .expect("No session cookie set")
-    .split(';')
-    .next()
-    .unwrap()
-    .to_string()
+    .await
+    .unwrap();
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
