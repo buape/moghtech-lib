@@ -6,8 +6,12 @@ Only failures count. A failed attempt returns its own error (status and
 headers included) with a `FailedAttempt` context noting the attempts left,
 displayed as `Invalid login credentials | You have 2 attempts remaining`.
 The original error stays in the chain, so `error.downcast_ref::<T>()` still
-finds its types. Once the attempts are used up, requests from the client are
-refused with `429 Too Many Requests` until the window passes.
+finds its types. The note displays the error with its causes, except for a
+server error (5xx) when the app hides server error details
+(`mogh_error::set_server_error_detail`): then only its top-level message, as
+the response carries that message alone. Once the attempts are used up,
+requests from the client are refused with `429 Too Many Requests` until the
+window passes.
 
 ```rust
 use mogh_rate_limit::{RateLimiter, WithFailureRateLimit};

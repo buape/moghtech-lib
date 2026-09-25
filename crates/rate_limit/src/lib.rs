@@ -23,9 +23,15 @@ pub use mogh_request_ip::{TrustedProxies, get_client_ip};
 /// `Invalid login credentials | You have 2 attempts remaining`.
 /// Rendering the whole chain (`{:#}`, or the `trace` of a
 /// serialized error) lists the attempt's error again below it.
+///
+/// A server error (5xx) displays without its causes when the app
+/// hides server error details
+/// ([mogh_error::set_server_error_detail] other than `Full`), as
+/// the response then carries this message alone.
 #[derive(Debug)]
 pub struct FailedAttempt {
-  /// The attempt's error with its causes, as `{:#}` renders it.
+  /// The attempt's error with its causes, as `{:#}` renders it
+  /// (only its top-level message for a hidden server error).
   error: String,
   remaining_attempts: usize,
 }
@@ -254,8 +260,20 @@ fn failed_attempt(
   mut e: mogh_error::Error,
   remaining_attempts: usize,
 ) -> mogh_error::Error {
+  // When the app hides the details of server errors, their
+  // response carries only the top-level message, which is this
+  // context: it must not repeat the causes (internal hosts, urls,
+  // driver messages). They stay below it in the chain, for logs.
+  let hide_causes = e.status.is_server_error()
+    && mogh_error::server_error_detail()
+      != mogh_error::ServerErrorDetail::Full;
+  let error = if hide_causes {
+    e.error.to_string()
+  } else {
+    format!("{:#}", e.error)
+  };
   let attempt = FailedAttempt {
-    error: format!("{:#}", e.error),
+    error,
     remaining_attempts,
   };
   e.error = e.error.context(attempt);
