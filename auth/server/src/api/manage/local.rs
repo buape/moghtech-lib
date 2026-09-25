@@ -7,10 +7,8 @@ use tracing::instrument;
 
 use crate::{
   AuthImpl,
-  api::{
-    login::local::{bcrypt_hash, check_username_available},
-    manage::ManageArgs,
-  },
+  api::{login::local::check_username_available, manage::ManageArgs},
+  bcrypt_pool::bcrypt_hash,
 };
 
 pub async fn update_username<I: AuthImpl + ?Sized>(

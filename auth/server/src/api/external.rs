@@ -36,6 +36,7 @@ use crate::{
   },
   rand::random_string,
   session::{ExternalLink, Session},
+  user::AuthUserImpl,
   validations::{MAX_USERNAME_LENGTH, constant_time_eq},
 };
 use crate::{Login, api::provider_login};
@@ -244,6 +245,8 @@ async fn begin_external_login<I: AuthImpl>(
 /// whatever its outcome, and refused once it is older than 10 minutes
 /// (`Session::MAX_EXTERNAL_LINK_AGE`). Until it is taken, the request
 /// is not known to be a link, and a failure goes to the login page.
+/// A user who was disabled (or locked) since is refused, here and
+/// again when the provider's callback completes the link.
 pub async fn external_link<I: AuthImpl>(
   slug: String,
   RequestIp(ip): RequestIp,
@@ -265,8 +268,7 @@ pub async fn external_link<I: AuthImpl>(
       load_enabled_provider(&auth, &slug).await?;
 
     let user = auth.get_user(user_id.clone()).await?;
-    auth.check_username_locked(user.username())?;
-    check_user_cidr_whitelist(user.as_ref(), ip)?;
+    check_user_can_link(&auth, user.as_ref(), ip)?;
 
     let begin = built.begin_login();
 
@@ -293,6 +295,29 @@ pub async fn external_link<I: AuthImpl>(
   }
   .await;
   error_redirect(&auth, flow, res)
+}
+
+/// Whether `user` can link a login now, checked when the link is
+/// started (`/link`) and again before the provider's callback links
+/// the login (the user may have changed in between):
+/// - the user is enabled: a disabled user changes nothing about how
+///   they log in (like the management api they began it with),
+/// - the username isn't locked,
+/// - the request comes from within the user's cidr whitelist.
+fn check_user_can_link<I: AuthImpl + ?Sized>(
+  auth: &I,
+  user: &dyn AuthUserImpl,
+  ip: IpAddr,
+) -> mogh_error::Result<()> {
+  if !user.is_enabled() {
+    return Err(
+      anyhow!("User is not enabled")
+        .status_code(StatusCode::FORBIDDEN),
+    );
+  }
+  auth.check_username_locked(user.username())?;
+  check_user_cidr_whitelist(user, ip)?;
+  Ok(())
 }
 
 /// Takes the link begun on the session, and saves the session right
@@ -476,7 +501,8 @@ pub async fn external_callback<I: AuthImpl>(
 
       match link_user_id {
         Some(user_id) => {
-          link_callback(&auth, &provider, user_id, completed).await
+          link_callback(&auth, &provider, user_id, completed, ip)
+            .await
         }
         None => {
           login_callback(
@@ -679,13 +705,21 @@ fn normalize_username(name: &str) -> String {
   normalized.trim_matches(['-', '.']).to_string()
 }
 
+/// Links the login completed at the provider to the user who
+/// started the link (`user_id`), checked again first
+/// ([check_user_can_link]): the user may have been disabled, or
+/// locked, since the link was started.
 async fn link_callback<I: AuthImpl>(
   auth: &I,
   provider: &ExternalLoginProvider,
   user_id: String,
   completed: CompletedExternalLogin,
+  ip: IpAddr,
 ) -> mogh_error::Result<Redirect> {
   let info = completed.info;
+
+  let user = auth.get_user(user_id.clone()).await?;
+  check_user_can_link(auth, user.as_ref(), ip)?;
 
   // Ensure there are no other existing users with this login linked.
   if let Some(existing_user) = auth
@@ -756,6 +790,7 @@ mod tests {
   struct TestUser {
     id: String,
     cidr_whitelist: Vec<String>,
+    enabled: bool,
   }
 
   impl crate::user::AuthUserImpl for TestUser {
@@ -767,6 +802,9 @@ mod tests {
     }
     fn cidr_whitelist(&self) -> &[String] {
       &self.cidr_whitelist
+    }
+    fn is_enabled(&self) -> bool {
+      self.enabled
     }
   }
 
@@ -787,6 +825,10 @@ mod tests {
     no_users_exist: bool,
     sync_fails: bool,
     cidr_whitelist: Vec<String>,
+    /// The users [AuthImpl::get_user] finds are disabled.
+    users_disabled: bool,
+    /// The username of the users is locked.
+    username_locked: bool,
     error_redirect: Option<&'static str>,
     /// Refused by the app's 'validate_username', on top of the default rule.
     rejected_usernames: Vec<&'static str>,
@@ -892,6 +934,7 @@ mod tests {
           Box::new(TestUser {
             id: user_id.clone(),
             cidr_whitelist: self.cidr_whitelist.clone(),
+            enabled: true,
           }) as crate::user::BoxAuthUser
         });
       Box::pin(async move { Ok(user) })
@@ -942,10 +985,21 @@ mod tests {
 
     fn get_user(
       &self,
-      _user_id: String,
+      user_id: String,
     ) -> crate::DynFuture<mogh_error::Result<crate::user::BoxAuthUser>>
     {
-      Box::pin(async { Err(anyhow!("not implemented").into()) })
+      let user = Box::new(TestUser {
+        id: user_id,
+        cidr_whitelist: self.cidr_whitelist.clone(),
+        enabled: !self.users_disabled,
+      }) as crate::user::BoxAuthUser;
+      Box::pin(async { Ok(user) })
+    }
+
+    fn locked_usernames(&self) -> &'static [String] {
+      static LOCKED: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| vec!["user".to_string()]);
+      if self.username_locked { &LOCKED } else { &[] }
     }
 
     fn handle_request_authentication(
@@ -1229,6 +1283,7 @@ mod tests {
       &provider,
       "linking-user".to_string(),
       completed(&provider, "42", None),
+      IP,
     )
     .await
     .unwrap();
@@ -1372,6 +1427,7 @@ mod tests {
       &provider,
       "linking-user".to_string(),
       completed(&provider, "42", None),
+      IP,
     )
     .await
     .unwrap_err();
@@ -1646,6 +1702,164 @@ mod tests {
       location(redirect)
         .starts_with("https://example.com/login?login_error=")
     );
+  }
+
+  /// The requests anybody holding the cookie can send leave a
+  /// session without a flow in flight unmodified: the session layer
+  /// would save it, extending its expiry, and keep whatever else is
+  /// pending on it (a second factor) alive.
+  #[tokio::test]
+  async fn test_nothing_in_flight_leaves_the_session_unmodified() {
+    let store = Arc::new(tower_sessions::MemoryStore::default());
+    let session = session_on(&store, None);
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    session.0.save().await.unwrap();
+    let id = session.id();
+
+    let session = session_on(&store, id);
+    let redirect = external_callback::<NoLinkingAuth>(
+      "oidc".to_string(),
+      RequestIp(IP),
+      session.clone(),
+      Query(StandardCallbackQuery {
+        state: Some("state".into()),
+        code: Some("code".into()),
+        error: None,
+      }),
+    )
+    .await
+    .unwrap();
+    assert!(location(redirect).contains("not%20been%20initiated"));
+    let redirect = external_link::<NoLinkingAuth>(
+      "oidc".to_string(),
+      RequestIp(IP),
+      session.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(location(redirect).contains("not%20been%20initiated"));
+    assert!(!session.0.is_modified());
+  }
+
+  /// A link completes only for a user who can still link: enabled,
+  /// not locked, and within their cidr whitelist. The user may have
+  /// changed since the link was started.
+  #[tokio::test]
+  async fn test_link_is_refused_once_the_user_can_not_link() {
+    let provider = github("flow-a", true, "secret");
+    for (auth, status, reason) in [
+      (
+        TestAuth {
+          users_disabled: true,
+          ..Default::default()
+        },
+        StatusCode::FORBIDDEN,
+        "not enabled",
+      ),
+      (
+        TestAuth {
+          username_locked: true,
+          ..Default::default()
+        },
+        StatusCode::UNAUTHORIZED,
+        "locked",
+      ),
+      (
+        TestAuth {
+          cidr_whitelist: vec!["192.168.0.0/16".to_string()],
+          ..Default::default()
+        },
+        StatusCode::FORBIDDEN,
+        "",
+      ),
+    ] {
+      let err = link_callback(
+        &auth,
+        &provider,
+        "linking-user".to_string(),
+        completed(&provider, "42", None),
+        IP,
+      )
+      .await
+      .unwrap_err();
+      assert_eq!(err.status, status, "{reason}");
+      assert!(format!("{:#}", err.error).contains(reason));
+      let calls = auth.calls.lock().unwrap();
+      assert!(calls.logins.is_empty(), "{reason}");
+      assert!(calls.synced.is_empty(), "{reason}");
+    }
+  }
+
+  /// An app whose users are disabled, with a provider to link.
+  struct DisabledUserAuth;
+
+  impl AuthImpl for DisabledUserAuth {
+    fn new() -> Self {
+      DisabledUserAuth
+    }
+    fn host(&self) -> &str {
+      "https://example.com"
+    }
+    fn post_link_redirect(&self) -> &str {
+      "https://example.com/profile"
+    }
+    fn external_login_error_redirect(&self) -> Option<&str> {
+      Some("https://example.com/login")
+    }
+    fn static_external_providers(
+      &self,
+    ) -> Vec<ExternalLoginProvider> {
+      vec![github("flow-link", true, "secret")]
+    }
+    fn get_user(
+      &self,
+      user_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<crate::user::BoxAuthUser>>
+    {
+      Box::pin(async {
+        Ok(Box::new(TestUser {
+          id: user_id,
+          cidr_whitelist: Vec::new(),
+          enabled: false,
+        }) as crate::user::BoxAuthUser)
+      })
+    }
+    fn handle_request_authentication(
+      &self,
+      _auth: crate::RequestAuthentication,
+      _ip: IpAddr,
+      _require_user_enabled: bool,
+      _req: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      Box::pin(async { Err(anyhow!("not implemented").into()) })
+    }
+    fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+      panic!("not needed for these tests")
+    }
+  }
+
+  /// A user disabled after beginning a link can't start it: nothing
+  /// is left on the session for the provider's callback to complete.
+  #[tokio::test]
+  async fn test_link_start_is_refused_for_a_disabled_user() {
+    let session = session();
+    session
+      .insert_external_link_user_id("user-1")
+      .await
+      .unwrap();
+    let redirect = external_link::<DisabledUserAuth>(
+      "flow-link".to_string(),
+      RequestIp(IP),
+      session.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      location(redirect),
+      "https://example.com/profile?link_error=User%20is%20not%20enabled"
+    );
+    assert!(session.retrieve_external_login().await.is_err());
   }
 
   fn server_error() -> mogh_error::Result<Redirect> {

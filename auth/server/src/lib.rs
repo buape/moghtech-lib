@@ -23,6 +23,7 @@ pub mod rand;
 pub mod user;
 pub mod validations;
 
+mod bcrypt_pool;
 mod session;
 
 use crate::{
@@ -1087,9 +1088,12 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// DANGER ⚠️ the incoming secret must still be validated as matching the
   /// known hashed secret for the api key. Use
   /// [middleware::verify_api_key_secret_async] with the stored hash
-  /// (or `None` if the key does not exist) to do so. It runs bcrypt on
-  /// the blocking thread pool: bcrypt takes tens of milliseconds, and
-  /// runs for every request carrying X-API-KEY, made up keys included.
+  /// (or `None` if the key does not exist) to do so. bcrypt takes tens
+  /// of milliseconds, and runs for every request carrying X-API-KEY,
+  /// made up keys included. The helper runs it on the blocking thread
+  /// pool, at most one per available core at a time, on a budget of
+  /// its own: a flood of made up keys stalls neither the async runtime
+  /// nor password logins.
   ///
   /// The returned [cidr_whitelist][api_key::AuthApiKeyImpl::cidr_whitelist]
   /// is enforced by [Self::get_user_id_from_request_authentication].
@@ -1154,6 +1158,30 @@ pub trait AuthImpl: Send + Sync + 'static {
   /// use TLS either way.
   fn signing_key_timestamp_tolerance_ms(&self) -> u64 {
     1_000
+  }
+
+  /// The largest body, in bytes, a request signed with a signing key
+  /// may carry. Default: 2 MB (axum's default body limit).
+  ///
+  /// The signature covers the body, so it is read into memory before
+  /// the request is authenticated
+  /// ([middleware::read_signed_request_body]), also when the signature
+  /// then turns out to be invalid: anybody can send a current
+  /// X-API-TIMESTAMP. It is read up to this and, like axum's body
+  /// extractors, up to the `axum::extract::DefaultBodyLimit` of the
+  /// router applied outside of the middleware (axum's 2 MB default
+  /// when there is none), whichever is smaller. A larger signed body
+  /// is refused with `413 Payload Too Large`.
+  ///
+  /// So raising (or disabling) the router's limit, eg. for an upload
+  /// route, doesn't let unauthenticated signed requests buffer more.
+  /// To accept signed bodies over 2 MB, raise both this and the
+  /// router's `DefaultBodyLimit` (a layer outside of the middleware):
+  /// raising only this still refuses them at axum's 2 MB default.
+  /// Other requests aren't affected: their body isn't read before they
+  /// are authenticated.
+  fn signed_request_body_limit(&self) -> usize {
+    2 * 1024 * 1024
   }
 
   /// Store a new signing key of the user: a key pair whose private

@@ -7,7 +7,8 @@
 //! - After a failed load the source is left alone for a while,
 //!   instead of being tried again by every request.
 //! - While the source can't be reached, the last loaded value stays in
-//!   use for a limited time, so a short outage doesn't stop everything.
+//!   use for a limited time after it went out of date, so a short
+//!   outage doesn't stop everything.
 
 use std::{
   collections::HashMap,
@@ -22,7 +23,12 @@ use anyhow::anyhow;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// After a failed load the source is left alone this long.
 const RETRY_FAILED_LOAD_AFTER: Duration = Duration::from_secs(30);
-/// While loading fails, the last loaded value stays in use this long.
+/// While loading fails, the last loaded value stays in use
+/// this long after it went out of date (its `valid_for`).
+///
+/// Measured from when it went out of date rather than when it loaded,
+/// otherwise a value valid for as long as this (Google's discovery
+/// data) would never be reused: it only reloads once it is too old.
 const MAX_STALE_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The error of a load which wasn't attempted, because it failed too
@@ -84,13 +90,26 @@ fn state(
     return State::Fresh;
   }
   if failed_ago.is_some_and(|ago| ago < RETRY_FAILED_LOAD_AFTER) {
-    return if value_age.is_some_and(|age| age < MAX_STALE_AGE) {
+    return if value_age
+      .is_some_and(|age| usable_while_failing(valid_for, age))
+    {
       State::Stale
     } else {
       State::FailedRecently
     };
   }
   State::Load
+}
+
+/// Whether a value loaded `age` ago may still be used while loading
+/// fails: up to [MAX_STALE_AGE] after it went out of date.
+fn usable_while_failing(
+  valid_for: Option<Duration>,
+  age: Duration,
+) -> bool {
+  valid_for.is_none_or(|valid_for| {
+    age < valid_for.saturating_add(MAX_STALE_AGE)
+  })
 }
 
 pub struct LoadCache<T> {
@@ -229,7 +248,7 @@ impl<T> LoadCache<T> {
         let stale = previous
           .as_ref()
           .filter(|(loaded_at, _)| {
-            loaded_at.elapsed() < MAX_STALE_AGE
+            usable_while_failing(valid_for, loaded_at.elapsed())
           })
           .map(|(_, value)| value.clone());
         entries.insert(
@@ -333,6 +352,25 @@ mod tests {
     // But not forever, and not without any value
     assert_eq!(
       state(MINUTE, Some(secs(2 * 60 * 60)), Some(secs(5))),
+      State::FailedRecently
+    );
+    // How long is measured from when the value went out of date
+    assert_eq!(
+      state(MINUTE, Some(secs(60 + 59 * 60)), Some(secs(5))),
+      State::Stale
+    );
+    assert_eq!(
+      state(MINUTE, Some(secs(60 + 60 * 60)), Some(secs(5))),
+      State::FailedRecently
+    );
+    // So a value valid for as long as that is reused as well
+    let hour = Some(secs(60 * 60));
+    assert_eq!(
+      state(hour, Some(secs(60 * 60 + 5)), Some(secs(5))),
+      State::Stale
+    );
+    assert_eq!(
+      state(hour, Some(secs(2 * 60 * 60 + 5)), Some(secs(5))),
       State::FailedRecently
     );
     assert_eq!(
@@ -514,6 +552,64 @@ mod tests {
         .await
         .is_err()
     );
+  }
+
+  /// Moves the value and the last failure of `key` `by` into the past.
+  fn backdate(cache: &LoadCache<u32>, key: &str, by: Duration) {
+    let past = |instant: Instant| {
+      instant.checked_sub(by).expect("an instant in the past")
+    };
+    let mut entries = cache.entries.write().unwrap();
+    let entry = entries.get_mut(key).unwrap();
+    if let Some((loaded_at, _)) = &mut entry.value {
+      *loaded_at = past(*loaded_at);
+    }
+    if let Some(failed_at) = &mut entry.failed_at {
+      *failed_at = past(*failed_at);
+    }
+  }
+
+  /// A value valid for as long as values are reused while loading
+  /// fails (Google's discovery data) is reused as well: when it
+  /// reloads it is at least that old. How long it is reused is
+  /// measured from when it went out of date.
+  #[tokio::test]
+  async fn test_long_lived_value_is_used_when_reload_fails() {
+    let cache = LoadCache::<u32>::default();
+    let valid_for = Some(MAX_STALE_AGE);
+    let first = cache
+      .load("key", 1, valid_for, || async { Ok(7) })
+      .await
+      .unwrap();
+    // Just out of date
+    backdate(&cache, "key", MAX_STALE_AGE + Duration::from_secs(5));
+    let second = cache
+      .load("key", 1, valid_for, || async {
+        Err(anyhow!("unreachable"))
+      })
+      .await
+      .unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    let third = cache
+      .load("key", 1, valid_for, || async { panic!("must not load") })
+      .await
+      .unwrap();
+    assert!(Arc::ptr_eq(&first, &third));
+
+    // Out of date for longer than values are reused
+    backdate(&cache, "key", MAX_STALE_AGE);
+    let err = cache
+      .load("key", 1, valid_for, || async {
+        Err(anyhow!("unreachable"))
+      })
+      .await
+      .unwrap_err();
+    assert!(err.to_string().contains("unreachable"), "{err:#}");
+    let err = cache
+      .load("key", 1, valid_for, || async { panic!("must not load") })
+      .await
+      .unwrap_err();
+    assert!(LoadFailedRecently::is(&err));
   }
 
   #[tokio::test]

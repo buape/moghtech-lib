@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::OnceLock};
+use std::{collections::HashMap, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, anyhow};
 use axum::http::StatusCode;
@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
-  provider::token_exchange::TokenVerificationKeys,
+  provider::{
+    CONNECT_TIMEOUT, REQUEST_TIMEOUT,
+    token_exchange::TokenVerificationKeys,
+  },
   validations::url_has_credentials,
 };
 
@@ -48,13 +51,31 @@ pub type TokenResponse = StandardTokenResponse<
   CoreTokenType,
 >;
 
-fn reqwest(app_user_agent: &str) -> &'static reqwest::Client {
+/// A client for requests to OIDC providers (and Google), which
+/// gives up after `timeout` (see [REQUEST_TIMEOUT]).
+///
+/// Redirects are not followed: the token request carries the
+/// client credentials and the PKCE verifier, which a redirect
+/// would send on.
+pub(crate) fn http_client(
+  app_user_agent: &str,
+  timeout: Duration,
+) -> reqwest::Result<reqwest::Client> {
+  reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(timeout)
+    .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+    .user_agent(app_user_agent)
+    .build()
+}
+
+/// The client shared by every OIDC provider.
+fn shared_http_client(
+  app_user_agent: &str,
+) -> &'static reqwest::Client {
   static REQWEST: OnceLock<reqwest::Client> = OnceLock::new();
   REQWEST.get_or_init(|| {
-    reqwest::Client::builder()
-      .redirect(reqwest::redirect::Policy::none())
-      .user_agent(app_user_agent)
-      .build()
+    http_client(app_user_agent, REQUEST_TIMEOUT)
       .expect("Invalid OIDC reqwest client")
   })
 }
@@ -80,7 +101,7 @@ pub type InnerOidcProvider = Client<
 >;
 
 pub struct OidcProvider {
-  app_user_agent: &'static str,
+  http: reqwest::Client,
   client: InnerOidcProvider,
   use_full_email: bool,
   additional_scopes: Vec<String>,
@@ -120,7 +141,7 @@ impl OidcProvider {
     // Use OpenID Connect Discovery to fetch the provider metadata.
     let provider_metadata = CoreProviderMetadata::discover_async(
       IssuerUrl::new(config.provider.clone())?,
-      reqwest(app_user_agent),
+      shared_http_client(app_user_agent),
     )
     .await
     .context(
@@ -167,13 +188,24 @@ impl OidcProvider {
     );
 
     Ok(OidcProvider {
+      http: shared_http_client(app_user_agent).clone(),
       client,
-      app_user_agent,
       use_full_email: config.use_full_email,
       additional_scopes,
       additional_audiences: config.additional_audiences.clone(),
       verification_keys,
     })
+  }
+
+  /// Gives up on requests after `timeout`
+  /// instead of [REQUEST_TIMEOUT].
+  #[cfg(test)]
+  fn with_request_timeout(
+    mut self,
+    timeout: Duration,
+  ) -> OidcProvider {
+    self.http = http_client("test", timeout).unwrap();
+    self
   }
 
   /// Verifies the ID tokens of logins. Some providers attach
@@ -268,13 +300,12 @@ impl OidcProvider {
       return Err(anyhow!("CSRF token invalid").into());
     }
 
-    let reqwest_client = reqwest(self.app_user_agent);
     let token_response = self
       .client
       .exchange_code(AuthorizationCode::new(code))
       .context("Failed to get Oauth token at exchange code")?
       .set_pkce_verifier(pkce_verifier)
-      .request_async(reqwest_client)
+      .request_async(&self.http)
       .await
       .context("Failed to get Oauth token")?;
 
@@ -347,7 +378,7 @@ impl OidcProvider {
       })
       .ok()?
       .request_async::<UsernameAdditionalClaims, _, CoreGenderClaim>(
-        reqwest(self.app_user_agent),
+        &self.http,
       )
       .await
       .inspect(|user_info| debug!("OIDC USER INFO: {user_info:?}"))
@@ -401,7 +432,7 @@ impl OidcProvider {
         )
         .ok()?
         .request_async::<UsernameAdditionalClaims, _, CoreGenderClaim>(
-          reqwest(self.app_user_agent),
+          &self.http,
         )
         .await
         .inspect(|user_info| debug!("OIDC USER INFO: {user_info:?}"))
@@ -492,7 +523,7 @@ impl OidcProvider {
         )
         .ok()?
         .request_async::<UsernameAdditionalClaims, _, CoreGenderClaim>(
-          reqwest(self.app_user_agent),
+          &self.http,
         )
         .await
         .inspect(|user_info| debug!("OIDC USER INFO: {user_info:?}"))
@@ -985,6 +1016,88 @@ mod tests {
       provider.get_username(&subject, &token, &nonce).await,
       "subject-123"
     );
+  }
+
+  /// The provider of the test metadata, with `endpoints` set on it,
+  /// which gives up on requests after a moment.
+  fn impatient_provider(
+    config: &OidcConfig,
+    endpoints: impl FnOnce(CoreProviderMetadata) -> CoreProviderMetadata,
+  ) -> OidcProvider {
+    use crate::provider::token_exchange::test_tokens::metadata;
+    OidcProvider::from_metadata(
+      "test",
+      "https://app.example.com/auth/oidc/callback".to_string(),
+      config,
+      endpoints(metadata()),
+    )
+    .unwrap()
+    .with_request_timeout(std::time::Duration::from_millis(200))
+  }
+
+  /// A provider which accepts the connection but never answers
+  /// fails the login, instead of leaving the callback hanging.
+  #[tokio::test]
+  async fn test_stalled_token_endpoint_fails_the_login() {
+    use openidconnect::TokenUrl;
+    let stalled = crate::provider::stalled_server().await;
+    let config = exchange_config(&[], &[]);
+    let provider = impatient_provider(&config, |metadata| {
+      metadata.set_token_endpoint(Some(
+        TokenUrl::new(format!("{stalled}/token")).unwrap(),
+      ))
+    });
+    let nonce = Nonce::new("nonce".to_string());
+    let login = provider.validate_extract_login_info_and_token(
+      &config,
+      (CsrfToken::new("state".to_string()), "state".to_string()),
+      "code".to_string(),
+      PkceCodeVerifier::new("v".repeat(43)),
+      &nonce,
+    );
+    let err =
+      tokio::time::timeout(std::time::Duration::from_secs(10), login)
+        .await
+        .expect("the login must fail, not hang")
+        .unwrap_err();
+    let message = format!("{:#}", err.error);
+    assert!(message.contains("timed out"), "{message}");
+  }
+
+  /// The user info a login may ask for (username,
+  /// groups) is given up on the same way.
+  #[tokio::test]
+  async fn test_stalled_user_info_is_given_up_on() {
+    use openidconnect::UserInfoUrl;
+    let stalled = crate::provider::stalled_server().await;
+    let config = exchange_config(&[], &[]);
+    let provider = impatient_provider(&config, |metadata| {
+      metadata.set_userinfo_endpoint(Some(
+        UserInfoUrl::new(format!("{stalled}/userinfo")).unwrap(),
+      ))
+    });
+    // Without an ID token, the name comes from the user info
+    let token: TokenResponse = serde_json::from_value(json!({
+      "access_token": "access-token",
+      "token_type": "bearer",
+    }))
+    .unwrap();
+    let subject = SubjectIdentifier::new("subject-123".to_string());
+    let nonce = Nonce::new("nonce".to_string());
+    let username = tokio::time::timeout(
+      std::time::Duration::from_secs(10),
+      provider.get_username(&subject, &token, &nonce),
+    )
+    .await
+    .expect("the user info request must be given up on");
+    assert_eq!(username, "subject-123");
+    let groups = tokio::time::timeout(
+      std::time::Duration::from_secs(10),
+      provider.get_user_info_groups(&subject, &token, "groups"),
+    )
+    .await
+    .expect("the user info request must be given up on");
+    assert_eq!(groups, None);
   }
 
   #[tokio::test]

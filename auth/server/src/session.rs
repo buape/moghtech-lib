@@ -4,6 +4,7 @@ use anyhow::Context;
 use axum::extract::FromRequestParts;
 use mogh_error::{AddStatusCode, AddStatusCodeError as _};
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use tracing::warn;
 use webauthn_rs::prelude::{
   PasskeyAuthentication, PasskeyRegistration,
@@ -55,6 +56,32 @@ impl Session {
       .map_err(Into::into)
   }
 
+  /// Takes the value under `key` off the session. Unlike
+  /// [tower_sessions::Session::remove], a session without one is
+  /// left unmodified: the session layer saves (which extends its
+  /// expiry) every modified session, and a request with nothing in
+  /// flight, which anyone holding the cookie can send, must not keep
+  /// the session alive.
+  async fn take<T: DeserializeOwned>(
+    &self,
+    key: &str,
+  ) -> anyhow::Result<Option<T>> {
+    let present = self
+      .0
+      .get_value(key)
+      .await
+      .context("Failed to load session")?
+      .is_some();
+    if !present {
+      return Ok(None);
+    }
+    self
+      .0
+      .remove(key)
+      .await
+      .context("Internal session type error")
+  }
+
   pub async fn insert_authenticated_user_id(
     &self,
     user_id: &str,
@@ -72,10 +99,8 @@ impl Session {
     &self,
   ) -> mogh_error::Result<String> {
     self
-      .0
-      .remove(Self::AUTHENTICATED_USER_ID)
-      .await
-      .context("Internal session type error")?
+      .take(Self::AUTHENTICATED_USER_ID)
+      .await?
       .context("Authentication steps must be completed before JWT can be retrieved")
       .status_code(StatusCode::UNAUTHORIZED)
   }
@@ -98,15 +123,15 @@ impl Session {
   }
 
   /// Takes the in flight external login or link,
-  /// it can only be completed once.
+  /// it can only be completed once. Without one, the session is
+  /// left unmodified (see [Self::take]): a callback anybody holding
+  /// the cookie can send doesn't keep the session alive.
   pub async fn retrieve_external_login(
     &self,
   ) -> mogh_error::Result<SessionExternalLogin> {
     self
-      .0
-      .remove(Self::EXTERNAL_LOGIN)
-      .await
-      .context("Internal session type error")?
+      .take(Self::EXTERNAL_LOGIN)
+      .await?
       .context(
         "External login has not been initiated for this session",
       )
@@ -117,7 +142,22 @@ impl Session {
   // = 2FA LOGIN =
   // =============
 
-  const PASSKEY_LOGIN: &str = "passkey-login";
+  /// How long the second factor (passkey, TOTP or recovery code) of
+  /// a login can be completed for, from when its first factor (the
+  /// password, or an external login) passed. An older one is refused,
+  /// and the login starts over.
+  ///
+  /// The pending second factor is not tied to its first factor
+  /// otherwise: this bounds how long it outlives a change of the
+  /// password, or the unlink of the external login, it came from,
+  /// however the session is kept alive.
+  pub const MAX_SECOND_FACTOR_LOGIN_AGE: Duration =
+    Duration::from_secs(10 * 60);
+
+  // Stored with when the first factor passed. The key is not the
+  // one of the earlier format (without it), which then reads as not
+  // initiated.
+  const PASSKEY_LOGIN: &str = "passkey-login-begun";
 
   /// Begins the passkey second factor of the user, whose first
   /// factor has passed. Cycles the session id first, so the
@@ -128,10 +168,26 @@ impl Session {
     user_id: &str,
     state: &PasskeyAuthentication,
   ) -> mogh_error::Result<()> {
+    self
+      .insert_passkey_login_begun_at(
+        user_id,
+        state,
+        unix_timestamp_secs(),
+      )
+      .await
+  }
+
+  /// [Self::insert_passkey_login] begun at `begun_at` (unix seconds).
+  pub(crate) async fn insert_passkey_login_begun_at(
+    &self,
+    user_id: &str,
+    state: &PasskeyAuthentication,
+    begun_at: u64,
+  ) -> mogh_error::Result<()> {
     self.cycle_id().await?;
     self
       .0
-      .insert(Self::PASSKEY_LOGIN, (user_id, state))
+      .insert(Self::PASSKEY_LOGIN, (user_id, state, begun_at))
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
@@ -140,20 +196,24 @@ impl Session {
   /// Takes the passkey login in progress, and with it the kind of
   /// its first factor: the caller records the login on success,
   /// and a refused passkey ends the attempt (the login starts over).
+  /// One older than [Self::MAX_SECOND_FACTOR_LOGIN_AGE] is refused
+  /// (and taken all the same).
   pub async fn retrieve_passkey_login(
     &self,
   ) -> mogh_error::Result<(String, PasskeyAuthentication, LoginKind)>
   {
-    let (user_id, state) = self
-      .0
-      .remove::<(String, PasskeyAuthentication)>(Self::PASSKEY_LOGIN)
-      .await
-      .context("Internal session type error")?
+    let (user_id, state, begun_at) = self
+      .take::<(String, PasskeyAuthentication, u64)>(
+        Self::PASSKEY_LOGIN,
+      )
+      .await?
       .context(
         "Passkey login has not been initiated for this session",
       )
       .status_code(StatusCode::UNAUTHORIZED)?;
-    Ok((user_id, state, self.take_login_kind().await))
+    let kind = self.take_login_kind().await;
+    check_second_factor_login_age(begun_at, unix_timestamp_secs())?;
+    Ok((user_id, state, kind))
   }
 
   const LOGIN_KIND: &str = "login-kind";
@@ -196,7 +256,8 @@ impl Session {
     }
   }
 
-  const TOTP_LOGIN: &str = "totp-login";
+  // Stored with when the first factor passed, see PASSKEY_LOGIN.
+  const TOTP_LOGIN: &str = "totp-login-begun";
   const TOTP_LOGIN_ATTEMPTS: &str = "totp-login-attempts";
 
   /// How many codes (TOTP or recovery) can be tried for one
@@ -219,6 +280,16 @@ impl Session {
     &self,
     user_id: &str,
   ) -> mogh_error::Result<()> {
+    self.insert_totp_login(user_id, unix_timestamp_secs()).await
+  }
+
+  /// [Self::insert_totp_login_user_id] begun at `begun_at`
+  /// (unix seconds).
+  pub(crate) async fn insert_totp_login(
+    &self,
+    user_id: &str,
+    begun_at: u64,
+  ) -> mogh_error::Result<()> {
     self.cycle_id().await?;
     self
       .0
@@ -227,7 +298,7 @@ impl Session {
       .context("Failed to serialize session data")?;
     self
       .0
-      .insert(Self::TOTP_LOGIN, user_id)
+      .insert(Self::TOTP_LOGIN, (user_id, begun_at))
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
@@ -236,18 +307,26 @@ impl Session {
   /// Returns the user id which began totp login, and counts an attempt
   /// at the second factor. The login stays on the session, so a
   /// mistyped code can be tried again without logging in from the
-  /// start, up to [Self::MAX_TOTP_LOGIN_ATTEMPTS] times. Finish it
-  /// with [Self::complete_totp_login] once the code is accepted.
+  /// start, up to [Self::MAX_TOTP_LOGIN_ATTEMPTS] times, for up to
+  /// [Self::MAX_SECOND_FACTOR_LOGIN_AGE]. Past either, the login is
+  /// removed and refused. Finish it with [Self::complete_totp_login]
+  /// once the code is accepted.
   pub async fn begin_totp_login_attempt(
     &self,
   ) -> mogh_error::Result<String> {
-    let user_id = self
+    let (user_id, begun_at) = self
       .0
-      .get::<String>(Self::TOTP_LOGIN)
+      .get::<(String, u64)>(Self::TOTP_LOGIN)
       .await
       .context("Internal session type error")?
       .context("TOTP login has not been initiated for this session")
       .status_code(StatusCode::UNAUTHORIZED)?;
+    if let Err(e) =
+      check_second_factor_login_age(begun_at, unix_timestamp_secs())
+    {
+      self.complete_totp_login().await?;
+      return Err(e);
+    }
     let attempts = self
       .0
       .get::<u32>(Self::TOTP_LOGIN_ATTEMPTS)
@@ -277,12 +356,12 @@ impl Session {
   ) -> mogh_error::Result<LoginKind> {
     self
       .0
-      .remove::<String>(Self::TOTP_LOGIN)
+      .remove_value(Self::TOTP_LOGIN)
       .await
       .context("Internal session type error")?;
     self
       .0
-      .remove::<u32>(Self::TOTP_LOGIN_ATTEMPTS)
+      .remove_value(Self::TOTP_LOGIN_ATTEMPTS)
       .await
       .context("Internal session type error")?;
     Ok(self.take_login_kind().await)
@@ -395,6 +474,12 @@ impl Session {
 
   /// Stores the user id which began external login linking, and
   /// when, replacing any other link begun on the session.
+  ///
+  /// Cycles the session id first, like the first factor of a login:
+  /// the link is only reachable with the cookie issued in the
+  /// response, not with a session id planted in the browser
+  /// beforehand (whoever holds the session starts the link, and the
+  /// login they complete at the provider is linked to the user).
   pub async fn insert_external_link_user_id(
     &self,
     user_id: &str,
@@ -411,6 +496,7 @@ impl Session {
     user_id: &str,
     begun_at: u64,
   ) -> mogh_error::Result<()> {
+    self.cycle_id().await?;
     self
       .0
       .insert(Self::EXTERNAL_LINK, (user_id, begun_at))
@@ -422,14 +508,13 @@ impl Session {
   /// Takes the link begun on the session, it can only be started
   /// once. Check [ExternalLink::check_age] before using it: the link
   /// is taken either way, so an expired one has to be begun again.
+  /// Without one, the session is left unmodified (see [Self::take]).
   pub async fn retrieve_external_link(
     &self,
   ) -> mogh_error::Result<ExternalLink> {
     let (user_id, begun_at) = self
-      .0
-      .remove::<(String, u64)>(Self::EXTERNAL_LINK)
-      .await
-      .context("Internal session type error")?
+      .take::<(String, u64)>(Self::EXTERNAL_LINK)
+      .await?
       .context(
         "External link has not been initiated for this session",
       )
@@ -461,15 +546,36 @@ fn check_external_link_age(
   begun_at: u64,
   now: u64,
 ) -> mogh_error::Result<()> {
-  if now.saturating_sub(begun_at)
-    <= Session::MAX_EXTERNAL_LINK_AGE.as_secs()
-  {
+  if is_within(begun_at, now, Session::MAX_EXTERNAL_LINK_AGE) {
     return Ok(());
   }
   Err(
     anyhow::anyhow!("External link has expired, begin linking again")
       .status_code(StatusCode::UNAUTHORIZED),
   )
+}
+
+/// Refuses the second factor of a login whose first factor passed
+/// `begun_at`, more than [Session::MAX_SECOND_FACTOR_LOGIN_AGE] before
+/// `now` (unix seconds). One begun in the future (the clock of the
+/// instance which began it runs ahead) is as good as new.
+fn check_second_factor_login_age(
+  begun_at: u64,
+  now: u64,
+) -> mogh_error::Result<()> {
+  if is_within(begun_at, now, Session::MAX_SECOND_FACTOR_LOGIN_AGE) {
+    return Ok(());
+  }
+  Err(
+    anyhow::anyhow!("Login has expired. Log in again.")
+      .status_code(StatusCode::UNAUTHORIZED),
+  )
+}
+
+/// Whether `begun_at` is at most `max_age` before `now`
+/// (unix seconds), or after it.
+fn is_within(begun_at: u64, now: u64, max_age: Duration) -> bool {
+  now.saturating_sub(begun_at) <= max_age.as_secs()
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -590,6 +696,172 @@ mod tests {
     session.0.save().await.unwrap();
     assert_ne!(session.id().unwrap(), planted);
     assert!(store.load(&planted).await.unwrap().is_none());
+  }
+
+  /// Beginning a link (BeginExternalLoginLink) gives the session a
+  /// new id as well: whoever holds a session id planted in the
+  /// browser beforehand can't start the link, and link the login
+  /// they complete at the provider to the user.
+  #[tokio::test]
+  async fn test_begin_link_cycles_the_session_id() {
+    let store = Arc::new(MemoryStore::default());
+    let (session, planted) = saved_session(&store).await;
+    session
+      .insert_external_link_user_id("user-1")
+      .await
+      .unwrap();
+    session.0.save().await.unwrap();
+    let cycled = session.id().unwrap();
+    assert_ne!(cycled, planted);
+    // Nothing is left under the planted id...
+    assert!(store.load(&planted).await.unwrap().is_none());
+    let planted = Session(tower_sessions::Session::new(
+      Some(planted),
+      store.clone(),
+      None,
+    ));
+    let err = planted.retrieve_external_link().await.err().unwrap();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    // ...the link continues under the new one, with the data the
+    // session had before.
+    let session = Session(tower_sessions::Session::new(
+      Some(cycled),
+      store.clone(),
+      None,
+    ));
+    assert_eq!(
+      session.retrieve_external_link().await.unwrap().user_id,
+      "user-1"
+    );
+    assert_eq!(
+      session.0.get::<u32>("marker").await.unwrap(),
+      Some(1)
+    );
+  }
+
+  /// The steps anybody holding the cookie can request, with nothing
+  /// in flight on the session, leave it unmodified: the session
+  /// layer would save it and extend its expiry otherwise, keeping a
+  /// pending second factor on it alive.
+  #[tokio::test]
+  async fn test_nothing_in_flight_leaves_the_session_unmodified() {
+    let store = Arc::new(MemoryStore::default());
+    let (session, _) = saved_session(&store).await;
+    session.insert_totp_login_user_id("user-1").await.unwrap();
+    session.0.save().await.unwrap();
+    let id = session.id().unwrap();
+    // As the next request loads it.
+    let session =
+      Session(tower_sessions::Session::new(Some(id), store, None));
+    assert!(session.retrieve_external_login().await.is_err());
+    assert!(session.retrieve_external_link().await.is_err());
+    assert!(session.retrieve_authenticated_user_id().await.is_err());
+    assert!(session.retrieve_passkey_login().await.is_err());
+    assert!(!session.0.is_modified());
+    // The pending second factor is still there.
+    assert_eq!(
+      session.begin_totp_login_attempt().await.unwrap(),
+      "user-1"
+    );
+  }
+
+  /// A second factor is refused once its first factor passed longer
+  /// than [Session::MAX_SECOND_FACTOR_LOGIN_AGE] ago, and removed
+  /// with the kind of its first factor: the login starts over.
+  #[tokio::test]
+  async fn test_second_factor_login_expires() {
+    let max_age = Session::MAX_SECOND_FACTOR_LOGIN_AGE.as_secs();
+    let expired = unix_timestamp_secs() - max_age - 60;
+    let provider = LoginKind::Provider {
+      provider_id: "oidc".into(),
+      provider_name: "OIDC".into(),
+    };
+
+    let session = session();
+    session.insert_totp_login("user-1", expired).await.unwrap();
+    session.insert_login_kind(&provider).await.unwrap();
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("expired"));
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert!(
+      format!("{:#}", err.error).contains("not been initiated")
+    );
+    assert_eq!(session.take_login_kind().await, LoginKind::Local);
+    assert!(
+      session
+        .0
+        .get_value(Session::TOTP_LOGIN_ATTEMPTS)
+        .await
+        .unwrap()
+        .is_none()
+    );
+    // A recent one is fine.
+    let recent = unix_timestamp_secs() - max_age + 60;
+    session.insert_totp_login("user-1", recent).await.unwrap();
+    assert_eq!(
+      session.begin_totp_login_attempt().await.unwrap(),
+      "user-1"
+    );
+
+    let session = self::session();
+    let state = passkey_authentication();
+    session
+      .insert_passkey_login_begun_at("user-1", &state, expired)
+      .await
+      .unwrap();
+    session.insert_login_kind(&provider).await.unwrap();
+    let err = session.retrieve_passkey_login().await.err().unwrap();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("expired"));
+    let err = session.retrieve_passkey_login().await.err().unwrap();
+    assert!(
+      format!("{:#}", err.error).contains("not been initiated")
+    );
+    assert_eq!(session.take_login_kind().await, LoginKind::Local);
+    session
+      .insert_passkey_login_begun_at("user-1", &state, recent)
+      .await
+      .unwrap();
+    session.insert_login_kind(&provider).await.unwrap();
+    let (user_id, _, kind) =
+      session.retrieve_passkey_login().await.unwrap();
+    assert_eq!(user_id, "user-1");
+    assert_eq!(kind, provider);
+  }
+
+  #[test]
+  fn test_check_second_factor_login_age() {
+    let max_age = Session::MAX_SECOND_FACTOR_LOGIN_AGE.as_secs();
+    let now = 1_000_000;
+    for begun_at in [now, now - max_age, now + 30, u64::MAX] {
+      check_second_factor_login_age(begun_at, now).unwrap();
+    }
+    for begun_at in [now - max_age - 1, 0] {
+      let err =
+        check_second_factor_login_age(begun_at, now).unwrap_err();
+      assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+  }
+
+  /// A pending second factor stored by an earlier version (without
+  /// when it began) reads as not initiated, rather than a server
+  /// error: the user logs in again.
+  #[tokio::test]
+  async fn test_second_factor_login_of_earlier_format_is_not_initiated()
+   {
+    let session = session();
+    session.0.insert("totp-login", "user-1").await.unwrap();
+    let err = session.begin_totp_login_attempt().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    let state = passkey_authentication();
+    session
+      .0
+      .insert("passkey-login", ("user-1", &state))
+      .await
+      .unwrap();
+    let err = session.retrieve_passkey_login().await.err().unwrap();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
   }
 
   /// A passkey authentication state, for a made up passkey

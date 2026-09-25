@@ -13,7 +13,8 @@ use zeroize::Zeroizing;
 
 use crate::{
   AuthImpl,
-  api::{login::local::spawn_bcrypt, manage::ManageArgs},
+  api::manage::ManageArgs,
+  bcrypt_pool::spawn_bcrypt,
   rand::{random_bytes, random_string},
 };
 

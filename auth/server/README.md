@@ -376,7 +376,8 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
     Box::pin(async move {
       let api_key = find_api_key(&key).await?;
       // Also runs for unknown keys, so timing doesn't reveal them,
-      // and off the async runtime: bcrypt takes a while.
+      // off the async runtime and bounded to one per core (bcrypt
+      // takes a while, and anybody can send made up keys).
       verify_api_key_secret_async(
         &AppAuthImpl,
         secret,
@@ -451,9 +452,12 @@ fn general_rate_limiter(&self) -> &RateLimiter {
   (15 minutes), then `429 Too Many Requests` (`api::login::totp`). Only a client
   which passed the first factor can send codes, but whoever holds it can keep
   the user's second factor locked this way: the user or an admin then changes
-  the password, or unlinks the external login. The count is kept in process
-  memory, so each instance of a replicated app allows this many, and a restart
-  starts over.
+  the password, or unlinks the external login. A first factor's codes are only
+  accepted for 10 minutes after it passed, so the ones passed before the change
+  stop at most 10 minutes after it, and the user's codes are accepted again
+  once their failures leave the window (at most 25 minutes after the change).
+  The count is kept in process memory, so each instance of a replicated app
+  allows this many, and a restart starts over.
 - Requests without any credentials are never counted.
 - The client ip is taken from forwarding headers only when the request comes
   from a trusted proxy (`mogh_server`'s `trusted_proxies`, private ranges by
@@ -465,8 +469,17 @@ fn general_rate_limiter(&self) -> &RateLimiter {
   up and `UpdatePassword` refuse longer ones (`validations::MAX_PASSWORD_BYTES`),
   rather than letting two passwords differing after 72 bytes both work.
 - The session id is cycled when the first factor passes (the password, or an
-  external login), so a session id planted in the browser beforehand (eg. a
-  cookie set by a sibling subdomain) can't be used to complete the login.
+  external login), and when a link of an external login is begun
+  (`BeginExternalLoginLink`), so a session id planted in the browser beforehand
+  (eg. a cookie set by a sibling subdomain) can't be used to complete the login,
+  or to start the link. The client must keep the cookie of the response (a
+  browser `fetch` with `credentials: "include"` does).
+- The second factor (passkey, TOTP or recovery code) of a login has to be
+  completed within 10 minutes of its first factor, after that the login starts
+  over. Requests anybody holding the cookie can send, which find nothing in
+  flight on the session (a callback or `/link` without a flow started,
+  `ExchangeForJwt` without a login), leave the session unchanged, so they don't
+  extend its expiry.
 - A TOTP or passkey enrollment (`BeginTotpEnrollment` / `BeginPasskeyEnrollment`)
   can only be confirmed by the user who began it: the management api
   authenticates by the `Authorization` header, not the session cookie.
@@ -476,7 +489,9 @@ fn general_rate_limiter(&self) -> &RateLimiter {
 Implement `AuthUserImpl::is_enabled` to disable users. Disabled users can still
 log in (to see that they are disabled), and are refused the whole auth management
 api except `GetUserId`: no api keys, no changes to how they log in, and a disabled
-admin no longer manages login providers or trusted issuers. Refusing them the
+admin no longer manages login providers or trusted issuers. A link of an external
+login they began before being disabled is refused as well, when it is started
+(`/link`) and when the provider's callback would complete it. Refusing them the
 app's own api is `handle_request_authentication`'s `require_user_enabled`.
 
 ### App tokens
@@ -580,6 +595,12 @@ only shown after a flow the same tab started through `mogh_ui` (`externalLogin`,
 otherwise. After a failed login `LoginPage` doesn't redirect to the provider on
 its own again, which would only fail again, in a loop.
 
+The requests of a callback to the provider (the code exchange, user info) are
+given 30 seconds each, 10 of them to connect, and redirects are not followed. A
+provider which accepts the connection but never answers fails the login after
+that, instead of leaving the callback hanging. Loading its discovery data is
+given 15 seconds (see [Workload identity](#workload-identity)).
+
 The external login routes are plain `GET`s, which any web page a user visits
 can send from their browser. Only the failures of a callback which redeems a
 code (and the login rules after it) count against the client ip in
@@ -658,15 +679,20 @@ for (header, value) in signed_request_headers(
   receives them: percent encoded, without scheme and host (it is the same over
   HTTP/2). So the headers are made for each request, they can't be default
   headers of a client.
-- The server reads the body of a signed request before authenticating it,
-  limited like axum's body extractors (the router's `DefaultBodyLimit`, 2 MB by
-  default, else `413 Payload Too Large`). A signed request which can't verify,
-  found out before (without `server_private_key`, or with the
-  `X-API-TIMESTAMP` missing or outside the tolerance), is refused with `401`
-  without its body being read, and so is a client the general rate limiter has
-  locked out, with `429`. Anybody can send a current timestamp, so the body of
-  any other signed request is read (up to the limit), even when its signature
-  turns out to be invalid.
+- The server reads the body of a signed request before authenticating it, up
+  to `AuthImpl::signed_request_body_limit` (2 MB by default) and to the router's
+  `DefaultBodyLimit` like axum's body extractors (axum's 2 MB default when the
+  router sets none), whichever is smaller, else `413 Payload Too Large`. A
+  router which raises or disables its limit (eg. for uploads) doesn't raise how
+  much of a signed request is buffered before it is authenticated. To accept
+  signed bodies over 2 MB, raise both `signed_request_body_limit` and the
+  router's `DefaultBodyLimit` (a layer outside of the auth middleware). A signed
+  request which can't verify, found out before (without `server_private_key`,
+  or with the `X-API-TIMESTAMP` missing or outside the tolerance), is refused
+  with `401` without its body being read, and so is a client the general rate
+  limiter has locked out, with `429`. Anybody can send a current timestamp, so
+  the body of any other signed request is read (up to the limit), even when its
+  signature turns out to be invalid.
 - Apps without `AuthImpl::server_private_key` (the default) answer signed
   requests with `401 Signing keys are not enabled`.
 - The signature is accepted for one second around the server time by default,
@@ -846,7 +872,8 @@ are loaded the same way, as they are loaded on demand by unauthenticated request
   get `503` right away (`temporarily_unavailable` from `/token`), and the
   reason is logged once per attempt, not by every request.
 - While the source can't be reached, what was loaded before stays in use for
-  up to an hour, so a short outage doesn't stop every login or workload.
+  up to an hour after it went out of date, so a short outage doesn't stop every
+  login or workload.
 
 Issuers can also be stored by the app and managed by admins over the API
 (`ListTrustedIssuers`, `CreateTrustedIssuer`, ...), with the same storage

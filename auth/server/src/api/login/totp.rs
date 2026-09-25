@@ -17,9 +17,8 @@ use tracing::{info, instrument, warn};
 use zeroize::Zeroizing;
 
 use crate::{
-  Login, SecondFactor,
-  api::login::{LoginArgs, local::spawn_bcrypt},
-  middleware::check_user_cidr_whitelist,
+  Login, SecondFactor, api::login::LoginArgs,
+  bcrypt_pool::spawn_bcrypt, middleware::check_user_cidr_whitelist,
 };
 
 /// Tracks the latest accepted TOTP step per user, to reject reuse
@@ -74,10 +73,18 @@ pub fn consume_totp_step_in_process(
 /// for as long as they like by failing this many codes each window
 /// (10 per 15 minutes, per process). The user or an admin then
 /// changes the password, or unlinks the external login, the first
-/// factor came from. A failure is any
-/// refused code (wrong, already used, or from an ip outside the
-/// user's whitelist); server errors are not counted. Accepted codes
-/// don't give the failures back, they leave the window.
+/// factor came from. The codes of a first factor are accepted for 10
+/// minutes after it passed (`Session::MAX_SECOND_FACTOR_LOGIN_AGE`),
+/// however its session is kept alive, so the ones passed before the
+/// change stop at most 10 minutes after it. The user's codes are
+/// accepted again once the last failures leave the window: at most
+/// 25 minutes after the change.
+///
+/// A failure is any refused code (wrong, already used, or from an ip
+/// outside the user's whitelist); server errors are not counted, nor
+/// is a second factor which can't be tried anymore (the login
+/// expired, or ran out of attempts). Accepted codes don't give the
+/// failures back, they leave the window.
 ///
 /// Kept in process memory (like [consume_totp_step_in_process]), so
 /// every instance of a replicated app allows this many, and a
@@ -818,6 +825,82 @@ mod tests {
     second.unwrap();
     // Neither removal undid the other.
     assert!(auth.recovery_codes.lock().unwrap().is_empty());
+  }
+
+  /// The codes of a first factor which passed longer than
+  /// `Session::MAX_SECOND_FACTOR_LOGIN_AGE` ago are refused, the
+  /// right ones too (the password may have changed since), and the
+  /// login is removed. Nothing is checked, so no failure of the user
+  /// is counted.
+  #[tokio::test]
+  async fn test_expired_login_is_refused() {
+    let auth = TestAuth::with_user("expired-login-user");
+    *auth.recovery_codes.lock().unwrap() =
+      vec![bcrypt::hash("code-one", 4).unwrap()];
+    let expired = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs()
+      - Session::MAX_SECOND_FACTOR_LOGIN_AGE.as_secs()
+      - 60;
+    let expired_login = || async {
+      let session = session();
+      session
+        .insert_totp_login("expired-login-user", expired)
+        .await
+        .unwrap();
+      login_args(&auth, session)
+    };
+    let valid = auth
+      .make_totp(SECRET.to_vec(), None)
+      .unwrap()
+      .generate_current()
+      .to_string();
+
+    let args = expired_login().await;
+    let err = CompleteTotpLogin {
+      code: valid.clone(),
+    }
+    .resolve(&args)
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("expired"));
+    // Removed, the login starts over.
+    let err = CompleteTotpRecoveryLogin {
+      code: "code-one".into(),
+    }
+    .resolve(&args)
+    .await
+    .unwrap_err();
+    assert!(
+      format!("{:#}", err.error).contains("not been initiated")
+    );
+
+    let args = expired_login().await;
+    let err = CompleteTotpRecoveryLogin {
+      code: "code-one".into(),
+    }
+    .resolve(&args)
+    .await
+    .unwrap_err();
+    assert!(format!("{:#}", err.error).contains("expired"));
+
+    // No code was checked, nor failure counted.
+    assert_eq!(auth.get_user_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(auth.recovery_codes.lock().unwrap().len(), 1);
+    assert!(
+      !second_factor_attempts()
+        .users
+        .contains_key("expired-login-user")
+    );
+    // A new first factor logs in.
+    let args =
+      login_args(&auth, pending_login("expired-login-user").await);
+    CompleteTotpLogin { code: valid }
+      .resolve(&args)
+      .await
+      .unwrap();
   }
 
   #[test]

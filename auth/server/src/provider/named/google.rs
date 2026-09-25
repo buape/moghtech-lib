@@ -11,7 +11,8 @@ use openidconnect::{
 
 use crate::{
   provider::{
-    named::STATE_LENGTH, token_exchange::TokenVerificationKeys,
+    REQUEST_TIMEOUT, named::STATE_LENGTH, oidc::http_client,
+    token_exchange::TokenVerificationKeys,
   },
   rand::random_string,
 };
@@ -62,19 +63,7 @@ impl GoogleProvider {
       ));
     }
 
-    let scopes = urlencoding::encode(
-      &[
-        "https://www.googleapis.com/auth/userinfo.profile",
-        "https://www.googleapis.com/auth/userinfo.email",
-      ]
-      .join(" "),
-    )
-    .to_string();
-
-    let http_client = oidc_reqwest::ClientBuilder::new()
-      .redirect(oidc_reqwest::redirect::Policy::none())
-      .user_agent(app_user_agent)
-      .build()
+    let http_client = http_client(app_user_agent, REQUEST_TIMEOUT)
       .context("Failed to build Google HTTP client")?;
 
     let issuer_url =
@@ -86,14 +75,40 @@ impl GoogleProvider {
         .await
         .context("Failed to discover Google OpenID configuration")?;
 
+    Self::from_metadata(
+      http_client,
+      redirect_uri,
+      client_id,
+      client_secret,
+      provider_metadata,
+    )
+  }
+
+  /// Initialize the provider from already discovered metadata.
+  fn from_metadata(
+    http_client: oidc_reqwest::Client,
+    redirect_uri: String,
+    client_id: &str,
+    client_secret: &str,
+    provider_metadata: CoreProviderMetadata,
+  ) -> anyhow::Result<GoogleProvider> {
+    let scopes = urlencoding::encode(
+      &[
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/userinfo.email",
+      ]
+      .join(" "),
+    )
+    .to_string();
+
     let verification_keys =
       TokenVerificationKeys::from_metadata(&provider_metadata);
 
     let oidc_client =
       openidconnect::core::CoreClient::from_provider_metadata(
         provider_metadata,
-        ClientId::new(client_id.clone()),
-        Some(ClientSecret::new(client_secret.clone())),
+        ClientId::new(client_id.to_string()),
+        Some(ClientSecret::new(client_secret.to_string())),
       )
       .set_redirect_uri(
         RedirectUrl::new(redirect_uri.clone())
@@ -103,7 +118,7 @@ impl GoogleProvider {
     Ok(GoogleProvider {
       http_client,
       oidc_client,
-      client_id: client_id.clone(),
+      client_id: client_id.to_string(),
       redirect_uri,
       scopes,
       verification_keys,
@@ -193,5 +208,45 @@ impl GoogleUser {
         .map(|p| p.as_str().to_string())
         .unwrap_or_default(),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  use openidconnect::TokenUrl;
+
+  use super::*;
+  use crate::provider::{
+    stalled_server, token_exchange::test_tokens::metadata,
+  };
+
+  /// A Google which accepts the connection but never answers
+  /// fails the login, instead of leaving the callback hanging.
+  #[tokio::test]
+  async fn test_stalled_token_endpoint_fails_the_login() {
+    let stalled = stalled_server().await;
+    let provider = GoogleProvider::from_metadata(
+      http_client("test", Duration::from_millis(200)).unwrap(),
+      "https://app.example.com/auth/google/callback".to_string(),
+      "client-id",
+      "client-secret",
+      metadata().set_token_endpoint(Some(
+        TokenUrl::new(format!("{stalled}/token")).unwrap(),
+      )),
+    )
+    .unwrap();
+    let login = provider
+      .get_google_user("code".to_string(), "nonce".to_string());
+    let Err(err) =
+      tokio::time::timeout(Duration::from_secs(10), login)
+        .await
+        .expect("the login must fail, not hang")
+    else {
+      panic!("a login without an answer must fail");
+    };
+    let message = format!("{err:#}");
+    assert!(message.contains("timed out"), "{message}");
   }
 }

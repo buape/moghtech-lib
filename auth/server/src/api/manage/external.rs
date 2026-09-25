@@ -34,6 +34,8 @@ impl Resolve<ManageArgs> for BeginExternalLoginLink {
   ) -> Result<Self::Response, Self::Error> {
     auth.check_username_locked(user.username())?;
 
+    // Cycles the session id: the response carries the cookie
+    // the client has to start the link (`/link`) with.
     session.insert_external_link_user_id(user.id()).await?;
 
     Ok(BeginExternalLoginLinkResponse {})

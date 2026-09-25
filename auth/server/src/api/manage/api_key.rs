@@ -9,7 +9,10 @@ use mogh_resolver::Resolve;
 use reqwest::StatusCode;
 use tracing::{info, instrument};
 
-use crate::{AuthImpl, api::manage::ManageArgs, rand::random_string};
+use crate::{
+  AuthImpl, api::manage::ManageArgs,
+  bcrypt_pool::spawn_api_key_bcrypt, rand::random_string,
+};
 
 //
 
@@ -49,11 +52,12 @@ pub async fn create_api_key<I: AuthImpl + ?Sized>(
   body.cidr_whitelist =
     normalize_cidr_whitelist(auth, body.cidr_whitelist)?;
 
-  // bcrypt takes a while, keep it off the async runtime.
+  // bcrypt takes a while: off the async runtime, on the bounded
+  // budget of api key secrets.
   let secret_length = auth.api_key_secret_length();
   let bcrypt_cost = auth.api_secret_bcrypt_cost();
   let (key, secret, hashed_secret) =
-    tokio::task::spawn_blocking(move || {
+    spawn_api_key_bcrypt(move || {
       generate_api_key_parts(secret_length, bcrypt_cost)
     })
     .await
@@ -388,6 +392,18 @@ mod tests {
     fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
       unimplemented!()
     }
+    fn api_secret_bcrypt_cost(&self) -> u32 {
+      TEST_BCRYPT_COST
+    }
+    fn create_api_key(
+      &self,
+      _: String,
+      _: CreateApiKey,
+      _: String,
+      _: String,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      Box::pin(async { Ok(()) })
+    }
     fn create_signing_key(
       &self,
       _: String,
@@ -461,6 +477,31 @@ mod tests {
         .await
         .unwrap();
     assert!(res.private_key.is_some());
+  }
+
+  /// The secret of a new api key is hashed on the bounded budget
+  /// of api keys: with every permit taken, it waits.
+  #[tokio::test]
+  async fn test_create_api_key_is_bounded() {
+    let held = crate::bcrypt_pool::hold_api_key_permits().await;
+    let create = tokio::spawn(async {
+      let auth = KnownKeyAuth {
+        known: String::new(),
+      };
+      let body = CreateApiKey {
+        name: "key".into(),
+        expires: 0,
+        cidr_whitelist: Vec::new(),
+      };
+      create_api_key(&auth, "user".into(), body).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!create.is_finished(), "hashed without a permit");
+    drop(held);
+    let res = create.await.unwrap().unwrap();
+    assert!(
+      res.key.starts_with("K_") && res.secret.starts_with("S_")
+    );
   }
 
   #[test]

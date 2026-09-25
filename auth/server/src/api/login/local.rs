@@ -1,9 +1,4 @@
-use std::{
-  net::IpAddr,
-  num::NonZero,
-  sync::{Arc, LazyLock},
-  thread::available_parallelism,
-};
+use std::net::IpAddr;
 
 use anyhow::{Context, anyhow};
 use axum::http::StatusCode;
@@ -13,73 +8,15 @@ use mogh_auth_client::api::login::{
 use mogh_error::{AddStatusCode, AddStatusCodeError};
 use mogh_rate_limit::WithFailureRateLimit;
 use mogh_resolver::Resolve;
-use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
-use zeroize::Zeroizing;
 
 use crate::{
-  AuthImpl, Login, LoginKind, api::login::LoginArgs,
-  middleware::check_user_cidr_whitelist, session::Session,
+  AuthImpl, Login, LoginKind,
+  api::login::LoginArgs,
+  bcrypt_pool::{bcrypt_hash, bcrypt_verify},
+  middleware::check_user_cidr_whitelist,
+  session::Session,
 };
-
-/// Bounds the bcrypt work running at the same time to the
-/// available cores, see [spawn_bcrypt].
-static BCRYPT_PERMITS: LazyLock<Arc<Semaphore>> =
-  LazyLock::new(|| {
-    Arc::new(Semaphore::new(
-      available_parallelism().map(NonZero::get).unwrap_or(1),
-    ))
-  });
-
-/// Runs the bcrypt work `f` on tokio's blocking pool.
-///
-/// A bcrypt hash or verify takes tens to hundreds of milliseconds
-/// of CPU (by its cost). Run on an async worker, a handful at once
-/// (unauthenticated logins, say) would stall every other request of
-/// the server. At most one per available core runs at a time,
-/// the others wait their turn without holding a thread.
-pub(crate) async fn spawn_bcrypt<T: Send + 'static>(
-  f: impl FnOnce() -> T + Send + 'static,
-) -> anyhow::Result<T> {
-  let permit = BCRYPT_PERMITS
-    .clone()
-    .acquire_owned()
-    .await
-    .context("bcrypt permits closed")?;
-  tokio::task::spawn_blocking(move || {
-    // Held until the work is done, also when the caller
-    // stops waiting for it (the client disconnects).
-    let _permit = permit;
-    f()
-  })
-  .await
-  .context("bcrypt task failed")
-}
-
-/// The bcrypt hash of `secret`, off the async runtime
-/// (see [spawn_bcrypt]).
-pub(crate) async fn bcrypt_hash(
-  secret: &[u8],
-  cost: u32,
-) -> anyhow::Result<String> {
-  let secret = Zeroizing::new(secret.to_vec());
-  spawn_bcrypt(move || bcrypt::hash(&*secret, cost))
-    .await?
-    .context("Failed to hash secret")
-}
-
-/// Whether `secret` matches the bcrypt `hash`, off the async
-/// runtime (see [spawn_bcrypt]). Errors if the hash is malformed.
-pub(crate) async fn bcrypt_verify(
-  secret: &[u8],
-  hash: &str,
-) -> anyhow::Result<bool> {
-  let secret = Zeroizing::new(secret.to_vec());
-  let hash = hash.to_string();
-  spawn_bcrypt(move || bcrypt::verify(&*secret, &hash))
-    .await?
-    .context("Failed to verify secret")
-}
 
 pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
   auth: &I,

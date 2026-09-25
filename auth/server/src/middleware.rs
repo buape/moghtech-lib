@@ -11,6 +11,7 @@ use axum::{
   middleware::Next,
   response::Response,
 };
+use http_body_util::Limited;
 use mogh_auth_client::signature::{
   API_SIGNATURE_HEADER, API_TIMESTAMP_HEADER,
 };
@@ -24,6 +25,7 @@ use tracing::{debug, error};
 use crate::{
   AuthImpl, RequestAuthentication,
   api_key::AuthApiKeyImpl,
+  bcrypt_pool::spawn_api_key_bcrypt,
   user::{AuthUserImpl, BoxAuthUser},
 };
 
@@ -113,10 +115,14 @@ pub async fn authenticate_request<
 /// The body of a CONNECT request (eg. a websocket over HTTP/2) is the
 /// tunnel, it isn't read either: it is signed as empty.
 ///
-/// The body is limited like axum's body extractors: the
+/// The body is limited to [AuthImpl::signed_request_body_limit]
+/// (2 MB by default), and like axum's body extractors to the
 /// `axum::extract::DefaultBodyLimit` of the router when it is applied
-/// outside of the middleware, else 2 MB. A larger body is
-/// PAYLOAD_TOO_LARGE.
+/// outside of the middleware, else 2 MB: whichever is smaller. A
+/// router which raises or disables its limit (eg. for uploads)
+/// doesn't raise how much of an unauthenticated signed request is
+/// buffered, and raising only the knob doesn't get past the router's
+/// limit (or the 2 MB default). A larger body is PAYLOAD_TOO_LARGE.
 pub async fn read_signed_request_body<I: AuthImpl>(
   auth: &I,
   ip: IpAddr,
@@ -145,6 +151,10 @@ pub async fn read_signed_request_body<I: AuthImpl>(
       &ip,
     )
     .await?;
+  // The router's limit (if any) still applies inside
+  // read_request_body, the smaller one refuses.
+  let limit = auth.signed_request_body_limit();
+  let req = req.map(|body| Body::new(Limited::new(body, limit)));
   let (req, body) = read_request_body(req).await?;
   Ok((req, SignedRequestBody { body, timestamp }))
 }
@@ -181,8 +191,10 @@ impl From<Bytes> for SignedRequestBody {
   }
 }
 
-/// Reads the body of the request (limited like
-/// [read_signed_request_body]) and puts it back.
+/// Reads the body of the request (limited like axum's body
+/// extractors, by the router's `axum::extract::DefaultBodyLimit`,
+/// else 2 MB) and puts it back. A body which is too large (also for
+/// a `Limited` wrapped around it) is PAYLOAD_TOO_LARGE.
 pub(crate) async fn read_request_body(
   req: Request,
 ) -> mogh_error::Result<(Request, Bytes)> {
@@ -557,9 +569,10 @@ pub fn get_jwt_user_id<I: AuthImpl + ?Sized>(
 ///
 /// ⚠️ This blocks for as long as bcrypt takes at the cost (tens of
 /// milliseconds by default), for every request carrying X-API-KEY,
-/// whether the key exists or not. Use [verify_api_key_secret_async]
-/// in async code, which runs it on the blocking thread pool, so
-/// requests with made up keys can't stall the async runtime.
+/// whether the key exists or not, and isn't bounded. Use
+/// [verify_api_key_secret_async] in async code, so requests with made
+/// up keys can't stall the async runtime nor take up the blocking
+/// thread pool.
 pub fn verify_api_key_secret<I: AuthImpl + ?Sized>(
   auth: &I,
   secret: &str,
@@ -574,13 +587,21 @@ pub fn verify_api_key_secret<I: AuthImpl + ?Sized>(
 
 /// [verify_api_key_secret] on tokio's blocking thread pool, for
 /// implementing [AuthImpl::get_api_key] in async code.
+///
+/// At most one api key secret is verified per available core at a
+/// time, the other requests wait their turn without holding a thread.
+/// Api keys have a budget of their own: a flood of requests with made
+/// up keys waits behind itself, not ahead of password logins or other
+/// blocking work (file io, the DNS lookups of outgoing requests).
+/// A request dropped while it waits (the client disconnects) doesn't
+/// run its bcrypt.
 pub async fn verify_api_key_secret_async<I: AuthImpl + ?Sized>(
   auth: &I,
   secret: String,
   hashed_secret: Option<String>,
 ) -> mogh_error::Result<()> {
   let cost = auth.api_secret_bcrypt_cost();
-  tokio::task::spawn_blocking(move || {
+  spawn_api_key_bcrypt(move || {
     verify_api_key_secret_with_cost(
       cost,
       &secret,
@@ -883,13 +904,34 @@ mod tests {
     }
   }
 
+  /// Api key secrets are verified on the bounded budget of api keys:
+  /// with every permit taken, a verification waits.
+  #[tokio::test]
+  async fn test_verify_api_key_secret_async_is_bounded() {
+    let held = crate::bcrypt_pool::hold_api_key_permits().await;
+    // A made up key, anybody can send them.
+    let verify = tokio::spawn(verify_api_key_secret_async(
+      &TestAuth,
+      "S_def_S".into(),
+      None,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!verify.is_finished(), "verified without a permit");
+    drop(held);
+    let err = verify.await.unwrap().unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+  }
+
   /// [TestAuth] with a server private key, so signatures are checked.
+  #[derive(Clone, Copy)]
   struct KeyedAuth {
     timestamp_tolerance_ms: u64,
+    signed_body_limit: usize,
   }
 
   const KEYED: KeyedAuth = KeyedAuth {
     timestamp_tolerance_ms: 1_000,
+    signed_body_limit: 2 * 1024 * 1024,
   };
 
   fn server_keys() -> &'static mogh_pki::RotatableKeyPair {
@@ -914,6 +956,9 @@ mod tests {
     }
     fn signing_key_timestamp_tolerance_ms(&self) -> u64 {
       self.timestamp_tolerance_ms
+    }
+    fn signed_request_body_limit(&self) -> usize {
+      self.signed_body_limit
     }
     fn general_rate_limiter(&self) -> &mogh_rate_limit::RateLimiter {
       static LIMITER: std::sync::LazyLock<
@@ -1226,6 +1271,7 @@ mod tests {
 
     let tolerant = KeyedAuth {
       timestamp_tolerance_ms: 30_000,
+      ..KEYED
     };
     let extracted = extract_request_public_key(
       &tolerant,
@@ -1575,6 +1621,138 @@ mod tests {
     assert!(body.body().is_empty());
   }
 
+  /// [read_signed_request_body] for `auth` behind the router's
+  /// `route_limit`, as a handler sees it. Answers OK when the body
+  /// was read, else with the status of the error.
+  async fn read_behind_route_limit(
+    auth: KeyedAuth,
+    route_limit: axum::extract::DefaultBodyLimit,
+    req: Request,
+  ) -> StatusCode {
+    use axum::handler::Handler as _;
+    let handler = (move |req: Request| async move {
+      match read_signed_request_body(&auth, READ_IP, req).await {
+        Ok(_) => StatusCode::OK,
+        Err(e) => e.status,
+      }
+    })
+    .layer(route_limit);
+    handler.call(req, ()).await.status()
+  }
+
+  #[tokio::test]
+  async fn test_read_signed_request_body_has_its_own_limit() {
+    let limited = KeyedAuth {
+      signed_body_limit: 64,
+      ..KEYED
+    };
+    let (_, body) = read_signed_request_body(
+      &limited,
+      READ_IP,
+      signed_request(Some(now_ms()), vec![b'a'; 64]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(body.body().len(), 64);
+    let err = read_signed_request_body(
+      &limited,
+      READ_IP,
+      signed_request(Some(now_ms()), vec![b'a'; 65]),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+  }
+
+  /// A router which raises or disables its body limit (eg. for
+  /// uploads) doesn't raise how much of an unauthenticated signed
+  /// request is read, and one which lowers it still applies.
+  #[tokio::test]
+  async fn test_read_signed_request_body_limit_is_the_smaller() {
+    use axum::extract::DefaultBodyLimit;
+    const MB: usize = 1024 * 1024;
+    let raised = KeyedAuth {
+      signed_body_limit: 4 * MB,
+      ..KEYED
+    };
+    let cases = [
+      // The default limit (2 MB), whatever the router's.
+      (KEYED, DefaultBodyLimit::disable(), 2 * MB, StatusCode::OK),
+      (
+        KEYED,
+        DefaultBodyLimit::disable(),
+        2 * MB + 1,
+        StatusCode::PAYLOAD_TOO_LARGE,
+      ),
+      (
+        KEYED,
+        DefaultBodyLimit::max(64 * MB),
+        2 * MB + 1,
+        StatusCode::PAYLOAD_TOO_LARGE,
+      ),
+      // Raised for signed requests too.
+      (raised, DefaultBodyLimit::disable(), 3 * MB, StatusCode::OK),
+      (
+        raised,
+        DefaultBodyLimit::disable(),
+        4 * MB + 1,
+        StatusCode::PAYLOAD_TOO_LARGE,
+      ),
+      // A router's lower limit applies.
+      (raised, DefaultBodyLimit::max(64), 64, StatusCode::OK),
+      (
+        raised,
+        DefaultBodyLimit::max(64),
+        65,
+        StatusCode::PAYLOAD_TOO_LARGE,
+      ),
+      (
+        KEYED,
+        DefaultBodyLimit::max(64),
+        65,
+        StatusCode::PAYLOAD_TOO_LARGE,
+      ),
+    ];
+    for (i, (auth, route_limit, len, expected)) in
+      cases.into_iter().enumerate()
+    {
+      let status = read_behind_route_limit(
+        auth,
+        route_limit,
+        signed_request(Some(now_ms()), vec![b'a'; len]),
+      )
+      .await;
+      assert_eq!(status, expected, "case {i}: {len} bytes");
+    }
+    // Unsigned requests are left to the handler.
+    let status = read_behind_route_limit(
+      KEYED,
+      DefaultBodyLimit::disable(),
+      unsigned_request(vec![b'a'; 3 * MB]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Without a DefaultBodyLimit, axum's 2 MB default still applies:
+    // raising only the knob doesn't get a signed body past it.
+    for (len, expected) in [
+      (2 * MB, StatusCode::OK),
+      (2 * MB + 1, StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+      let status = match read_signed_request_body(
+        &raised,
+        READ_IP,
+        signed_request(Some(now_ms()), vec![b'a'; len]),
+      )
+      .await
+      {
+        Ok(_) => StatusCode::OK,
+        Err(e) => e.status,
+      };
+      assert_eq!(status, expected, "no route limit: {len} bytes");
+    }
+  }
+
   /// [KeyedAuth] as [authenticate_request] makes it ([AuthImpl::new]),
   /// with a tolerance short enough for a test to wait it out. Shares
   /// the limiter of [KeyedAuth].
@@ -1586,6 +1764,7 @@ mod tests {
     fn new() -> Self {
       ServedAuth(KeyedAuth {
         timestamp_tolerance_ms: SERVED_TOLERANCE_MS,
+        ..KEYED
       })
     }
     fn signing_key_timestamp_tolerance_ms(&self) -> u64 {

@@ -9,7 +9,10 @@ use serde::{Deserialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
 use crate::{
-  provider::named::{STATE_LENGTH, handle_response, sanitize_text},
+  provider::{
+    CONNECT_TIMEOUT, REQUEST_TIMEOUT,
+    named::{STATE_LENGTH, handle_response, sanitize_text},
+  },
   rand::random_string,
 };
 
@@ -17,9 +20,6 @@ use crate::{
 const WEB_URL: &str = "https://github.com";
 /// Where the Github REST api lives.
 const API_URL: &str = "https://api.github.com";
-
-/// How long a request to Github may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct GithubProvider {
   http: reqwest::Client,
@@ -58,15 +58,9 @@ impl GithubProvider {
         "Github login is enabled, but 'client_secret' is not configured"
       ));
     }
-    // Redirects are not followed: the token request carries the
-    // client secret in its body, which a redirect would send on.
-    let http = reqwest::Client::builder()
-      .redirect(reqwest::redirect::Policy::none())
-      .timeout(REQUEST_TIMEOUT)
-      .build()
-      .context("Failed to build Github HTTP client")?;
     Ok(GithubProvider {
-      http,
+      http: http_client(REQUEST_TIMEOUT)
+        .context("Failed to build Github HTTP client")?,
       client_id: client_id.clone(),
       client_secret: Zeroizing::new(client_secret.clone()),
       redirect_uri,
@@ -81,6 +75,14 @@ impl GithubProvider {
       web_url: WEB_URL.to_string(),
       api_url: API_URL.to_string(),
     })
+  }
+
+  /// Gives up on requests after `timeout`
+  /// instead of [REQUEST_TIMEOUT].
+  #[cfg(test)]
+  fn with_request_timeout(mut self, timeout: Duration) -> Self {
+    self.http = http_client(timeout).unwrap();
+    self
   }
 
   /// Points the provider at a mock of Github.
@@ -186,6 +188,20 @@ impl GithubProvider {
       .context("Failed to reach Github")?;
     handle_response(res).await
   }
+}
+
+/// A client which gives up on requests after `timeout`.
+///
+/// Redirects are not followed: the token request carries the
+/// client secret in its body, which a redirect would send on.
+fn http_client(
+  timeout: Duration,
+) -> reqwest::Result<reqwest::Client> {
+  reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(timeout)
+    .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+    .build()
 }
 
 #[derive(Deserialize)]
@@ -543,6 +559,36 @@ mod tests {
     assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(format!("{:#}", err.error).contains("Failed to reach"));
     assert_no_secret(&err, &url);
+  }
+
+  /// A Github which accepts the connection but never
+  /// answers fails the login, instead of leaving it hanging.
+  #[tokio::test]
+  async fn test_stalled_github_fails_the_login() {
+    let stalled = crate::provider::stalled_server().await;
+    let provider = test_provider()
+      .with_base_urls(&stalled, &stalled)
+      .with_request_timeout(Duration::from_millis(200));
+    let (_, verifier) = challenge();
+    let login = provider.get_access_token("code", &verifier);
+    let err =
+      match tokio::time::timeout(Duration::from_secs(10), login)
+        .await
+        .expect("the login must fail, not hang")
+      {
+        Ok(_) => panic!("a login without an answer must fail"),
+        Err(e) => e,
+      };
+    let message = format!("{:#}", err.error);
+    assert!(message.contains("timed out"), "{message}");
+    assert_no_secret(&err, &stalled);
+    let user = provider.get_github_user("gho_token");
+    assert!(
+      tokio::time::timeout(Duration::from_secs(10), user)
+        .await
+        .expect("the user request must fail, not hang")
+        .is_err()
+    );
   }
 
   #[tokio::test]
