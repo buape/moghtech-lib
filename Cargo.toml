@@ -50,9 +50,7 @@ arc-swap = "1.9.2"
 tower-http = { version = "0.7.1", features = ["fs", "cors", "set-header"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 axum = { version = "0.8.9", features = ["macros"] }
-# Limits request bodies. Keep it semver compatible with axum's (0.1):
-# axum only answers the LengthLimitError of its own version with 413.
-http-body-util = "0.1.3"
+http-body-util = "0.1.5"
 tower-sessions = "0.15.0"
 urlencoding = "2.1.3"
 
