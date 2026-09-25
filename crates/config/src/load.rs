@@ -350,6 +350,18 @@ pub fn load_parse_config_file<T: DeserializeOwned>(
   parse_config_contents(file, &contents)
 }
 
+/// Whether [parse_config_contents] can parse the file by its name:
+/// an env file, or a toml / yaml / yml / json extension.
+pub(crate) fn has_config_type(file: &Path) -> bool {
+  is_env_file(file)
+    || file.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+      matches!(
+        e.to_ascii_lowercase().as_str(),
+        "toml" | "yaml" | "yml" | "json"
+      )
+    })
+}
+
 /// Parses config contents by the file's name: toml, yaml / yml,
 /// json, or an env file (`.env`, `*.env`, see
 /// [parse_env_file_object]): a flat set of `NAME=value` entries

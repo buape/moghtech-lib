@@ -18,17 +18,103 @@ pub fn value_type(value: &serde_json::Value) -> &'static str {
 /// Redacts values from a serde error message, since config values
 /// may be secrets and errors are logged: double quoted strings
 /// (`invalid type: string "hunter2"`) and backticked tokens
-/// (`invalid type: integer `4829``, `unknown variant `x``).
+/// (`invalid type: integer `4829``). An unknown enum variant or
+/// field is redacted whole, whatever it holds (serde doesn't escape
+/// it), keeping the names expected after it:
+/// `unknown variant [redacted], expected `fast` or `safe``.
 pub fn redact_serde_error(e: &serde_json::Error) -> String {
-  redact_message(&e.to_string())
+  redact_message(&e.to_string(), false)
 }
 
-/// [redact_serde_error] for the message of any parser.
-fn redact_message(message: &str) -> String {
-  static QUOTED: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#""(?:[^"\\]|\\.)*"|`[^`]*`"#).unwrap()
+/// [redact_serde_error] for the message of any parser. serde's own
+/// message comes first, or with `path_prefix` (yaml) may follow
+/// the path of the value it is about (`server.mode: ...`).
+fn redact_message(message: &str, path_prefix: bool) -> String {
+  // Where serde's message starts. serde writes each value right
+  // after its own wording, and the first one comes after the path,
+  // so the wording before the first quote / backtick tells where
+  // the path ends: the path (yaml keys) may hold anything.
+  static WORDING: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+      r"(?:\A|: )((?:invalid (?:type|value): (?:string|character|boolean|integer|floating point)|unknown (?:variant|field)|missing field|duplicate field) )\z",
+    )
+    .unwrap()
   });
-  QUOTED.replace_all(message, "[redacted]").into_owned()
+  let start = match message.find(['"', '`']) {
+    Some(quote) if path_prefix => {
+      match WORDING.captures(&message[..quote]) {
+        Some(wording) => wording.get(1).unwrap().start(),
+        // A quote or backtick in the path, which can't be told
+        // apart from a value's: keep only the text before it, and
+        // where the error is.
+        None => {
+          static LOCATION: LazyLock<regex::Regex> =
+            LazyLock::new(|| {
+              regex::Regex::new(
+                r" at (?:line \d+ column \d+|position \d+)\z",
+              )
+              .unwrap()
+            });
+          let location = LOCATION
+            .find(&message[quote..])
+            .map_or("", |location| location.as_str());
+          return format!(
+            "{}[redacted]{location}",
+            &message[..quote]
+          );
+        }
+      }
+    }
+    _ => 0,
+  };
+  // serde writes an unknown enum variant or field name in
+  // backticks without escaping it, so it may hold backticks or
+  // quotes itself: it runs up to serde's own `, expected` / `, there
+  // are no`, the last one, as it may hold these too. The names
+  // expected after it are the program's, and stay readable. Only at
+  // the start of serde's message: text like it anywhere else is
+  // inside a value, eg. `invalid type: string "unknown variant `a`,
+  // expected b", expected u16`, whose string is redacted whole
+  // below.
+  static UNKNOWN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+      r"(?s)\A(unknown (?:variant|field) )`.*`(, expected|, there are no)",
+    )
+    .unwrap()
+  });
+  let (path, rest) = message.split_at(start);
+  if let Some(unknown) = UNKNOWN.captures(rest) {
+    let end = unknown.get(0).unwrap().end();
+    return format!(
+      "{path}{}[redacted]{}{}",
+      &unknown[1],
+      &unknown[2],
+      &rest[end..]
+    );
+  }
+  redact_values(message)
+}
+
+/// Redacts the values serde writes into its messages: strings
+/// escaped in double quotes (`string "a \"b\""`), a character in
+/// backticks (which may be a backtick itself), and numbers and
+/// booleans in backticks.
+fn redact_values(message: &str) -> String {
+  static QUOTED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+      r#"(?s)"(?:[^"\\]|\\.)*"|character `.`|`[^`]*`"#,
+    )
+    .unwrap()
+  });
+  QUOTED
+    .replace_all(message, |caps: &regex::Captures| {
+      if caps[0].starts_with("character ") {
+        "character [redacted]"
+      } else {
+        "[redacted]"
+      }
+    })
+    .into_owned()
 }
 
 /// The message of a toml error, redacted like [redact_serde_error],
@@ -39,7 +125,7 @@ pub(crate) fn redact_toml_error(
   e: &toml::de::Error,
   contents: &str,
 ) -> String {
-  let message = redact_message(e.message().trim_end());
+  let message = redact_message(e.message().trim_end(), false);
   let Some((line, column)) =
     e.span().and_then(|span| line_column(contents, span.start))
   else {
@@ -51,7 +137,7 @@ pub(crate) fn redact_toml_error(
 /// The yaml error message (with its line and column), redacted like
 /// [redact_serde_error].
 pub(crate) fn redact_yaml_error(e: &serde_yaml_ng::Error) -> String {
-  redact_message(&e.to_string())
+  redact_message(&e.to_string(), true)
 }
 
 /// The 1 based line and column (in chars) of a byte offset.
@@ -265,6 +351,227 @@ mod tests {
         .unwrap_err();
     let message = redact_serde_error(&err);
     assert!(!message.contains("482913"), "{message}");
+    // A character is written in backticks unescaped.
+    let err = <serde_json::Error as serde::de::Error>::invalid_type(
+      serde::de::Unexpected::Char('`'),
+      &"a secret",
+    );
+    let message = redact_serde_error(&err);
+    assert_eq!(
+      message,
+      "invalid type: character [redacted], expected a secret"
+    );
+  }
+
+  /// serde writes an unknown enum variant (or field name) in
+  /// backticks without escaping it: a backtick in the value used to
+  /// end the redacted token early, leaking the rest.
+  #[test]
+  fn redacts_unknown_variants_holding_backticks_and_quotes() {
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(rename_all = "lowercase")]
+    #[allow(dead_code)]
+    enum Mode {
+      Fast,
+      Safe,
+    }
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Config {
+      mode: Mode,
+    }
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Strict {
+      port: u16,
+    }
+    for value in [
+      "x`hunter2secret",
+      "a`b`c`hunter2`d",
+      "`hunter2`",
+      "x\"hunter2\"",
+      "x`, expected `hunter2",
+      "x`, there are no hunter2",
+      "multi\nline`hunter2",
+    ] {
+      let err = deserialize_final::<Config>(
+        &serde_json::json!({ "mode": value }),
+      )
+      .unwrap_err();
+      for message in [err.to_string(), format!("{err:?}")] {
+        assert!(!message.contains("hunter2"), "{value:?}: {message}");
+      }
+      let message = err.to_string();
+      assert!(
+        message.ends_with(
+          "unknown variant [redacted], expected `fast` or `safe`"
+        ),
+        "{value:?}: {message}"
+      );
+      // Parse errors too.
+      for (file, contents) in [
+        ("a.yaml", format!("mode: {}", serde_json::json!(value))),
+        ("a.toml", format!("mode = {}", serde_json::json!(value))),
+        (
+          "a.json",
+          format!("{{\"mode\": {}}}", serde_json::json!(value)),
+        ),
+      ] {
+        let err = crate::load::parse_config_contents::<Config>(
+          std::path::Path::new(file),
+          &contents,
+        )
+        .unwrap_err();
+        for message in [err.to_string(), format!("{err:?}")] {
+          assert!(
+            !message.contains("hunter2"),
+            "{file} {value:?}: {message}"
+          );
+          assert!(
+            message.contains(
+              "unknown variant [redacted], expected `fast` or `safe`"
+            ),
+            "{file} {value:?}: {message}"
+          );
+        }
+      }
+
+      // A key is named by the path, but not by serde's message.
+      let err = deserialize_final::<Strict>(
+        &serde_json::json!({ "port": 1, value: 1 }),
+      )
+      .unwrap_err();
+      let Error::ParseFinalJson { message, .. } = err else {
+        panic!("{err:?}");
+      };
+      assert_eq!(
+        message, "unknown field [redacted], expected `port`",
+        "{value:?}"
+      );
+    }
+  }
+
+  /// Text like serde's unknown variant message inside a string
+  /// value is part of the value: the string is redacted whole, not
+  /// taken for serde's message, which would keep what follows it.
+  #[test]
+  fn redacts_strings_holding_unknown_variant_text() {
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Typed {
+      port: u16,
+    }
+    for value in [
+      "unknown variant `a`, expected hunter2",
+      "x unknown variant `a`, expected `hunter2` or",
+      "unknown field `a`, there are no hunter2",
+      "x: unknown variant `a`, expected hunter2",
+      "hunter2: unknown variant `a`, expected `b`",
+    ] {
+      let err = deserialize_final::<Typed>(
+        &serde_json::json!({ "port": value }),
+      )
+      .unwrap_err();
+      let Error::ParseFinalJson { message, .. } = &err else {
+        panic!("{err:?}");
+      };
+      assert_eq!(
+        message, "invalid value: string [redacted], expected u16",
+        "{value:?}"
+      );
+      for (file, contents) in [
+        (
+          "a.json",
+          format!("{{\"port\": {}}}", serde_json::json!(value)),
+        ),
+        ("a.toml", format!("port = {}", serde_json::json!(value))),
+        ("a.yaml", format!("port: {}", serde_json::json!(value))),
+        ("a.yaml", format!("{}", serde_json::json!(value))),
+      ] {
+        let err = crate::load::parse_config_contents::<Typed>(
+          std::path::Path::new(file),
+          &contents,
+        )
+        .unwrap_err();
+        for message in [err.to_string(), format!("{err:?}")] {
+          assert!(
+            !message.contains("hunter2"),
+            "{file} {value:?}: {message}"
+          );
+        }
+        if file == "a.json" || contents.starts_with("port") {
+          assert!(
+            err.to_string().contains("[redacted], expected u16"),
+            "{file} {value:?}: {err}"
+          );
+        }
+      }
+    }
+  }
+
+  /// yaml names the key of the failing value before serde's message:
+  /// a key holding a quote or a backtick can't be told from the
+  /// value, so only the text before it is kept.
+  #[test]
+  fn redacts_yaml_errors_under_keys_holding_quotes() {
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(rename_all = "lowercase")]
+    #[allow(dead_code)]
+    enum Mode {
+      Fast,
+      Safe,
+    }
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Typed {
+      modes: std::collections::HashMap<String, Mode>,
+      ports: std::collections::HashMap<String, u16>,
+    }
+    let parse = |contents: &str| {
+      crate::load::parse_config_contents::<Typed>(
+        std::path::Path::new("a.yaml"),
+        contents,
+      )
+      .unwrap_err()
+    };
+    for key in ["a`b", "a\"b", "a`b\"c", "a: b`c", "a: b\"c"] {
+      let key = serde_json::json!(key);
+      for value in ["x`hunter2", "hunter2", "x\"hunter2"] {
+        let value = serde_json::json!(value);
+        let err =
+          parse(&format!("ports: {{}}\nmodes: {{ {key}: {value} }}"));
+        let message = err.to_string();
+        assert!(
+          !message.contains("hunter2"),
+          "{key} {value}: {message}"
+        );
+        assert!(
+          message.contains("at line 2"),
+          "{key} {value}: {message}"
+        );
+      }
+      let err =
+        parse(&format!("modes: {{}}\nports: {{ {key}: hunter2 }}"));
+      let message = err.to_string();
+      assert!(!message.contains("hunter2"), "{key}: {message}");
+      assert!(message.contains("at line 2"), "{key}: {message}");
+    }
+    // A plain key stays readable, and so does serde's message.
+    let err = parse("ports: {}\nmodes: { a.b: x`hunter2 }");
+    assert!(
+      err.to_string().ends_with(
+        "modes.a.b: unknown variant [redacted], expected `fast` or `safe` at line 2 column 15"
+      ),
+      "{err}"
+    );
+    let err = parse("modes: {}\nports: { a.b: hunter2 }");
+    assert!(
+      err.to_string().ends_with(
+        "ports.a.b: invalid type: string [redacted], expected u16 at line 2 column 15"
+      ),
+      "{err}"
+    );
   }
 
   /// Parse errors are returned to the app, which logs them: a

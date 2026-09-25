@@ -178,9 +178,20 @@ impl ConfigLoader<'_, '_> {
     // the extension).
     let mut all_files = IndexMap::<PathBuf, PathBuf>::new();
     // If the same file comes up again later on, it should be
-    // removed and reinserted so it maintains higher priority.
+    // removed and reinserted so it maintains higher priority,
+    // keeping a name its type is known by: a scan finding the
+    // target of a listed `app.env` link as `secret` must not
+    // replace the name the file can be parsed by.
     let mut push = |key: PathBuf, path: PathBuf| {
-      all_files.shift_remove(&key);
+      let path = match all_files.shift_remove(&key) {
+        Some(prev)
+          if !load::has_config_type(&path)
+            && load::has_config_type(&prev) =>
+        {
+          prev
+        }
+        _ => path,
+      };
       all_files.insert(key, path);
     };
 

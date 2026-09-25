@@ -1093,6 +1093,30 @@ fn a_symlinked_file_found_again_by_a_scan_keeps_its_name() {
   }
 }
 
+/// A listed symlink keeps its name when a later scan finds the file
+/// under the target's own name (`secret`, no config type): without
+/// wildcards the scan skips `app.env` but finds `secret`, and with
+/// `*` it finds `secret` after `app.env`. Either used to replace the
+/// listed name, dropping the env file as an unsupported type.
+#[cfg(unix)]
+#[test]
+fn a_scan_finding_the_link_target_keeps_the_listed_name() {
+  let dir = TestDir::new("scan_finds_target");
+  let secret = dir.write("secret", "PORT=8080\n");
+  let env = dir.0.join("app.env");
+  std::os::unix::fs::symlink(&secret, &env).unwrap();
+  for wildcards in [&[][..], &["*"]] {
+    for paths in [[env.as_path(), &dir.0], [&dir.0, env.as_path()]] {
+      let config = load(&paths, wildcards, true, false);
+      assert_eq!(
+        config,
+        serde_json::json!({ "port": "8080" }),
+        "{wildcards:?} {paths:?}"
+      );
+    }
+  }
+}
+
 /// A symlinked file listed in an include file is loaded by its
 /// listed name: the include used to be replaced with the link
 /// target's canonical path (`secret`, no config extension),
