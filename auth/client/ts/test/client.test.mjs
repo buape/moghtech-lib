@@ -5,7 +5,12 @@ import { setLocalStorage } from "./helpers.mjs";
 // Like node without `--localstorage-file`, minus the warning.
 setLocalStorage({ value: undefined });
 
-const { MoghAuthClient, safeBackto } = await import("../dist/lib.js");
+const {
+  MoghAuthClient,
+  REAUTHENTICATION_REQUIRED,
+  isReauthenticationRequired,
+  safeBackto,
+} = await import("../dist/lib.js");
 
 const realFetch = globalThis.fetch;
 /** The requests sent by the client. */
@@ -96,6 +101,69 @@ describe("request errors", () => {
     assert.equal(e.result.trace[1], "<!doctype html>");
   });
 
+  it("reports a json error of another shape like a non json one", async () => {
+    // Eg. a gateway / WAF in front of the auth api.
+    for (const foreign of [
+      { error: { code: 403, message: "Forbidden" } },
+      { error: true, message: "Forbidden" },
+      { message: "Forbidden" },
+      ["Forbidden"],
+      "Forbidden",
+      403,
+      null,
+    ]) {
+      mockFetch(() =>
+        Response.json(foreign, { status: 403, statusText: "Forbidden" }),
+      );
+      const e = await rejection(client.manage("UpdatePassword", {}));
+      assert.deepEqual(
+        e,
+        {
+          status: 403,
+          result: {
+            error: "Request failed with status 403 Forbidden",
+            trace: [JSON.stringify(foreign)],
+          },
+        },
+        JSON.stringify(foreign),
+      );
+      assert.equal(isReauthenticationRequired(e), false);
+    }
+  });
+
+  it("keeps only the string lines of the trace", async () => {
+    for (const [trace, expected] of [
+      [undefined, []],
+      ["cause", []],
+      [{ 0: "cause" }, []],
+      [["cause", 1, null, { a: 1 }, "root"], ["cause", "root"]],
+    ]) {
+      mockFetch(() =>
+        Response.json(
+          { error: "Forbidden", trace, code: 7 },
+          { status: 403 },
+        ),
+      );
+      const e = await rejection(client.manage("UpdatePassword", {}));
+      assert.deepEqual(e, {
+        status: 403,
+        result: { error: "Forbidden", trace: expected, code: 7 },
+      });
+    }
+  });
+
+  it("tells a reauthentication error apart", async () => {
+    const error = `${REAUTHENTICATION_REQUIRED}: this needs a recent login`;
+    mockFetch(() => Response.json({ error, trace: [] }, { status: 403 }));
+    const e = await rejection(client.manage("UpdatePassword", {}));
+    assert.equal(isReauthenticationRequired(e), true);
+    // Only as a 403.
+    assert.equal(
+      isReauthenticationRequired({ status: 401, result: { error } }),
+      false,
+    );
+  });
+
   it("resolves the json body", async () => {
     mockFetch(() => Response.json({ user_id: "x" }));
     assert.deepEqual(await client.manage("GetUserId", {}), {
@@ -129,6 +197,77 @@ describe("tokenExchange errors", () => {
     assert.deepEqual(e, { status: 400, result });
   });
 
+  it("reports a json error of another shape as server_error", async () => {
+    for (const foreign of [
+      { error: { code: 429 }, error_description: "slow down" },
+      { message: "Too Many Requests" },
+      ["temporarily_unavailable"],
+      "temporarily_unavailable",
+    ]) {
+      mockFetch(() =>
+        Response.json(foreign, {
+          status: 429,
+          statusText: "Too Many Requests",
+        }),
+      );
+      const e = await rejection(client.tokenExchange("token"));
+      assert.deepEqual(
+        e,
+        {
+          status: 429,
+          result: {
+            error: "server_error",
+            error_description: `Request failed with status 429 Too Many Requests | ${JSON.stringify(foreign)}`,
+          },
+        },
+        JSON.stringify(foreign),
+      );
+    }
+  });
+
+  it("drops an error_description which isn't a string", async () => {
+    mockFetch(() =>
+      Response.json(
+        { error: "temporarily_unavailable", error_description: { a: 1 } },
+        { status: 503 },
+      ),
+    );
+    const e = await rejection(client.tokenExchange("token"));
+    assert.deepEqual(e, {
+      status: 503,
+      result: { error: "temporarily_unavailable" },
+    });
+  });
+
+  it("keeps only the string lines of a trace", async () => {
+    for (const [trace, expected] of [
+      ["s", []],
+      [null, []],
+      [{ a: 1 }, []],
+      [["cause", 1, null, { a: 1 }, "root"], ["cause", "root"]],
+    ]) {
+      mockFetch(() =>
+        Response.json(
+          { error: "temporarily_unavailable", trace, code: 7 },
+          { status: 503 },
+        ),
+      );
+      const e = await rejection(client.tokenExchange("token"));
+      assert.deepEqual(
+        e,
+        {
+          status: 503,
+          result: {
+            error: "temporarily_unavailable",
+            trace: expected,
+            code: 7,
+          },
+        },
+        JSON.stringify(trace),
+      );
+    }
+  });
+
   it("describes a network failure", async () => {
     globalThis.fetch = async () => {
       throw new TypeError("fetch failed");
@@ -139,6 +278,56 @@ describe("tokenExchange errors", () => {
       e.result.error_description,
       "Request failed with error | TypeError: fetch failed",
     );
+  });
+});
+
+describe("isReauthenticationRequired", () => {
+  const error = `${REAUTHENTICATION_REQUIRED}: this needs a recent login`;
+
+  it("is true for the reauthentication error", () => {
+    assert.equal(
+      isReauthenticationRequired({ status: 403, result: { error } }),
+      true,
+    );
+  });
+
+  it("is false for anything else, without throwing", () => {
+    const throwing = {
+      status: 403,
+      get result() {
+        throw new Error("getter");
+      },
+    };
+    for (const e of [
+      undefined,
+      null,
+      "",
+      error,
+      403,
+      [],
+      {},
+      { status: 403 },
+      { status: 403, result: null },
+      { status: 403, result: error },
+      { status: 403, result: { error: { code: 403 } } },
+      { status: 403, result: { error: 403 } },
+      { status: 403, result: { error: true } },
+      { status: 403, result: { error: [error] } },
+      { status: 403, result: { error: "Forbidden" } },
+      { status: "403", result: { error } },
+      { status: 401, result: { error } },
+      throwing,
+      new Proxy(
+        {},
+        {
+          get() {
+            throw new Error("proxy");
+          },
+        },
+      ),
+    ]) {
+      assert.equal(isReauthenticationRequired(e), false);
+    }
   });
 });
 

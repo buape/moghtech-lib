@@ -26,15 +26,26 @@ export type { LoginResponses, ManageResponses };
  */
 export const REAUTHENTICATION_REQUIRED = "Reauthentication required";
 
-/** Whether a rejected request (`{ status, result }`) needs the user to log in again. */
+/**
+ * Whether a rejected request (`{ status, result }`) needs the user to log
+ * in again. Takes anything that was caught: it never throws, and is
+ * `false` for any other value.
+ */
 export function isReauthenticationRequired(e: unknown): boolean {
-  const { status, result } = (e ?? {}) as {
-    status?: number;
-    result?: { error?: string };
-  };
-  return (
-    status === 403 && !!result?.error?.startsWith(REAUTHENTICATION_REQUIRED)
-  );
+  try {
+    if (!e || typeof e !== "object") return false;
+    const { status, result } = e as { status?: unknown; result?: unknown };
+    if (status !== 403 || !result || typeof result !== "object") {
+      return false;
+    }
+    const error = (result as { error?: unknown }).error;
+    return (
+      typeof error === "string" && error.startsWith(REAUTHENTICATION_REQUIRED)
+    );
+  } catch {
+    // Eg. a getter which throws.
+    return false;
+  }
 }
 
 /** RFC 8693 identifiers used by the token endpoint. */
@@ -85,7 +96,13 @@ export type RequestError = {
    * (network / CORS failure).
    */
   status: number;
-  /** The error body: `{ error, trace }` (`{ error, error_description }` for `tokenExchange`). */
+  /**
+   * The error body: `{ error, trace }` (`{ error, error_description }`
+   * for `tokenExchange`). `error` is always a string, as are `trace`'s
+   * entries and `error_description`: a json body of another shape (eg.
+   * the error of a proxy in front of the server) is reported like a body
+   * which isn't json.
+   */
   result: { error?: string; trace?: string[] } & Record<string, unknown>;
   /** The caught error, if any. */
   error?: unknown;
@@ -117,6 +134,33 @@ function describeError(error: unknown): string[] {
   }
   const filtered = messages.filter(Boolean);
   return filtered.length ? filtered : ["Unknown error"];
+}
+
+/**
+ * The parsed error body when it has the shape of the auth server's
+ * errors: an object whose `error` is a string. Other json (the error of
+ * a proxy / gateway, eg. `{ "error": { "code": 403 } }`) is not passed
+ * on as is, it would break the declared shape of `RequestError.result`.
+ */
+function errorBody(
+  body: Body,
+): (Record<string, unknown> & { error: string }) | undefined {
+  if (!body.read || !body.parsed) return undefined;
+  const { json } = body;
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    return undefined;
+  }
+  const { error } = json as { error?: unknown };
+  return typeof error === "string"
+    ? (json as Record<string, unknown> & { error: string })
+    : undefined;
+}
+
+/** The strings of `trace`, when it is a list. */
+function traceList(trace: unknown): string[] {
+  return Array.isArray(trace)
+    ? trace.filter((line): line is string => typeof line === "string")
+    : [];
 }
 
 /** The start of a response body which isn't the expected json. */
@@ -223,10 +267,15 @@ export function MoghAuthClient(url: string, jwt?: string) {
         error: body.parseError,
       } satisfies RequestError;
     }
-    if (body.parsed && body.json && typeof body.json === "object") {
-      throw { status: response.status, result: body.json };
+    const error = errorBody(body);
+    if (error) {
+      throw {
+        status: response.status,
+        result: { ...error, trace: traceList(error.trace) },
+      } satisfies RequestError;
     }
-    // Not an error of the auth server, eg. a proxy's 502 page.
+    // Not an error of the auth server, eg. a proxy's 502 page,
+    // or its json error of another shape.
     throw {
       status: response.status,
       result: {
@@ -303,7 +352,12 @@ export function MoghAuthClient(url: string, jwt?: string) {
    * and the user must already exist.
    *
    * Rejects with `{ status, result }`, where `result` is the
-   * OAuth error: `{ error, error_description }`.
+   * OAuth error: `{ error, error_description }`. A response which isn't
+   * an OAuth error (no string `error`, eg. a proxy's error page) is
+   * `server_error`, its status and body in `error_description`. Other
+   * fields of an OAuth error body are kept, except that an
+   * `error_description` which isn't a string is dropped and a `trace`
+   * is reduced to its string lines, as `RequestError.result` declares.
    *
    * @param subjectToken The token issued by the provider.
    * @param subjectTokenType `TOKEN_EXCHANGE.ID_TOKEN` (default) or `TOKEN_EXCHANGE.JWT`.
@@ -352,14 +406,27 @@ export function MoghAuthClient(url: string, jwt?: string) {
         error: body.error,
       };
     }
-    if (body.parsed) {
-      if (response.status === 200) {
-        return body.json as TokenExchangeResponse;
-      }
-      if (body.json && typeof body.json === "object") {
-        throw { status: response.status, result: body.json };
-      }
+    if (body.parsed && response.status === 200) {
+      return body.json as TokenExchangeResponse;
     }
+    const error = errorBody(body);
+    if (error) {
+      const { error_description, ...rest } = error;
+      throw {
+        status: response.status,
+        result: {
+          ...rest,
+          // Not sent by the auth server, but a body which has one
+          // keeps `RequestError.result`'s shape.
+          ...("trace" in rest ? { trace: traceList(rest.trace) } : {}),
+          ...(typeof error_description === "string"
+            ? { error_description }
+            : {}),
+        } satisfies TokenExchangeError,
+      };
+    }
+    // Not an OAuth error, eg. a proxy's 502 page,
+    // or its json error of another shape.
     const description =
       response.status === 200 && !body.parsed
         ? ["Invalid response body", ...describeError(body.parseError)]

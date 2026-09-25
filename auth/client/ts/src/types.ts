@@ -340,6 +340,11 @@ export type UpdateUsernameResponse = NoData;
  * from [GetLoginOptions][crate::api::login::GetLoginOptions]
  * (see [LoginOptionsProvider][crate::api::login::LoginOptionsProvider]).
  * The slug is not the provider id.
+ * 
+ * The response sets a new session cookie (the session id changes),
+ * and the redirect to `/link` must carry it: only the session which
+ * began the link can use it, for 10 minutes. Browsers do this when
+ * the request is sent with credentials.
  */
 export interface BeginExternalLoginLink {
 }
@@ -807,12 +812,17 @@ export interface SignUpLocalUser {
 /** A failed token exchange (RFC 6749 section 5.2). */
 export interface TokenExchangeError {
 	/**
-	 * The OAuth error code:
-	 * - `invalid_request`: The request is malformed or uses unsupported parameters.
-	 * - `unsupported_grant_type`: `grant_type` is not token exchange.
-	 * - `invalid_grant`: The subject token was rejected.
-	 * - `temporarily_unavailable`: Too many failed requests.
-	 * - `server_error`
+	 * The OAuth error code, and the http status it comes with:
+	 * - `invalid_request` (`400`): The request is malformed or uses unsupported parameters.
+	 * - `unsupported_grant_type` (`400`): `grant_type` is not token exchange.
+	 * - `invalid_grant` (`400`): The subject token was rejected.
+	 * - `temporarily_unavailable`: Retry later. Either `429`, too many
+	 * failed requests, or `503`, a login provider or trusted issuer of
+	 * the token's issuer can't be loaded right now (eg. its keys can't
+	 * be fetched). With several of them sharing the issuer, a token the
+	 * others rejected is `503` rather than `invalid_grant` while one is
+	 * unavailable, as that one might have accepted it.
+	 * - `server_error` (`500`)
 	 */
 	error: string;
 	/** Human readable details. */

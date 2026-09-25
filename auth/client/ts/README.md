@@ -21,17 +21,24 @@ Every request rejects with `{ status, result, error? }`
 
 - `status` is the http status, or `1` when the server wasn't reached
   (network / CORS failure).
-- `result` is the error body of the server: `{ error, trace }`. When the
-  body isn't json (eg. a proxy's `502` page) `error` names the status and
+- `result` is the error body of the server: `{ error, trace }`, where
+  `error` is always a string and `trace` a list of strings. When the body
+  isn't json (eg. a proxy's `502` page), or is json of another shape (eg.
+  a gateway's `{"error":{"code":403}}`), `error` names the status and
   `trace` holds the start of the body. A `200` with an invalid body
   rejects with `Invalid response body`.
 - `error` is the caught error, if any.
 
 `isReauthenticationRequired(e)` tells whether a manage request needs the
-user to log in again.
+user to log in again. It takes anything that was caught, never throws,
+and is `false` for any other value.
 
 `tokenExchange` rejects the same way, with the OAuth error
-`{ error, error_description }` as `result`.
+`{ error, error_description }` as `result`. A body which isn't an OAuth
+error is `server_error`, with the status and the start of the body as
+`error_description`. `temporarily_unavailable` means retry later: `429`
+after too many failed requests, `503` while a login provider or trusted
+issuer of the token's issuer can't be loaded.
 
 ## Login tokens
 
