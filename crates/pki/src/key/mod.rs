@@ -337,7 +337,11 @@ impl RotatableKeyPair {
   /// [retired][Self::retired] key of an earlier rotation is still
   /// waiting to be finished. A `<path>.old` holding the live key (a
   /// commit interrupted before its switch) is not a retired key, and
-  /// is removed.
+  /// is removed while the live file holds that key too (otherwise
+  /// kept, as it may be the only copy of the key in use, and
+  /// written again by the next commit). A `<path>.next` holding the
+  /// live key (a commit interrupted after its switch) is not a
+  /// candidate, and is replaced by a new one.
   pub fn begin_rotation(
     &self,
     pki_kind: PkiKind,
@@ -364,6 +368,16 @@ impl RotatableKeyPair {
     let next_path = sibling(path, NEXT_SUFFIX);
     let candidate = match next_path.try_exists()? {
       true => match EncodedKeyPair::from_file(pki_kind, &next_path) {
+        // Left by a commit which switched to it, but did not get to
+        // remove it: that rotation is done. Start a new one.
+        Ok(candidate)
+          if candidate.public == self.keys.load().public =>
+        {
+          tracing::info!(
+            "Replacing the rotation candidate at {next_path:?}: it holds the live key, left by a key rotation which switched to it"
+          );
+          Self::write_candidate(pki_kind, &next_path)?
+        }
         Ok(candidate) => {
           tracing::info!(
             "Resuming key rotation with the candidate at {next_path:?}"
@@ -408,7 +422,7 @@ impl RotatableKeyPair {
   ///
   /// Never the live pair: a `<path>.old` holding the live key was
   /// left by a commit that did not switch (interrupted, or its
-  /// rename failed), so there is nothing to revoke. `None` is
+  /// write failed), so there is nothing to revoke. `None` is
   /// returned, and the file is left for the next
   /// [begin_rotation][Self::begin_rotation] to remove (until then
   /// [Self::rotation_pending] stays true).
@@ -454,7 +468,13 @@ impl RotatableKeyPair {
     if retired.public != self.keys.load().public {
       return Ok(Some(retired));
     }
-    if settle {
+    // Only while the live file holds the key too: otherwise `.old`
+    // may be the only copy of the key in use.
+    if settle
+      && self.path.as_deref().is_some_and(|live| {
+        file_holds_key(pki_kind, live, &retired.public)
+      })
+    {
       tracing::info!(
         "Removing {old_path:?}: it holds the live key, left by a key rotation which did not switch"
       );
@@ -467,10 +487,15 @@ impl RotatableKeyPair {
   /// or a retired key (`<path>.old`) is waiting, see
   /// [Self::begin_rotation] and [Self::retired]. Also true for a
   /// `<path>.old` holding the live key (a commit that did not
-  /// switch), until [Self::begin_rotation] removes it.
+  /// switch), until [Self::begin_rotation] removes it. Not for a
+  /// `<path>.next` holding the live key (a commit interrupted after
+  /// its switch): there is nothing to resume.
   pub fn rotation_pending(&self) -> bool {
     self.path.as_deref().is_some_and(|path| {
-      sibling(path, NEXT_SUFFIX).exists()
+      let next = sibling(path, NEXT_SUFFIX);
+      (next.exists()
+        && !Pkcs8PrivateKey::from_file(&next)
+          .is_ok_and(|next| next == self.keys.load().private))
         || sibling(path, OLD_SUFFIX).exists()
     })
   }
@@ -574,19 +599,43 @@ impl KeyRotation<'_> {
 
   /// Makes the candidate the live pair. The previous private key
   /// is first written to `<path>.old` (to be revoked, see
-  /// [RotatableKeyPair::retired]), then the candidate is renamed
-  /// over the live path: one atomic rename, so the live file never
-  /// goes missing. From here every signature uses the new key, and
-  /// the switch is synced to disk before this returns.
-  /// The `.pub` sidecar is refreshed on a best effort basis.
+  /// [RotatableKeyPair::retired]), then the candidate is written
+  /// over the live key file the way [RotatableKeyPair::rotate]
+  /// writes it (see `mogh_secret_file::write`): an atomic replace
+  /// which keeps the file's owner, group and mode, so the live file
+  /// never goes missing. A key file which can't be replaced, like a
+  /// docker / kubernetes single file mount, is written in place
+  /// instead, which is **not atomic**: interrupted midway, the live
+  /// file can be left partially written (the previous key is still
+  /// at `<path>.old`, the candidate at `<path>.next`). From here
+  /// every signature uses the new key, and the switch is synced to
+  /// disk before this returns. `<path>.next`, a copy of the live key
+  /// from then on, is removed, and the `.pub` sidecar refreshed, on
+  /// a best effort basis.
   ///
   /// Refuses (changing nothing) when `<path>.next` no longer holds
-  /// the candidate, or a retired key is already waiting. When the
-  /// rename fails, `<path>.old` is removed again, as nothing
-  /// switched.
+  /// the candidate, or a retired key is already waiting (a
+  /// `<path>.old` holding the key in use, left by a commit which did
+  /// not switch, is none: it is written again). A write can report
+  /// an error and have happened anyway, so on a failed write the
+  /// live file is read back: holding the candidate, the commit goes
+  /// ahead (with a warning). Otherwise nothing switched, and
+  /// `<path>.old` is removed again while the live file holds the
+  /// previous key (kept when the live file can't be read, as it may
+  /// be the only copy).
   pub fn commit(self) -> anyhow::Result<()> {
-    // The file renamed into place must hold the key memory
-    // switches to, or a restart would load another key.
+    self.commit_with(|private, live| private.write_pem_sync(live))
+  }
+
+  /// [Self::commit], writing the candidate's private key over the
+  /// live key file with `write`.
+  fn commit_with(
+    self,
+    write: impl FnOnce(&Pkcs8PrivateKey, &Path) -> anyhow::Result<()>,
+  ) -> anyhow::Result<()> {
+    // The candidate file must still hold the key memory switches
+    // to: the one the caller registered, which a restart before
+    // the switch resumes.
     let on_disk =
       EncodedKeyPair::from_file(self.pki_kind, &self.next_path)
         .with_context(|| {
@@ -601,37 +650,70 @@ impl KeyRotation<'_> {
         self.next_path
       ));
     }
-    if self.old_path.try_exists()? {
+    let previous = self.pair.load().clone();
+    // A `.old` holding the key in use is no retired key: a commit
+    // which did not switch left it, kept while the live file can't
+    // be read (a write which failed midway). Written again below.
+    if self.old_path.try_exists()?
+      && !file_holds_key(
+        self.pki_kind,
+        &self.old_path,
+        &previous.public,
+      )
+    {
       return Err(anyhow!(
         "A retired key is already waiting at {:?}",
         self.old_path
       ));
     }
-    let previous = self.pair.load().clone();
     previous
       .private
       .write_pem_sync(&self.old_path)
       .context("Failed to keep the previous key for revocation")?;
-    if let Err(e) = std::fs::rename(&self.next_path, &self.live_path)
-    {
-      // Nothing switched: `.old` must not offer the live key for
-      // revocation.
-      if let Err(e) = std::fs::remove_file(&self.old_path) {
-        tracing::warn!(
-          "Failed to remove {:?} after the failed key switch | {e:#}",
-          self.old_path
-        );
-      }
-      return Err(e).with_context(|| {
-        format!(
+    if let Err(e) = write(&self.candidate.private, &self.live_path) {
+      // A write can report an error and have happened anyway
+      // (syncing the directory after the replace, a retried NFS
+      // rename): memory follows whatever key the live file now
+      // holds, as in [RotatableKeyPair::rotate].
+      if !file_holds_key(
+        self.pki_kind,
+        &self.live_path,
+        &self.candidate.public,
+      ) {
+        // Nothing switched: `.old` must not offer the live key for
+        // revocation. Removed only while the live file holds that
+        // key too, so it is never the only copy of the key in use.
+        if file_holds_key(
+          self.pki_kind,
+          &self.live_path,
+          &previous.public,
+        ) && let Err(e) = std::fs::remove_file(&self.old_path)
+        {
+          tracing::warn!(
+            "Failed to remove {:?} after the failed key switch | {e:#}",
+            self.old_path
+          );
+        }
+        return Err(e.context(format!(
           "Failed to move the new key {:?} into place at {:?}",
           self.next_path, self.live_path
-        )
-      });
+        )));
+      }
+      tracing::warn!(
+        "Moved the new key into place at {:?}, though writing it reported an error | {e:#}",
+        self.live_path
+      );
     }
     let public = self.candidate.public.clone();
     self.pair.keys.store(Arc::new(self.candidate));
     sync_parent_dir(&self.live_path);
+    // A copy of the live key now. One left behind is never resumed
+    // (see [RotatableKeyPair::begin_rotation]).
+    if let Err(e) = remove_file_if_exists(&self.next_path) {
+      tracing::warn!(
+        "Switched to the new key, but failed to remove the rotation candidate file | {e:#}"
+      );
+    }
     if let Err(e) =
       public.write_pem_sync(self.live_path.with_extension("pub"))
     {

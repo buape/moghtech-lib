@@ -737,17 +737,17 @@ fn a_failed_commit_leaves_no_retired_key() {
 
   let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
   let candidate = rotation.candidate().clone();
-  // The rename onto the live path fails (as onto a mount point):
-  // make the live path a non empty directory.
+  // Writing the live path fails: make it a non empty directory.
   std::fs::remove_file(&path).unwrap();
   std::fs::create_dir(&path).unwrap();
   std::fs::write(path.join("occupied"), "").unwrap();
   assert!(rotation.commit().is_err());
 
   // Nothing switched, and nothing offers the live key for
-  // revocation.
+  // revocation. The live file can't be read, so `.old` keeps the
+  // key in use rather than dropping its only copy on disk.
   assert_eq!(pair.load().public, original.public);
-  assert!(!dir.join("test.key.old").exists());
+  assert!(dir.join("test.key.old").exists());
   assert!(pair.retired(PkiKind::OneWay).unwrap().is_none());
 
   // Once the live file is back, the candidate resumes.
@@ -1081,4 +1081,233 @@ fn only_an_empty_key_file_suggests_deleting_it() {
   }
 
   std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_commit_whose_write_errors_follows_the_live_file() {
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_commit_write_errors");
+  let path = dir.join("test.key");
+  let old = dir.join("test.key.old");
+  let next = dir.join("test.key.next");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  let original = pair.load().clone();
+
+  // The write fails outright: nothing switched, `.old` (a copy of
+  // the live key) is removed, the candidate resumes.
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = rotation.candidate().clone();
+  let err = rotation
+    .commit_with(|_, _| Err(anyhow::anyhow!("write failed")))
+    .err()
+    .unwrap();
+  assert!(format!("{err:#}").contains("write failed"), "{err:#}");
+  assert_eq!(pair.load().public, original.public);
+  assert!(!old.exists());
+  assert!(next.exists());
+
+  // The write reports an error but happened (syncing the directory
+  // after the replace, a retried NFS rename): memory switches with
+  // the file, and the previous key is kept at `.old` for
+  // revocation.
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert_eq!(rotation.candidate().public, candidate.public);
+  rotation
+    .commit_with(|private, live| {
+      // The candidate, over the live key file.
+      assert!(*private == candidate.private);
+      assert_eq!(live, path);
+      private.write_pem_sync(live)?;
+      Err(anyhow::anyhow!("reported after the write"))
+    })
+    .unwrap();
+  assert_eq!(pair.load().public, candidate.public);
+  let on_disk =
+    EncodedKeyPair::from_file(PkiKind::OneWay, &path).unwrap();
+  assert_eq!(on_disk.public, candidate.public);
+  assert!(!next.exists());
+  let retired = pair.retired(PkiKind::OneWay).unwrap().unwrap();
+  assert_eq!(retired.public, original.public);
+  pair.finish_rotation().unwrap();
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_commit_interrupted_mid_write_is_retried() {
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_commit_mid_write");
+  let path = dir.join("test.key");
+  let old = dir.join("test.key.old");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  let original = pair.load().clone();
+
+  // An in place write (a bind mounted key file) fails midway: the
+  // live file holds no key, so `.old` keeps the key in use.
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = rotation.candidate().clone();
+  let err = rotation
+    .commit_with(|_, live| {
+      std::fs::write(live, "-----BEGIN PRIVATE KEY-----\nMC4C")
+        .unwrap();
+      Err(anyhow::anyhow!("write failed midway"))
+    })
+    .err()
+    .unwrap();
+  assert!(format!("{err:#}").contains("midway"), "{err:#}");
+  assert_eq!(pair.load().public, original.public);
+  assert!(
+    Pkcs8PrivateKey::from_file(&old).unwrap() == original.private
+  );
+  // Not a retired key: it is the key in use.
+  assert!(pair.retired(PkiKind::OneWay).unwrap().is_none());
+  assert!(pair.rotation_pending());
+
+  // The retry resumes the candidate, and its commit writes the live
+  // file again (`.old` holding the key in use doesn't block it).
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert_eq!(rotation.candidate().public, candidate.public);
+  rotation.commit().unwrap();
+  assert_eq!(pair.load().public, candidate.public);
+  let on_disk =
+    EncodedKeyPair::from_file(PkiKind::OneWay, &path).unwrap();
+  assert_eq!(on_disk.public, candidate.public);
+  let retired = pair.retired(PkiKind::OneWay).unwrap().unwrap();
+  assert_eq!(retired.public, original.public);
+  pair.finish_rotation().unwrap();
+  assert!(!pair.rotation_pending());
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_candidate_holding_the_live_key_is_not_resumed() {
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_switched_candidate");
+  let path = dir.join("test.key");
+  let next = dir.join("test.key.next");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  let original = pair.load().clone();
+
+  // A commit interrupted after its switch, before removing `.next`.
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = rotation.candidate().clone();
+  rotation.commit().unwrap();
+  pair.finish_rotation().unwrap();
+  candidate.private.write_pem_sync(&next).unwrap();
+  // A restart loads the switched key.
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  assert_eq!(pair.load().public, candidate.public);
+
+  // That rotation is done: nothing to resume.
+  assert!(!pair.rotation_pending());
+  // The next one starts over, never offering the live key as its
+  // candidate (committing it would retire the key in use).
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let fresh = rotation.candidate().clone();
+  assert_ne!(fresh.public, candidate.public);
+  assert_ne!(fresh.public, original.public);
+  assert!(
+    Pkcs8PrivateKey::from_file(&next).unwrap() == fresh.private
+  );
+  assert!(pair.rotation_pending());
+  rotation.commit().unwrap();
+  assert_eq!(pair.load().public, fresh.public);
+  let retired = pair.retired(PkiKind::OneWay).unwrap().unwrap();
+  assert_eq!(retired.public, candidate.public);
+  pair.finish_rotation().unwrap();
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A key file which can't simply be replaced (a single file bind
+/// mount, a hard link) is written in place by the commit, keeping
+/// its owner, group and mode, as [RotatableKeyPair::rotate] does.
+#[cfg(unix)]
+#[test]
+fn a_commit_writes_the_live_file_like_rotate() {
+  use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_commit_identity");
+  let path = dir.join("test.key");
+  let link = dir.join("linked.key");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+
+  // A key file shared with a group this process is in.
+  std::fs::set_permissions(
+    &path,
+    std::fs::Permissions::from_mode(0o640),
+  )
+  .unwrap();
+  let group =
+    supplementary_group(std::fs::metadata(&path).unwrap().gid());
+  if let Some(gid) = group {
+    std::os::unix::fs::chown(&path, None, Some(gid)).unwrap();
+  }
+
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = rotation.candidate().clone();
+  rotation.commit().unwrap();
+  assert_eq!(pair.load().public, candidate.public);
+  let meta = std::fs::metadata(&path).unwrap();
+  assert_eq!(meta.mode() & 0o7777, 0o640);
+  if let Some(gid) = group {
+    assert_eq!(meta.gid(), gid);
+  }
+  pair.finish_rotation().unwrap();
+
+  // A hard linked key file in a directory only its owner can write
+  // to is written in place, as a bind mounted one is: the same
+  // file, which the other link sees switch too.
+  std::fs::set_permissions(
+    &dir,
+    std::fs::Permissions::from_mode(0o700),
+  )
+  .unwrap();
+  std::fs::hard_link(&path, &link).unwrap();
+  let inode = std::fs::metadata(&path).unwrap().ino();
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = rotation.candidate().clone();
+  rotation.commit().unwrap();
+  assert_eq!(pair.load().public, candidate.public);
+  assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+  assert!(
+    Pkcs8PrivateKey::from_file(&link).unwrap() == candidate.private
+  );
+  assert!(!dir.join("test.key.next").exists());
+  pair.finish_rotation().unwrap();
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A group this process is in, other than `gid` (linux only).
+#[cfg(unix)]
+fn supplementary_group(gid: u32) -> Option<u32> {
+  let status = std::fs::read_to_string("/proc/self/status").ok()?;
+  let groups = status
+    .lines()
+    .find_map(|line| line.strip_prefix("Groups:"))?;
+  groups
+    .split_whitespace()
+    .filter_map(|group| group.parse().ok())
+    .find(|group| *group != gid)
 }

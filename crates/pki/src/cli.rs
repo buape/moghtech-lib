@@ -35,7 +35,7 @@ pub enum KeyCommand {
 )]
 #[strum(serialize_all = "lowercase")]
 pub enum KeyOutputFormat {
-  /// Readable output format. Default. (alias: `t`)
+  /// Readable output format. Default. (alias: `s`)
   #[default]
   #[clap(alias = "s")]
   Standard,
@@ -230,6 +230,52 @@ mod tests {
     );
     assert!(super::compute_public_key(PkiKind::Mutual, "").is_err());
     std::fs::remove_dir_all(dir).unwrap();
+  }
+
+  /// The aliases each format's help names are the ones clap takes,
+  /// for both subcommands.
+  #[test]
+  fn format_help_names_the_real_aliases() {
+    use clap::{Parser as _, ValueEnum as _};
+
+    use super::{KeyCommand, KeyOutputFormat};
+
+    #[derive(clap::Parser)]
+    struct Cli {
+      #[command(subcommand)]
+      command: KeyCommand,
+    }
+
+    for format in KeyOutputFormat::value_variants() {
+      let value = format.to_possible_value().unwrap();
+      let help = value.get_help().unwrap().to_string();
+      let documented = help
+        .split_once("(alias: `")
+        .and_then(|(_, alias)| alias.split_once('`'))
+        .map(|(alias, _)| alias)
+        .unwrap_or_else(|| panic!("no alias in {help:?}"));
+      assert!(
+        value
+          .get_name_and_aliases()
+          .any(|alias| alias == documented),
+        "{help:?} names an alias clap doesn't take"
+      );
+      for args in [
+        vec!["km", "generate", "-f", documented],
+        vec!["km", "compute", "-", "--format", documented],
+      ] {
+        let parsed = match Cli::try_parse_from(&args).unwrap().command
+        {
+          KeyCommand::Generate { format }
+          | KeyCommand::Compute { format, .. } => format,
+        };
+        assert_eq!(
+          parsed.to_string(),
+          format.to_string(),
+          "{args:?}"
+        );
+      }
+    }
   }
 
   #[test]

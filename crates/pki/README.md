@@ -34,7 +34,10 @@ fn main() -> anyhow::Result<()> {
   phases for a key registered elsewhere (`begin_rotation`, register
   the candidate, `commit`, revoke `retired`, `finish_rotation`). One
   rotation of a pair at a time, and only one process may rotate a
-  given key file.
+  given key file. Both write the key file with `mogh_secret_file`:
+  an atomic replace keeping its owner, group and mode, or an in
+  place write (not atomic) where the file can't be replaced, like a
+  docker / kubernetes single file mount.
 
 ## Handshakes
 
