@@ -6,6 +6,9 @@ use std::{
   sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod xattr;
+
 /// Writes data to path. A new file is created with `0600`
 /// permissions (on unix). `std::fs` sync version.
 ///
@@ -21,9 +24,15 @@ use std::{
 /// new file survives a crash.
 ///
 /// An existing file keeps its permissions, and on unix its owner
-/// and group. When these can't be kept, and the file can't be
-/// written in place either (see below), the write fails rather
-/// than changing them.
+/// and group. On Linux it also keeps its access ACL (`setfacl`) and
+/// its SELinux / Smack security label, and doesn't take on the
+/// directory's default ACL. When these can't be kept (eg. relabeling
+/// is not permitted), and the file can't be written in place either
+/// (see below), the write fails rather than changing them.
+///
+/// Other extended attributes (eg. `user.*`, or NFSv4 ACLs), and ACLs
+/// on other platforms, are not carried over when the file is
+/// replaced.
 ///
 /// ## Symlinks
 ///
@@ -45,10 +54,11 @@ use std::{
 ///   file mount), which can't be renamed onto.
 /// - The directory can't be written to (or is read only),
 ///   but the file can.
-/// - The owner / group can't be given to a new file, eg. a non-root
-///   process writing a file owned by another user. Except for
-///   another user's file in a sticky directory (eg. `/tmp`) this
-///   process doesn't own, which fails, like a rename would.
+/// - The owner / group, or on Linux the ACL / security label, can't
+///   be given to a new file, eg. a non-root process writing a file
+///   owned by another user. Except for another user's file in a
+///   sticky directory (eg. `/tmp`) this process doesn't own, which
+///   fails, like a rename would.
 /// - The file has other hard links, which a replace would split
 ///   off. Only when the directory can be written to by its owner
 ///   alone, being root or the file's owner, so no one else can have
@@ -153,10 +163,10 @@ fn write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 /// Writes the contents to a new temp file beside `path`, and renames
-/// it onto `path`, keeping the owner, group and mode of the
-/// `existing` file. With `in_place`, returns `Ok(false)`, leaving
-/// `path` untouched, when the existing file has to be written in
-/// place instead.
+/// it onto `path`, keeping the owner, group, mode and (on Linux)
+/// access control extended attributes of the `existing` file. With
+/// `in_place`, returns `Ok(false)`, leaving `path` untouched, when
+/// the existing file has to be written in place instead.
 fn replace(
   path: &Path,
   existing: Option<&Metadata>,
@@ -183,10 +193,11 @@ fn replace(
     // Read before copy_identity may give the temp file away: its
     // owner as created is the writer as the kernel sees it.
     let created = file.metadata()?;
-    match copy_identity(&file, &created, existing) {
+    match copy_identity(path, &file, &created, existing) {
       Ok(()) => {}
       // eg. a non-root process can't give a file to another user,
-      // or the owner is outside the user namespace.
+      // the owner is outside the user namespace, or relabeling
+      // the file is not permitted.
       Err(e) if not_permitted(&e) => {
         if in_place
           && sticky_permits_in_place(path, &created, existing)?
@@ -195,7 +206,10 @@ fn replace(
         }
         return Err(std::io::Error::new(
           e.kind(),
-          format!("Can't keep the owner / group of {path:?}: {e}"),
+          format!(
+            "Can't keep the owner / group / access control of \
+             {path:?}: {e}"
+          ),
         ));
       }
       Err(e) => return Err(e),
@@ -267,9 +281,12 @@ fn same_file(opened: &Metadata, _existing: &Metadata) -> bool {
 }
 
 /// Gives the new temp file (`created`: its metadata as created) the
-/// existing file's owner, group and mode.
+/// owner, group and mode of the `existing` file at `path`, and on
+/// Linux its access control extended attributes (ACL and security
+/// label).
 #[cfg(unix)]
 fn copy_identity(
+  path: &Path,
   temp: &File,
   created: &Metadata,
   existing: &Metadata,
@@ -285,12 +302,16 @@ fn copy_identity(
   }
 
   // Set through the handle rather than the path, so it can't be
-  // redirected. After the chown, which clears setuid / setgid.
-  let res = temp.set_permissions(existing.permissions());
+  // redirected. The ACL before the mode: an ACL's owning group entry
+  // may deny what the mode's group bits (its mask) allow, which the
+  // mode alone would grant meanwhile. The mode after the chown,
+  // which clears setuid / setgid.
+  let res = copy_access_control(path, temp)
+    .and_then(|()| temp.set_permissions(existing.permissions()));
   if res.is_err() && uid.is_some() {
     // Given away (CAP_CHOWN), but no longer this process's to set
-    // the mode of (no CAP_FOWNER): take it back, or it can't be
-    // removed from a sticky directory.
+    // the mode / ACL of (no CAP_FOWNER): take it back, or it can't
+    // be removed from a sticky directory.
     let _ = fchown(temp, Some(created.uid()), Some(created.gid()));
   }
   res
@@ -300,6 +321,7 @@ fn copy_identity(
 /// is not copied: Windows can't rename onto a read only file anyways.
 #[cfg(not(unix))]
 fn copy_identity(
+  _path: &Path,
   _temp: &File,
   _created: &Metadata,
   _existing: &Metadata,
@@ -307,8 +329,24 @@ fn copy_identity(
   Ok(())
 }
 
-/// Whether setting the owner / group / mode failed because it is
-/// not permitted, rather than eg. an I/O error.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use xattr::copy_access_control;
+
+/// Extended attributes are only carried over on Linux.
+#[cfg(all(
+  unix,
+  not(any(target_os = "linux", target_os = "android"))
+))]
+fn copy_access_control(
+  _path: &Path,
+  _temp: &File,
+) -> std::io::Result<()> {
+  Ok(())
+}
+
+/// Whether setting the owner / group / mode / access control failed
+/// because it is not permitted (or supported), rather than eg. an
+/// I/O error.
 fn not_permitted(e: &std::io::Error) -> bool {
   matches!(
     e.kind(),
@@ -604,6 +642,36 @@ mod tests {
   #[cfg(unix)]
   fn inject_failure(path: &Path) {
     FAIL_BEFORE_RENAME.lock().unwrap().push(path.to_path_buf());
+  }
+
+  /// Paths whose writes can't set (or remove) the access control
+  /// extended attributes of the temp file, as if not permitted.
+  #[cfg(any(target_os = "linux", target_os = "android"))]
+  static FAIL_ACCESS_CONTROL: Mutex<Vec<PathBuf>> =
+    Mutex::new(Vec::new());
+
+  #[cfg(any(target_os = "linux", target_os = "android"))]
+  pub(super) fn injected_access_control_failure(
+    path: &Path,
+  ) -> std::io::Result<()> {
+    if FAIL_ACCESS_CONTROL
+      .lock()
+      .unwrap()
+      .iter()
+      .any(|p| p == path)
+    {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "injected access control failure",
+      ))
+    } else {
+      Ok(())
+    }
+  }
+
+  #[cfg(any(target_os = "linux", target_os = "android"))]
+  fn inject_access_control_failure(path: &Path) {
+    FAIL_ACCESS_CONTROL.lock().unwrap().push(path.to_path_buf());
   }
 
   /// Temp paths handed out, in order, before random ones, per path
@@ -1331,6 +1399,247 @@ mod tests {
       );
       assert_eq!(std::fs::read_to_string(&host).unwrap(), "hunter3");
       assert_eq!(entries(mounted.parent().unwrap()), ["secret"]);
+    }
+
+    /// The access ACL and security label are carried over on Linux.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod linux {
+      use std::{
+        ffi::{CStr, CString},
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+        path::Path,
+      };
+
+      use super::{entries, mode, set_mode, temp_dir};
+      use crate::write::write;
+
+      const ACL_ACCESS: &CStr = c"system.posix_acl_access";
+      const ACL_DEFAULT: &CStr = c"system.posix_acl_default";
+
+      // POSIX ACL entry tags, and the id of the entries without one.
+      const USER_OBJ: u16 = 0x01;
+      const USER: u16 = 0x02;
+      const GROUP_OBJ: u16 = 0x04;
+      const MASK: u16 = 0x10;
+      const OTHER: u16 = 0x20;
+      const NO_ID: u32 = u32::MAX;
+
+      /// The user granted access in the ACLs, standing in for a
+      /// sidecar: the owner of `path`, as the id has to be mapped in
+      /// the user namespace the tests run in (`nobody` may not be).
+      fn sidecar(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().uid()
+      }
+
+      /// A POSIX ACL as the kernel stores it in the xattr (version 2):
+      /// `(tag, permissions, id)` entries, sorted by tag.
+      fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+          acl.extend(tag.to_le_bytes());
+          acl.extend(perm.to_le_bytes());
+          acl.extend(id.to_le_bytes());
+        }
+        acl
+      }
+
+      /// `setfacl -m u:<sidecar>:r` on the `0600` file at `path`: the
+      /// sidecar can read it, the owning group can't. The mode shows
+      /// the mask, `0640`.
+      fn sidecar_acl(path: &Path) -> Vec<u8> {
+        acl(&[
+          (USER_OBJ, 6, NO_ID),
+          (USER, 4, sidecar(path)),
+          (GROUP_OBJ, 0, NO_ID),
+          (MASK, 4, NO_ID),
+          (OTHER, 0, NO_ID),
+        ])
+      }
+
+      fn c_path(path: &Path) -> CString {
+        CString::new(path.as_os_str().as_bytes()).unwrap()
+      }
+
+      fn get_xattr(path: &Path, name: &CStr) -> Option<Vec<u8>> {
+        let path = c_path(path);
+        let mut buf = vec![0u8; 64 * 1024];
+        // SAFETY: path and name are nul terminated,
+        // buf is valid for writes of buf.len() bytes.
+        let len = unsafe {
+          libc::lgetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+          )
+        };
+        if len < 0 {
+          let e = std::io::Error::last_os_error();
+          assert_eq!(e.raw_os_error(), Some(libc::ENODATA), "{e}");
+          return None;
+        }
+        buf.truncate(len as usize);
+        Some(buf)
+      }
+
+      /// Sets the xattr, `false` when the filesystem doesn't support
+      /// it (eg. ACLs), and the test is skipped.
+      fn set_xattr(path: &Path, name: &CStr, value: &[u8]) -> bool {
+        let path = c_path(path);
+        // SAFETY: path and name are nul terminated,
+        // value is valid for reads of value.len() bytes.
+        let res = unsafe {
+          libc::lsetxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+          )
+        };
+        if res == 0 {
+          return true;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(
+          e.kind(),
+          std::io::ErrorKind::Unsupported,
+          "set {name:?}: {e}"
+        );
+        eprintln!("No {name:?} support, skipping: {e}");
+        false
+      }
+
+      fn ino(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().ino()
+      }
+
+      /// A file with an ACL (eg. granting a sidecar read) keeps it,
+      /// and so the owning group keeps being denied, rather than the
+      /// mask (the mode's group bits) becoming the group's access.
+      /// The file is still replaced atomically.
+      #[test]
+      fn write_keeps_the_acl() {
+        let dir = temp_dir("sync-acl");
+        let path = dir.join("secret");
+        write(&path, "hunter2").unwrap();
+        let acl = sidecar_acl(&path);
+        if !set_xattr(&path, ACL_ACCESS, &acl) {
+          std::fs::remove_dir_all(dir).unwrap();
+          return;
+        }
+        assert_eq!(mode(&path), 0o640);
+        let replaced = ino(&path);
+
+        write(&path, "hunter3").unwrap();
+        assert_eq!(
+          std::fs::read_to_string(&path).unwrap(),
+          "hunter3"
+        );
+        assert_eq!(get_xattr(&path, ACL_ACCESS), Some(acl));
+        assert_eq!(mode(&path), 0o640);
+        assert_ne!(ino(&path), replaced);
+        assert_eq!(entries(&dir), ["secret"]);
+        std::fs::remove_dir_all(dir).unwrap();
+      }
+
+      /// A file without an ACL doesn't take on the directory's default
+      /// ACL when it is replaced: its mode keeps meaning what it did.
+      #[test]
+      fn write_keeps_no_acl_under_a_default_acl() {
+        let dir = temp_dir("sync-default-acl");
+        let path = dir.join("secret");
+        write(&path, "hunter2").unwrap();
+        set_mode(&path, 0o640);
+        let default = acl(&[
+          (USER_OBJ, 7, NO_ID),
+          (USER, 4, sidecar(&dir)),
+          (GROUP_OBJ, 0, NO_ID),
+          (MASK, 4, NO_ID),
+          (OTHER, 0, NO_ID),
+        ]);
+        if !set_xattr(&dir, ACL_DEFAULT, &default) {
+          std::fs::remove_dir_all(dir).unwrap();
+          return;
+        }
+
+        write(&path, "hunter3").unwrap();
+        assert_eq!(
+          std::fs::read_to_string(&path).unwrap(),
+          "hunter3"
+        );
+        assert_eq!(get_xattr(&path, ACL_ACCESS), None);
+        assert_eq!(mode(&path), 0o640);
+
+        // A new file does take it on, masked by its 0600 mode,
+        // so only its owner has access.
+        let new = dir.join("new");
+        write(&new, "hunter2").unwrap();
+        assert_eq!(mode(&new), 0o600);
+        assert_eq!(entries(&dir), ["new", "secret"]);
+        std::fs::remove_dir_all(dir).unwrap();
+      }
+
+      /// When the ACL / label can't be given to the new file (eg.
+      /// relabeling is not permitted), the file is written in place,
+      /// keeping them.
+      #[test]
+      fn write_in_place_when_the_acl_cant_be_kept() {
+        let dir = temp_dir("sync-acl-in-place");
+        let path = dir.join("secret");
+        write(&path, "hunter2 is longer").unwrap();
+        let acl = sidecar_acl(&path);
+        if !set_xattr(&path, ACL_ACCESS, &acl) {
+          std::fs::remove_dir_all(dir).unwrap();
+          return;
+        }
+        let kept = ino(&path);
+
+        super::super::inject_access_control_failure(&path);
+        write(&path, "hunter3").unwrap();
+        assert_eq!(
+          std::fs::read_to_string(&path).unwrap(),
+          "hunter3"
+        );
+        assert_eq!(ino(&path), kept);
+        assert_eq!(get_xattr(&path, ACL_ACCESS), Some(acl));
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(entries(&dir), ["secret"]);
+        std::fs::remove_dir_all(dir).unwrap();
+      }
+
+      /// When the ACL can't be given to the new file, and the file
+      /// can't be written in place either (a hard link others could
+      /// have planted), the write fails rather than dropping it.
+      #[test]
+      fn write_fails_when_the_acl_cant_be_kept() {
+        let dir = temp_dir("sync-acl-fails");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        write(&a, "hunter2").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        set_mode(&dir, 0o775);
+        let acl = sidecar_acl(&a);
+        if !set_xattr(&a, ACL_ACCESS, &acl) {
+          std::fs::remove_dir_all(dir).unwrap();
+          return;
+        }
+
+        super::super::inject_access_control_failure(&a);
+        let err = write(&a, "hunter3").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("access control"), "{err}");
+        for path in [&a, &b] {
+          assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "hunter2"
+          );
+        }
+        assert_eq!(std::fs::metadata(&a).unwrap().nlink(), 2);
+        assert_eq!(get_xattr(&a, ACL_ACCESS), Some(acl));
+        assert_eq!(entries(&dir), ["a", "b"]);
+        std::fs::remove_dir_all(dir).unwrap();
+      }
     }
 
     #[cfg(feature = "tokio")]
