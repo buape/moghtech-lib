@@ -263,40 +263,90 @@ fn success_body_error(
   anyhow!("{message} | body: {preview}")
 }
 
-/// Replaces the quoted parts of a serde error message, which can be
-/// values of the input: strings in double quotes, other values in
-/// backticks. The field of a `missing field` error is kept, it comes
-/// from the type.
+/// Redacts the values of the input from a serde error message,
+/// keeping the names which come from the types. serde writes an
+/// unknown enum variant or field in backticks without escaping it,
+/// so it may hold backticks or quotes itself: it is redacted whole,
+/// and the names expected after it stay readable
+/// (`unknown variant [redacted], expected `Jwt` or `Totp``). So does
+/// the field of a `missing field` / `duplicate field` error. Other
+/// values are redacted by [redact_serde_values].
 fn redact_serde_message(message: &str) -> String {
+  // serde's wording only counts at the start of the message
+  // (serde_json appends ` at line N column M`): text like it
+  // anywhere else is inside a value.
+  for wording in ["unknown variant ", "unknown field "] {
+    let Some(name) = message
+      .strip_prefix(wording)
+      .and_then(|rest| rest.strip_prefix('`'))
+    else {
+      continue;
+    };
+    // The name runs up to serde's own `, expected` / `, there are
+    // no`, the last one, as the name may hold these too. What
+    // follows are the names of the type (`&'static str`).
+    let end = ["`, expected ", "`, there are no "]
+      .into_iter()
+      .filter_map(|marker| name.rfind(marker))
+      .max();
+    let after = end.map_or("", |end| &name[end + 1..]);
+    return format!("{wording}[redacted]{after}");
+  }
+  for wording in ["missing field `", "duplicate field `"] {
+    // serde names these fields with a `&'static str` of the type.
+    let Some(end) = message
+      .strip_prefix(wording)
+      .and_then(|rest| rest.find('`'))
+    else {
+      continue;
+    };
+    let (field, rest) = message.split_at(wording.len() + end + 1);
+    return format!("{field}{}", redact_serde_values(rest));
+  }
+  redact_serde_values(message)
+}
+
+/// Redacts the values serde writes into its messages: strings in
+/// double quotes, escaped (`string "a \"b\""`), a character in
+/// backticks, unescaped (it may be a backtick itself), and numbers
+/// and booleans in backticks. An unterminated one is redacted to
+/// the end.
+fn redact_serde_values(message: &str) -> String {
   let mut out = String::with_capacity(message.len());
   let mut rest = message;
-  // Both quotes are ascii, so `quoted[1..]` is on a char boundary.
   while let Some(start) = rest.find(['"', '`']) {
     let (before, quoted) = rest.split_at(start);
-    let quote = if quoted.starts_with('"') { '"' } else { '`' };
     out.push_str(before);
-    // The closing quote, skipping escaped characters in strings.
-    let mut escaped = false;
-    let end = quoted[1..].char_indices().find_map(|(i, c)| {
-      if escaped {
-        escaped = false;
-      } else if c == '\\' && quote == '"' {
-        escaped = true;
-      } else if c == quote {
-        return Some(i + 2);
-      }
-      None
-    });
+    out.push_str("[redacted]");
+    // Both quotes are ascii, so `quoted[1..]` is on a char boundary,
+    // and the end (past the closing quote) is its offset + 2.
+    let inner = &quoted[1..];
+    let end = if quoted.starts_with('"') {
+      // The closing quote, skipping escaped characters.
+      let mut escaped = false;
+      inner.char_indices().find_map(|(i, c)| {
+        if escaped {
+          escaped = false;
+        } else if c == '\\' {
+          escaped = true;
+        } else if c == '"' {
+          return Some(i + 2);
+        }
+        None
+      })
+    } else if before.ends_with("character ") {
+      // One char, then the closing backtick.
+      inner.chars().next().and_then(|c| {
+        let close = c.len_utf8();
+        inner[close..].starts_with('`').then_some(close + 2)
+      })
+    } else {
+      inner.find('`').map(|i| i + 2)
+    };
     let Some(end) = end else {
       // Unterminated, redact the rest.
-      out.push_str("[redacted]");
       return out;
     };
-    if quote == '`' && before.ends_with("missing field ") {
-      out.push_str(&quoted[..end]);
-    } else {
-      out.push_str("[redacted]");
-    }
     rest = &quoted[end..];
   }
   out.push_str(rest);
@@ -478,21 +528,119 @@ mod tests {
       ),
       "invalid value: integer [redacted], expected x"
     );
+    // The names expected after an unknown one are the type's.
     assert_eq!(
       redact_serde_message(
         "unknown variant `secret`, expected `Jwt`"
       ),
-      "unknown variant [redacted], expected [redacted]"
+      "unknown variant [redacted], expected `Jwt`"
+    );
+    assert_eq!(
+      redact_serde_message(
+        "unknown field `secret`, there are no fields"
+      ),
+      "unknown field [redacted], there are no fields"
     );
     assert_eq!(
       redact_serde_message("missing field `jwt` at line 1 column 2"),
       "missing field `jwt` at line 1 column 2"
     );
     assert_eq!(
+      redact_serde_message(
+        "duplicate field `jwt` at line 1 column 9"
+      ),
+      "duplicate field `jwt` at line 1 column 9"
+    );
+    assert_eq!(
       redact_serde_message(r#"unterminated "secret"#),
       "unterminated [redacted]"
     );
+    assert_eq!(
+      redact_serde_message("unterminated `secret"),
+      "unterminated [redacted]"
+    );
     assert_eq!(redact_serde_message("no quotes"), "no quotes");
+    // A character is written in backticks unescaped.
+    let err = <serde_json::Error as serde::de::Error>::invalid_type(
+      serde::de::Unexpected::Char('`'),
+      &"a secret",
+    );
+    assert_eq!(
+      redact_serde_message(&err.to_string()),
+      "invalid type: character [redacted], expected a secret"
+    );
+  }
+
+  /// serde writes an unknown enum variant (or field) in backticks
+  /// without escaping it: a backtick in the value used to end the
+  /// redacted part early, leaking the rest, and `missing field`
+  /// text in the value was kept as if it were serde's.
+  #[test]
+  fn test_redact_serde_message_unknown_names_holding_quotes() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Strict {
+      port: u16,
+    }
+    for value in [
+      "x`s3cr3t",
+      "a`b`c`s3cr3t`d",
+      "`s3cr3t`",
+      "x\"s3cr3t\"",
+      "x\"s3cr3t",
+      "x`missing field `s3cr3t",
+      "x`, missing field `s3cr3t`",
+      "x`, expected `s3cr3t",
+      "x`, expected `s3cr3t`, expected `x",
+      "x`, there are no s3cr3t",
+      "multi\nline`s3cr3t",
+    ] {
+      let body = json!({ "type": value, "data": {} }).to_string();
+      let err =
+        parse_response::<JwtOrTwoFactor>(StatusCode::OK, body)
+          .unwrap_err();
+      for msg in [format!("{err:#}"), format!("{err:?}")] {
+        assert!(!msg.contains("s3cr3t"), "{value:?}: {msg}");
+        assert!(
+          msg.contains(
+            "unknown variant [redacted], expected one of `Jwt`, `Passkey`, `Totp` at line 1 column"
+          ),
+          "{value:?}: {msg}"
+        );
+      }
+
+      let err = serde_json::from_str::<Strict>(
+        &json!({ "port": 1, value: 1 }).to_string(),
+      )
+      .unwrap_err();
+      let msg = redact_serde_message(&err.to_string());
+      assert!(!msg.contains("s3cr3t"), "{value:?}: {msg}");
+      assert!(
+        msg.starts_with("unknown field [redacted], expected `port`"),
+        "{value:?}: {msg}"
+      );
+
+      // A string is redacted whole, whatever it holds.
+      let err =
+        serde_json::from_str::<u16>(&json!(value).to_string())
+          .unwrap_err();
+      let msg = redact_serde_message(&err.to_string());
+      assert!(
+        msg.starts_with(
+          "invalid type: string [redacted], expected u16"
+        ),
+        "{value:?}: {msg}"
+      );
+    }
+    // serde's wording only counts at the start of the message.
+    for message in [
+      "invalid value: integer `1`, missing field `s3cr3t`",
+      "custom: duplicate field `s3cr3t`",
+    ] {
+      let msg = redact_serde_message(message);
+      assert!(!msg.contains("s3cr3t"), "{message:?}: {msg}");
+    }
   }
 
   #[test]
