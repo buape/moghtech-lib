@@ -75,6 +75,8 @@ longer name is one flat key too. A name that is both a value and
 an object (`DATABASE=x` next to `DATABASE.ADDRESS=y`), or two names equal
 once lowercased (`DB` and `db`), is an error naming the line and both
 names. Values are never interpolated: they are secrets, not templates.
+A parse error names the line (and entry) and what was expected, never
+the value: not even the character after an unsupported escape.
 
 ```sh
 # .env, listed in the paths after the defaults

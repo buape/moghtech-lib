@@ -202,7 +202,7 @@ fn parse_entries(content: &str) -> Result<Vec<Entry>, EnvFileError> {
     entries.push(Entry {
       line: number,
       name: name.to_string(),
-      value: parse_value(value.trim(), number)?,
+      value: parse_value(value.trim(), name, number)?,
     });
   }
   Ok(entries)
@@ -210,9 +210,10 @@ fn parse_entries(content: &str) -> Result<Vec<Entry>, EnvFileError> {
 
 /// A value after `=`, already trimmed: unquoted (taken literally to
 /// the end of the line), single quoted (literal), or double quoted
-/// with escapes.
+/// with escapes. `name` is the entry's, for the errors.
 fn parse_value(
   value: &str,
+  name: &str,
   line: usize,
 ) -> Result<String, EnvFileError> {
   let mut chars = value.chars();
@@ -227,10 +228,16 @@ fn parse_value(
             Some('t') => out.push('\t'),
             Some('"') => out.push('"'),
             Some('\\') => out.push('\\'),
-            Some(c) => {
+            // The escaped character is part of the (secret) value,
+            // and so is where it sits, so the message names neither.
+            Some(_) => {
               return Err(error(
                 line,
-                format!("unsupported escape `\\{c}`"),
+                format!(
+                  "unsupported escape in the value of `{name}`: \
+                   a double quoted value takes `\\n`, `\\r`, `\\t`, \
+                   `\\\"` and `\\\\` (a literal backslash)"
+                ),
               ));
             }
             None => {
@@ -338,7 +345,10 @@ UNQUOTED=$(not run) ${NOT_EXPANDED} # not a comment
       ("A=1\nnot an entry", "line 2: expected `NAME=value`"),
       ("=1", "line 1: missing name"),
       ("A=1\nA=2", "line 2: duplicate entry for `A`"),
-      ("A=\"bad \\x escape\"", "line 1: unsupported escape `\\x`"),
+      (
+        "A=\"bad \\x escape\"",
+        "line 1: unsupported escape in the value of `A`",
+      ),
       (
         "A=\"unterminated",
         "line 1: unterminated double quoted value",
@@ -359,6 +369,36 @@ UNQUOTED=$(not run) ${NOT_EXPANDED} # not a comment
       let err = parse_env_file(file).unwrap_err().to_string();
       assert!(err.starts_with(expected), "{file:?}: {err}");
       assert!(!err.contains("secret"), "{err}");
+    }
+  }
+
+  /// The escaped character is a character of the (secret) value:
+  /// the message is the same whichever it is, and wherever it sits.
+  #[test]
+  fn unsupported_escapes_never_name_the_escaped_character() {
+    let expected = parse_env_file("DB_PASSWORD=\"\\q\"")
+      .unwrap_err()
+      .to_string();
+    assert!(
+      expected.starts_with(
+        "line 1: unsupported escape in the value of `DB_PASSWORD`"
+      ),
+      "{expected}"
+    );
+    assert!(!expected.contains("\\q"), "{expected}");
+    let escaped = ('!'..='~')
+      .chain([' ', 'é', '€', '😀'])
+      .filter(|c| !matches!(c, 'n' | 'r' | 't' | '"' | '\\'));
+    for c in escaped {
+      for file in [
+        format!("DB_PASSWORD=\"\\{c}\""),
+        format!("DB_PASSWORD=\"p4ss\\{c}w0rd\""),
+        format!("DB_PASSWORD=\"{}\\{c}\"", "p".repeat(40)),
+      ] {
+        let err = parse_env_file(&file).unwrap_err();
+        assert_eq!(err.line, 1);
+        assert_eq!(err.to_string(), expected, "{file:?}");
+      }
     }
   }
 
