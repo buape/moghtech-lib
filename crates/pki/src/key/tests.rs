@@ -1188,6 +1188,82 @@ fn a_commit_interrupted_mid_write_is_retried() {
   std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The resume flow (revoke [RotatableKeyPair::retired], then
+/// [RotatableKeyPair::finish_rotation]) after a commit whose write
+/// failed midway never deletes the only copy of the key in use.
+#[test]
+fn finishing_after_a_failed_commit_keeps_the_key_in_use() {
+  use super::RotatableKeyPair;
+
+  let dir = scratch_dir("rotate_finish_failed_commit");
+  let path = dir.join("test.key");
+  let old = dir.join("test.key.old");
+  let spec = format!("file:{}", path.display());
+  let pair =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  let original = pair.load().clone();
+  let fail_midway = |_: &Pkcs8PrivateKey, live: &std::path::Path| {
+    std::fs::write(live, "-----BEGIN PRIVATE KEY-----\nMC4C")
+      .unwrap();
+    Err(anyhow::anyhow!("write failed midway"))
+  };
+  let old_holds_original = || {
+    Pkcs8PrivateKey::from_file(&old)
+      .is_ok_and(|old| old == original.private)
+  };
+
+  // An in place write fails midway: the live file holds no key, and
+  // `.old` is the only copy of the key in use on disk.
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  let candidate = rotation.candidate().clone();
+  assert!(rotation.commit_with(fail_midway).is_err());
+  assert!(pair.retired(PkiKind::OneWay).unwrap().is_none());
+  // Nothing retired to revoke, so the caller finishes: `.old` stays.
+  pair.finish_rotation().unwrap();
+  assert!(old_holds_original());
+  assert!(pair.rotation_pending());
+  // Nor while the live file holds another key.
+  EncodedKeyPair::generate(PkiKind::OneWay)
+    .unwrap()
+    .private
+    .write_pem_sync(&path)
+    .unwrap();
+  pair.finish_rotation().unwrap();
+  assert!(old_holds_original());
+  // Once the live file holds the key in use again, `.old` is a
+  // spare copy, and finishing removes it.
+  original.private.write_pem_sync(&path).unwrap();
+  pair.finish_rotation().unwrap();
+  assert!(!old.exists());
+  // The candidate still waits.
+  assert!(pair.rotation_pending());
+
+  // Again, resumed the way a caller does after finishing: the
+  // candidate resumes, and its commit writes the live file again.
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert_eq!(rotation.candidate().public, candidate.public);
+  assert!(rotation.commit_with(fail_midway).is_err());
+  pair.finish_rotation().unwrap();
+  assert!(old_holds_original());
+  let rotation = pair.begin_rotation(PkiKind::OneWay).unwrap();
+  assert_eq!(rotation.candidate().public, candidate.public);
+  rotation.commit().unwrap();
+  assert_eq!(pair.load().public, candidate.public);
+  // Now `.old` is a retired key, which finishing removes.
+  let retired = pair.retired(PkiKind::OneWay).unwrap().unwrap();
+  assert_eq!(retired.public, original.public);
+  pair.finish_rotation().unwrap();
+  assert!(!old.exists());
+  assert!(!pair.rotation_pending());
+  let reloaded =
+    RotatableKeyPair::from_private_key_spec(PkiKind::OneWay, &spec)
+      .unwrap();
+  assert_eq!(reloaded.load().public, candidate.public);
+
+  std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn a_candidate_holding_the_live_key_is_not_resumed() {
   use super::RotatableKeyPair;

@@ -37,7 +37,10 @@ fn main() -> anyhow::Result<()> {
   given key file. Both write the key file with `mogh_secret_file`:
   an atomic replace keeping its owner, group and mode, or an in
   place write (not atomic) where the file can't be replaced, like a
-  docker / kubernetes single file mount.
+  docker / kubernetes single file mount. A commit whose write fails
+  midway leaves the key in use only at `<path>.old`, which
+  `begin_rotation` and `finish_rotation` then keep, until the live
+  file holds that key again or a retried commit switches.
 
 ## Handshakes
 

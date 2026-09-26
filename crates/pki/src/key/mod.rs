@@ -424,7 +424,9 @@ impl RotatableKeyPair {
   /// left by a commit that did not switch (interrupted, or its
   /// write failed), so there is nothing to revoke. `None` is
   /// returned, and the file is left for the next
-  /// [begin_rotation][Self::begin_rotation] to remove (until then
+  /// [begin_rotation][Self::begin_rotation] or
+  /// [finish_rotation][Self::finish_rotation] to remove, once the
+  /// live file holds that key too (until then
   /// [Self::rotation_pending] stays true).
   ///
   /// Only reads, without the rotation guard: it never makes a
@@ -487,7 +489,8 @@ impl RotatableKeyPair {
   /// or a retired key (`<path>.old`) is waiting, see
   /// [Self::begin_rotation] and [Self::retired]. Also true for a
   /// `<path>.old` holding the live key (a commit that did not
-  /// switch), until [Self::begin_rotation] removes it. Not for a
+  /// switch), until [Self::begin_rotation] or
+  /// [Self::finish_rotation] removes it. Not for a
   /// `<path>.next` holding the live key (a commit interrupted after
   /// its switch): there is nothing to resume.
   pub fn rotation_pending(&self) -> bool {
@@ -503,12 +506,34 @@ impl RotatableKeyPair {
   /// Deletes the retired key of a committed rotation. Idempotent.
   /// Errors while a rotation is in flight, as its commit may be
   /// writing `<path>.old` right then.
+  ///
+  /// A `<path>.old` holding the key in use is no retired key (see
+  /// [Self::retired]), and follows the rule of
+  /// [begin_rotation][Self::begin_rotation]: removed while the live
+  /// file holds that key too, otherwise kept (with a warning, and
+  /// `Ok`), as it may be the only copy of the key in use on disk (a
+  /// commit whose write failed midway, see [KeyRotation::commit]).
+  /// [Self::rotation_pending] then stays true, and the next commit
+  /// writes the live file again.
   pub fn finish_rotation(&self) -> anyhow::Result<()> {
     let Some(path) = self.path.as_deref() else {
       return Ok(());
     };
     let _rotating = RotationGuard::acquire(&self.rotating)?;
-    remove_file_if_exists(&sibling(path, OLD_SUFFIX))
+    let old_path = sibling(path, OLD_SUFFIX);
+    // Private keys compare without a [PkiKind], as in
+    // [Self::rotation_pending].
+    let holds_key_in_use = |file: &Path| {
+      Pkcs8PrivateKey::from_file(file)
+        .is_ok_and(|key| key == self.keys.load().private)
+    };
+    if holds_key_in_use(&old_path) && !holds_key_in_use(path) {
+      tracing::warn!(
+        "Keeping {old_path:?}: it holds the key in use, which the live key file {path:?} does not (a key rotation whose switch failed), so it may be the only copy on disk. Retry the rotation: its commit writes the live key file again"
+      );
+      return Ok(());
+    }
+    remove_file_if_exists(&old_path)
   }
 }
 
@@ -622,7 +647,9 @@ impl KeyRotation<'_> {
   /// ahead (with a warning). Otherwise nothing switched, and
   /// `<path>.old` is removed again while the live file holds the
   /// previous key (kept when the live file can't be read, as it may
-  /// be the only copy).
+  /// be the only copy: [RotatableKeyPair::begin_rotation] and
+  /// [RotatableKeyPair::finish_rotation] keep it too, until the live
+  /// file holds that key again or a commit switches).
   pub fn commit(self) -> anyhow::Result<()> {
     self.commit_with(|private, live| private.write_pem_sync(live))
   }
