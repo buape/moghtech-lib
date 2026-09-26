@@ -789,18 +789,83 @@ fn truncate_for_log(value: &str) -> String {
   }
 }
 
+/// The issuer and rule of `verified` as they are now, once the
+/// exchange holds the lock of the rule ([lock_workload_user]).
+///
+/// An update or deletion of the issuer holds its lock while the app
+/// stores it and syncs the users of its rules
+/// ([AuthImpl::sync_workload_users]). An exchange which read the rule
+/// before, and waited for it, would otherwise give the user the
+/// access the rule had before the sync (or create the user of a rule
+/// which was removed), and issue a token the update meant to refuse.
+async fn current_rule<I: AuthImpl + ?Sized>(
+  auth: &I,
+  verified: &VerifiedWorkload,
+) -> mogh_error::Result<(TrustedIssuer, WorkloadRule)> {
+  let VerifiedWorkload {
+    issuer: read,
+    rule,
+    claims,
+  } = verified;
+  let Some(issuer) = list_trusted_issuers(auth)
+    .await?
+    .into_iter()
+    .map(|resolved| resolved.issuer)
+    .find(|issuer| issuer.id == read.id && issuer.enabled)
+  else {
+    return Err(invalid_grant(format!(
+      "Trusted issuer '{}' no longer accepts tokens",
+      read.name
+    )));
+  };
+  // The token was verified with what the issuer was.
+  if issuer.issuer != read.issuer
+    || issuer.keys != read.keys
+    || issuer.audiences != read.audiences
+    || issuer.max_token_age_secs != read.max_token_age_secs
+  {
+    return Err(
+      anyhow::anyhow!(
+        "Trusted issuer '{}' changed during the exchange, try again",
+        issuer.name
+      )
+      .status_code(StatusCode::SERVICE_UNAVAILABLE),
+    );
+  }
+  let Some(current) = issuer
+    .rules
+    .iter()
+    .find(|current| current.id == rule.id)
+    .and_then(|current| {
+      match_rule(std::slice::from_ref(current), claims)
+    })
+    .cloned()
+  else {
+    return Err(invalid_grant(format!(
+      "The token no longer matches rule '{}' of '{}'",
+      rule.name, issuer.name
+    )));
+  };
+  check_rule_id(&issuer, &current)?;
+  Ok((issuer, current))
+}
+
 /// Gets the user of the matched rule from the app,
 /// applies the login rules and issues a short lived app token.
 async fn complete_workload<I: AuthImpl + ?Sized>(
   auth: &I,
   ip: IpAddr,
-  VerifiedWorkload {
-    issuer,
-    rule,
-    claims,
-  }: VerifiedWorkload,
+  verified: VerifiedWorkload,
   issued_token_type: &str,
 ) -> mogh_error::Result<ExchangedToken> {
+  // The first exchanges of a rule (a CI matrix starting) would
+  // otherwise all race to create its user, and an update of the
+  // issuer with them.
+  let user_lock =
+    lock_workload_user(&verified.issuer.id, &verified.rule.id).await;
+  let (issuer, rule) = current_rule(auth, &verified).await?;
+  let claims = verified.claims;
+
   // What identifies the workload, for the audit log below.
   let subject = truncate_for_log(
     claims
@@ -822,9 +887,6 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     .collect::<Vec<_>>()
     .join(" ");
 
-  // The first exchanges of a rule (a CI matrix starting) would
-  // otherwise all race to create its user.
-  let user_lock = lock_workload_user(&issuer.id, &rule.id).await;
   let user_id = auth
     .get_or_create_workload_user(WorkloadIdentity {
       issuer_id: issuer.id.clone(),
@@ -847,6 +909,16 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
       )
       .into(),
     );
+  }
+
+  // Disabled with its rule or issuer (AuthImpl::sync_workload_users),
+  // which may have happened after the rule was read here on another
+  // instance of the app. Its tokens are refused as well.
+  if !user.is_enabled() {
+    return Err(invalid_grant(format!(
+      "The user of rule '{}' is disabled",
+      rule.name
+    )));
   }
 
   // Being an admin has to be a decision made on the rule.
@@ -1023,6 +1095,7 @@ mod tests {
     cidr_whitelist: Vec<String>,
     workload: bool,
     admin: bool,
+    disabled: bool,
   }
 
   impl AuthUserImpl for TestUser {
@@ -1050,11 +1123,18 @@ mod tests {
     fn is_admin(&self) -> bool {
       self.admin
     }
+    fn is_enabled(&self) -> bool {
+      !self.disabled
+    }
   }
 
   struct TestAuth {
     providers: Vec<ExternalLoginProvider>,
     issuers: Vec<TrustedIssuer>,
+    /// The issuers stored by the app, which a test can change.
+    stored_issuers: Arc<Mutex<Vec<TrustedIssuer>>>,
+    /// Calls listing the stored issuers.
+    stored_issuer_lists: Arc<AtomicUsize>,
     /// The user the app returns for workloads
     workload_user: TestUser,
     workloads: Arc<Mutex<Vec<WorkloadIdentity>>>,
@@ -1078,6 +1158,8 @@ mod tests {
       TestAuth {
         providers: vec![oidc_provider("oidc", true)],
         issuers: Vec::new(),
+        stored_issuers: Default::default(),
+        stored_issuer_lists: Default::default(),
         workload_user: TestUser {
           workload: true,
           ..Default::default()
@@ -1139,6 +1221,15 @@ mod tests {
 
     fn static_trusted_issuers(&self) -> Vec<TrustedIssuer> {
       self.issuers.clone()
+    }
+
+    fn list_trusted_issuers(
+      &self,
+    ) -> crate::DynFuture<mogh_error::Result<Vec<TrustedIssuer>>>
+    {
+      self.stored_issuer_lists.fetch_add(1, Ordering::SeqCst);
+      let stored = self.stored_issuers.lock().unwrap().clone();
+      Box::pin(async move { Ok(stored) })
     }
 
     fn record_login(
@@ -1785,6 +1876,111 @@ mod tests {
     let token = workload_token(12345, "refs/heads/release/1").mint();
     let err = run(&auth, token).await.unwrap_err();
     assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+  }
+
+  /// Its rule or issuer was disabled (AuthImpl::sync_workload_users),
+  /// eg. on another instance after this one read the rule.
+  #[tokio::test]
+  async fn test_workload_user_must_be_enabled() {
+    let mut auth = workload_auth(vec![deploy_rule()]);
+    auth.workload_user.disabled = true;
+    let token = workload_token(12345, "refs/heads/release/1").mint();
+    let err = run(&auth, token).await.unwrap_err();
+    assert_eq!(token_exchange_error(&err).1.error, "invalid_grant");
+    assert!(auth.logins.lock().unwrap().is_empty());
+  }
+
+  /// An update of the issuer which the app stores and syncs while an
+  /// exchange which read the rule before waits for the rule's lock:
+  /// the exchange goes by the rule as it is after the update. It never
+  /// gives the user the access the rule had before, nor creates the
+  /// user of a rule which is gone, after the update synced the users.
+  #[tokio::test]
+  async fn test_workload_exchange_gets_the_rule_as_updated_meanwhile()
+  {
+    type Change = fn(&mut Vec<TrustedIssuer>);
+    let cases: [(&str, Change, Option<&str>); 7] = [
+      ("rule disabled", |i| i[0].rules[0].enabled = false, None),
+      ("issuer disabled", |i| i[0].enabled = false, None),
+      ("rule removed", |i| i[0].rules.clear(), None),
+      ("issuer deleted", |i| i.clear(), None),
+      (
+        "claims narrowed",
+        |i| {
+          i[0].rules[0].claims[1].pattern = "refs/heads/main".into()
+        },
+        None,
+      ),
+      (
+        // Verified with the old keys / audiences
+        "audience changed",
+        |i| i[0].audiences = vec!["https://other.example.com".into()],
+        Some("temporarily_unavailable"),
+      ),
+      (
+        "demoted",
+        |i| {
+          i[0].rules[0].admin = false;
+          i[0].rules[0].groups = vec!["readers".to_string()];
+        },
+        Some("ok"),
+      ),
+    ];
+    for (n, (case, change, outcome)) in cases.into_iter().enumerate()
+    {
+      let issuer_id = format!("ci-updated-{n}");
+      let mut auth = TestAuth::with_user(None);
+      auth.providers = Vec::new();
+      *auth.stored_issuers.lock().unwrap() = vec![TrustedIssuer {
+        id: issuer_id.clone(),
+        ..trusted_issuer(vec![WorkloadRule {
+          admin: true,
+          ..deploy_rule()
+        }])
+      }];
+      let auth = Arc::new(auth);
+
+      // The update holds the issuer while the app stores and syncs.
+      let update =
+        crate::provider::workload::lock_trusted_issuer(&issuer_id)
+          .await;
+      let exchange = tokio::spawn({
+        let auth = auth.clone();
+        let token =
+          workload_token(12345, "refs/heads/release/1").mint();
+        async move { run(&auth, token).await }
+      });
+      // The exchange read the issuer and matched the rule, and waits.
+      tokio::time::timeout(Duration::from_secs(5), async {
+        while auth.stored_issuer_lists.load(Ordering::SeqCst) == 0 {
+          tokio::task::yield_now().await;
+        }
+      })
+      .await
+      .expect(case);
+      change(&mut auth.stored_issuers.lock().unwrap());
+      drop(update);
+
+      let res = exchange.await.unwrap();
+      let workloads = auth.workloads.lock().unwrap().clone();
+      match outcome {
+        Some("ok") => {
+          res.expect(case);
+          assert_eq!(workloads.len(), 1, "{case}");
+          assert!(!workloads[0].admin, "{case}");
+          assert_eq!(workloads[0].groups, ["readers"], "{case}");
+        }
+        outcome => {
+          let err = res.expect_err(case);
+          assert_eq!(
+            token_exchange_error(&err).1.error,
+            outcome.unwrap_or("invalid_grant"),
+            "{case}"
+          );
+          assert!(workloads.is_empty(), "{case}");
+        }
+      }
+    }
   }
 
   #[tokio::test]

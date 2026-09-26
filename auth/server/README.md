@@ -384,7 +384,11 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
         api_key.as_ref().map(|key| key.hashed_secret.clone()),
       )
       .await?;
+      // ⚠️ The server never checks `expires`, refuse expired keys here
+      // (after the secret check, so the timing is the same). Keep finding
+      // them in `get_api_key_owner_id`, so they can be deleted.
       let api_key = api_key
+        .filter(|key| key.expires == 0 || key.expires > unix_timestamp_ms())
         .context("Invalid client credentials")
         .status_code(StatusCode::UNAUTHORIZED)?;
       Ok(
@@ -398,9 +402,17 @@ impl mogh_auth_server::AuthImpl for AppAuthImpl {
   }
 
   // signing keys: server_private_key, create_signing_key (public keys
-  // unique across all users), get_signing_key, delete_signing_key
+  // unique across all users), get_signing_key (refusing expired keys like
+  // get_api_key), get_signing_key_owner_id (finding them), delete_signing_key
 }
 ```
+
+`CreateApiKey` / `CreateSigningKey` take an `expires` (unix milliseconds, `0`
+for never), which the server passes to `create_api_key` / `create_signing_key`
+and never checks itself: `get_api_key` and `get_signing_key` must refuse an
+expired key with `401 Invalid client credentials`, while `get_api_key_owner_id`
+and `get_signing_key_owner_id` still find it for `DeleteApiKey` /
+`DeleteSigningKey`.
 
 ### Nest the router
 
@@ -493,6 +505,8 @@ admin no longer manages login providers or trusted issuers. A link of an externa
 login they began before being disabled is refused as well, when it is started
 (`/link`) and when the provider's callback would complete it. Refusing them the
 app's own api is `handle_request_authentication`'s `require_user_enabled`.
+The user of a workload rule is disabled along with the rule or its issuer
+(`sync_workload_users`), and can't exchange tokens while it is.
 
 ### App tokens
 
@@ -704,9 +718,10 @@ for (header, value) in signed_request_headers(
 - A public key given to `CreateSigningKey` can be base64 or pem, anything else
   is refused, and so is one already stored (`409 Conflict`). ⚠️ Public keys
   are not secret: store them unique across all users (eg. a unique index),
-  which also covers two requests racing. Implement `get_signing_key_owner_id`
-  if `get_signing_key` rejects keys which should stay deletable (eg. expired
-  ones).
+  which also covers two requests racing.
+- The server never checks a signing key's `expires`: refuse expired keys in
+  `get_signing_key` (`401 Invalid client credentials`), and implement
+  `get_signing_key_owner_id` so they stay deletable.
 - Invalid signatures count against the general rate limiter.
 
 Since 5.0 the body is signed: a hard switch, clients signing the 4.x string
@@ -902,8 +917,25 @@ fn get_or_create_workload_user(
     // they are the full definition of the user.
     set_user_groups(&user.id, identity.groups).await?;
     set_user_admin(&user.id, identity.admin).await?;
+    // Created enabled. Leave `enabled` to `sync_workload_users`.
     // `identity.claims` tell which repository / run / service account it was.
     Ok(user.id)
+  })
+}
+
+/// Called after `update_trusted_issuer` stored an update (and by
+/// `sync_all_workload_users`), with every rule of the issuer.
+fn sync_workload_users(
+  &self,
+  issuer_id: String,
+  rules: Vec<WorkloadAccess>,
+) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
+  Box::pin(async move {
+    // Eg. in one transaction: remove the users of `issuer_id` whose rule
+    // isn't in `rules`, and give the others their rule's groups, admin
+    // and enabled (`false` while the rule or the issuer is disabled, it
+    // overrides the user's own). Rules without a user get none.
+    sync_service_users(&issuer_id, &rules).await.map_err(Into::into)
   })
 }
 ```
@@ -929,10 +961,55 @@ fn get_or_create_workload_user(
   it further: an audience is no restriction on a public platform, where anyone
   can request a token for any audience. This is best effort, `repo:*` still
   matches every repository there.
-- An admin user is only accepted if the rule has `admin` set.
+- An admin user is only accepted if the rule has `admin` set, and a disabled
+  user not at all.
 - The user cidr whitelist applies. Users requiring a second factor are refused.
 - The app token is valid for `token_ttl_secs`, capped at the app default.
 - Every exchange is logged with the issuer, rule, subject and matched claims.
+
+**Changing a rule.** The app token of a workload carries the id of the rule's
+user only, and the user keeps its id as long as the rule does. Saving an issuer
+(`UpdateTrustedIssuer`) syncs the users of its rules (`sync_workload_users`), so
+a change reaches the tokens already issued on their next request:
+
+- Disabling a rule or its issuer disables the user: its tokens are refused by
+  the app's disabled user check (`require_user_enabled`), and it gets no new
+  ones. Enabling it again brings back the same user, and its tokens.
+- Changing a rule's `groups` or `admin` applies to the user right away: a
+  demoted rule's tokens are no admin anymore.
+- Removing a rule, or deleting the issuer, removes the user: its tokens are
+  refused.
+- ⚠️ Narrowing a rule's `claims` only stops new exchanges of the tokens it no
+  longer matches. The app tokens issued before carry no claims, they act as the
+  rule's user like those of the workloads still matching. To cut them off,
+  disable or delete the rule (a new rule has a new user).
+- ⚠️ The synced `enabled` is the state of the rule, and wins over any other way
+  the user was disabled: saving the issuer (or `sync_all_workload_users` at
+  startup) re-enables a workload user an admin disabled directly while its rule
+  and issuer are enabled. Disabling the rule is the way to switch its user off.
+  An app with its own per user switch must refuse it for workload users (the
+  example app does), or store the rule's `enabled` apart from the switch and
+  have `is_enabled` report both. When upgrading an app which had such a switch,
+  disable the rules of the workload users it disabled first.
+
+A failed `sync_workload_users` fails `UpdateTrustedIssuer` after the issuer was
+stored, which is logged (the update, and a warning that its users weren't
+synced). Saving the issuer again syncs again.
+
+Within one instance of the app, exchanges of an issuer wait while it is updated
+or deleted and then read the rule again, so an exchange which read it before
+never gives the user access the update took away, nor creates the user of a
+removed rule. Apps running several instances only get that as far as each one
+sees the change right away (the cache of `list_trusted_issuers`), see
+`get_or_create_workload_user`.
+
+Static issuers can't be updated over the API. Their changes (a restart with
+another configuration) apply to new exchanges, and a rule's `groups` / `admin`
+reach its user at its next exchange. Call
+`mogh_auth_server::provider::workload::sync_all_workload_users` when the app
+starts to apply them to the users right away (disabling and removing the users
+of disabled and removed rules), and remove the users of issuers which aren't
+configured anymore. The example app does both (`example/server`).
 
 ⚠️ **Rate limiting and shared runners.** Failed exchanges count against
 `AuthImpl::general_rate_limiter` by client ip, like failed logins. Hosted CI

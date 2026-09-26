@@ -26,14 +26,17 @@ impl Resolve<LoginArgs> for CompletePasskeyLogin {
     self,
     LoginArgs { auth, session, ip }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
+    // Taken before the rate limit: a session without a passkey login
+    // (or with an expired one) holds nothing to guess, and is refused
+    // without counting against the ip. Only the assertion (and the
+    // user it logs in) counts. A client over the limit loses the
+    // login all the same, and logs in again.
+    let (user_id, state, kind) =
+      session.retrieve_passkey_login().await?;
     async {
       let provider = auth.passkey_provider().context(
         "No passkey provider available, possibly invalid 'host' config.",
       )?;
-
-      let (user_id, state, kind) = session
-        .retrieve_passkey_login()
-        .await?;
 
       // This will error if the incoming passkey is invalid.
       // The result of this call must be used to

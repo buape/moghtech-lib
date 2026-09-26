@@ -48,8 +48,11 @@ pub struct JwtClaims {
   /// that was before the token was issued. Set on tokens issued
   /// for the token of an external provider (token exchange): the
   /// time the provider authenticated the user, see
-  /// [JwtProvider::encode_sub_with_auth_time]. `None` on tokens
-  /// issued by a login, which authenticated the user at `iat`.
+  /// [JwtProvider::encode_sub_with_auth_time]. And on tokens
+  /// redeemed (`ExchangeForJwt`) for an external login: the time of
+  /// the provider's callback. `None` on tokens issued by the other
+  /// logins (a password, a second factor), which authenticated the
+  /// user at `iat`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub auth_time: Option<u64>,
 }
@@ -252,7 +255,9 @@ impl JwtProvider {
   /// long ago, and which can be exchanged again until it expires.
   /// The reauthentication window is measured from `auth_time`
   /// ([JwtClaims::authenticated_at]), so a replayed provider token
-  /// doesn't count as a fresh login. Capped at the issue time.
+  /// doesn't count as a fresh login. Also for an external login
+  /// redeemed after its callback (`ExchangeForJwt`), which counts
+  /// from the callback. Capped at the issue time.
   pub fn encode_sub_with_auth_time(
     &self,
     sub: &str,

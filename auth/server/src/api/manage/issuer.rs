@@ -13,7 +13,7 @@ use mogh_auth_client::{
 };
 use mogh_error::{AddStatusCode as _, AddStatusCodeError as _};
 use mogh_resolver::Resolve;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{
   AuthImpl,
@@ -21,7 +21,8 @@ use crate::{
   provider::{
     external::PROVIDER_ID_LENGTH,
     workload::{
-      evict_verification_keys, list_trusted_issuers, parse_jwks,
+      WorkloadAccess, evict_verification_keys, list_trusted_issuers,
+      lock_trusted_issuer, parse_jwks,
     },
   },
   rand::random_string,
@@ -319,6 +320,14 @@ async fn resolve_managed_issuer<I: AuthImpl + ?Sized>(
   Ok(resolved.issuer)
 }
 
+/// Stores the update, then syncs the users of the rules
+/// ([AuthImpl::sync_workload_users]): rules demoted or disabled, or
+/// of a disabled issuer, reach the tokens already issued. Exchanges
+/// of the issuer wait for both ([lock_trusted_issuer]).
+///
+/// Once stored, the update is audited and the issuer's keys evicted
+/// whether or not the sync succeeds: a failed sync fails the request,
+/// but the new trust configuration is already in effect.
 pub async fn update_issuer<I: AuthImpl + ?Sized>(
   auth: &I,
   user: &dyn AuthUserImpl,
@@ -326,6 +335,7 @@ pub async fn update_issuer<I: AuthImpl + ?Sized>(
 ) -> mogh_error::Result<TrustedIssuerListItem> {
   check_admin(user)?;
 
+  let lock = lock_trusted_issuer(&issuer.id).await;
   let existing = resolve_managed_issuer(auth, &issuer.id).await?;
   let mut issuer = validate_issuer(issuer, Some(&existing))?;
   issuer.id = existing.id;
@@ -341,6 +351,26 @@ pub async fn update_issuer<I: AuthImpl + ?Sized>(
     issuer = issuer.name,
     "Trusted issuer updated"
   );
+
+  if let Err(e) = auth
+    .sync_workload_users(
+      issuer.id.clone(),
+      WorkloadAccess::of_issuer(&issuer),
+    )
+    .await
+  {
+    warn!(
+      admin_id = user.id(),
+      admin = user.username(),
+      issuer_id = issuer.id,
+      issuer = issuer.name,
+      "Trusted issuer was stored, but syncing the users of its rules failed. \
+       They may keep their previous access until it is saved again | {:#}",
+      e.error
+    );
+    return Err(e);
+  }
+  drop(lock);
 
   Ok(TrustedIssuerListItem {
     issuer,
@@ -376,9 +406,12 @@ pub async fn delete_issuer<I: AuthImpl + ?Sized>(
 ) -> mogh_error::Result<()> {
   check_admin(user)?;
 
+  // Exchanges of the issuer wait, and then find it gone.
+  let lock = lock_trusted_issuer(issuer_id).await;
   let issuer = resolve_managed_issuer(auth, issuer_id).await?;
 
   auth.delete_trusted_issuer(issuer.id.clone()).await?;
+  drop(lock);
 
   evict_verification_keys(&issuer.id);
 
@@ -441,10 +474,44 @@ mod tests {
   const ADMIN: TestUser = TestUser { admin: true };
   const USER: TestUser = TestUser { admin: false };
 
+  /// The calls of sync_workload_users.
+  type Synced = Arc<Mutex<Vec<(String, Vec<WorkloadAccess>)>>>;
+
   #[derive(Default)]
   struct TestAuth {
     static_issuers: Vec<TrustedIssuer>,
     stored: Arc<Mutex<Vec<TrustedIssuer>>>,
+    synced: Synced,
+    sync_fails: bool,
+    /// Whether an exchange of the issuer had to wait, for each
+    /// call storing, syncing or deleting it.
+    exchange_waited: Arc<Mutex<Vec<bool>>>,
+  }
+
+  /// Whether an exchange of a rule of the issuer has to wait.
+  async fn exchange_waits(issuer_id: &str) -> bool {
+    tokio::time::timeout(
+      std::time::Duration::from_millis(20),
+      crate::provider::workload::lock_workload_user(
+        issuer_id, "rule",
+      ),
+    )
+    .await
+    .is_err()
+  }
+
+  impl TestAuth {
+    fn record_exchange_waits(
+      &self,
+      issuer_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      let waited = self.exchange_waited.clone();
+      Box::pin(async move {
+        let waits = exchange_waits(&issuer_id).await;
+        waited.lock().unwrap().push(waits);
+        Ok(())
+      })
+    }
   }
 
   impl AuthImpl for TestAuth {
@@ -476,11 +543,26 @@ mod tests {
       &self,
       issuer: TrustedIssuer,
     ) -> crate::DynFuture<mogh_error::Result<()>> {
+      let id = issuer.id.clone();
       let mut stored = self.stored.lock().unwrap();
       let existing =
         stored.iter_mut().find(|i| i.id == issuer.id).unwrap();
       *existing = issuer;
-      Box::pin(async { Ok(()) })
+      self.record_exchange_waits(id)
+    }
+
+    fn sync_workload_users(
+      &self,
+      issuer_id: String,
+      rules: Vec<WorkloadAccess>,
+    ) -> crate::DynFuture<mogh_error::Result<()>> {
+      if self.sync_fails {
+        return Box::pin(async {
+          Err(anyhow!("sync failed").into())
+        });
+      }
+      self.synced.lock().unwrap().push((issuer_id.clone(), rules));
+      self.record_exchange_waits(issuer_id)
     }
 
     fn delete_trusted_issuer(
@@ -488,7 +570,7 @@ mod tests {
       id: String,
     ) -> crate::DynFuture<mogh_error::Result<()>> {
       self.stored.lock().unwrap().retain(|i| i.id != id);
-      Box::pin(async { Ok(()) })
+      self.record_exchange_waits(id)
     }
 
     fn get_user(
@@ -787,6 +869,280 @@ mod tests {
     let err =
       delete_issuer(&auth, &ADMIN, "unknown").await.unwrap_err();
     assert_eq!(err.status, StatusCode::NOT_FOUND);
+  }
+
+  /// The rules kept by an update keep their user, which gets what
+  /// the rule says now right away: tokens issued before carry only
+  /// the user id, and would keep the old access otherwise.
+  #[tokio::test]
+  async fn test_update_syncs_the_users_of_the_rules() {
+    let auth = TestAuth::default();
+    let admin_rule = WorkloadRule {
+      admin: true,
+      ..rule("", "Infra")
+    };
+    let created = create_issuer(
+      &auth,
+      &ADMIN,
+      issuer(vec![admin_rule, rule("", "Deploy"), rule("", "Docs")]),
+    )
+    .await
+    .unwrap()
+    .issuer;
+    // A new issuer's rules have no users yet.
+    assert!(auth.synced.lock().unwrap().is_empty());
+    let [infra, deploy, docs] =
+      [0, 1, 2].map(|i| created.rules[i].clone());
+
+    // Demote Infra, disable Deploy, drop Docs, add one.
+    let mut update = created.clone();
+    update.rules = vec![
+      WorkloadRule {
+        admin: false,
+        groups: vec!["readers".into()],
+        ..infra.clone()
+      },
+      WorkloadRule {
+        enabled: false,
+        ..deploy.clone()
+      },
+      rule("", "New"),
+    ];
+    let updated =
+      update_issuer(&auth, &ADMIN, update).await.unwrap().issuer;
+    let access = |rule_id: &str, groups: &[&str], admin, enabled| {
+      WorkloadAccess {
+        rule_id: rule_id.to_string(),
+        groups: groups.iter().map(|g| g.to_string()).collect(),
+        admin,
+        enabled,
+      }
+    };
+    let synced = auth.synced.lock().unwrap().clone();
+    assert_eq!(
+      synced,
+      [(
+        created.id.clone(),
+        vec![
+          access(&infra.id, &["readers"], false, true),
+          access(&deploy.id, &["deployers"], false, false),
+          access(&updated.rules[2].id, &["deployers"], false, true),
+        ]
+      )]
+    );
+    // Docs isn't among them, so its user is removed.
+    assert!(
+      synced[0].1.iter().all(|access| access.rule_id != docs.id)
+    );
+
+    // Disabling the issuer disables every rule's user,
+    // enabling it again brings them back.
+    for enabled in [false, true] {
+      let update = TrustedIssuer {
+        enabled,
+        ..updated.clone()
+      };
+      update_issuer(&auth, &ADMIN, update).await.unwrap();
+      let synced = auth.synced.lock().unwrap().pop().unwrap().1;
+      assert_eq!(
+        synced.iter().map(|a| a.enabled).collect::<Vec<_>>(),
+        [enabled, false, enabled]
+      );
+    }
+  }
+
+  /// An event logged with an `issuer_id`.
+  #[derive(Clone, Debug)]
+  struct IssuerEvent {
+    level: tracing::Level,
+    issuer_id: String,
+    message: String,
+  }
+
+  /// Records the events logged with an `issuer_id`, by every test.
+  #[derive(Clone, Default)]
+  struct Events(Arc<Mutex<Vec<IssuerEvent>>>);
+
+  impl Events {
+    /// The events logged about the issuer. The subscriber is the
+    /// global default: callsites which other tests register while a
+    /// scoped one is set only ask theirs, and would stay off.
+    fn of_issuer(issuer_id: &str) -> Vec<IssuerEvent> {
+      static EVENTS: std::sync::OnceLock<Events> =
+        std::sync::OnceLock::new();
+      let events = EVENTS.get_or_init(|| {
+        let events = Events::default();
+        tracing::subscriber::set_global_default(events.clone())
+          .expect("no other global subscriber in the tests");
+        // Those registered by others while it was set.
+        tracing::callsite::rebuild_interest_cache();
+        events
+      });
+      events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.issuer_id == issuer_id)
+        .cloned()
+        .collect()
+    }
+  }
+
+  impl tracing::Subscriber for Events {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+      true
+    }
+    fn new_span(
+      &self,
+      _: &tracing::span::Attributes<'_>,
+    ) -> tracing::span::Id {
+      tracing::span::Id::from_u64(1)
+    }
+    fn record(
+      &self,
+      _: &tracing::span::Id,
+      _: &tracing::span::Record<'_>,
+    ) {
+    }
+    fn record_follows_from(
+      &self,
+      _: &tracing::span::Id,
+      _: &tracing::span::Id,
+    ) {
+    }
+    fn event(&self, event: &tracing::Event<'_>) {
+      #[derive(Default)]
+      struct Fields {
+        issuer_id: Option<String>,
+        message: String,
+      }
+      impl tracing::field::Visit for Fields {
+        fn record_str(
+          &mut self,
+          field: &tracing::field::Field,
+          value: &str,
+        ) {
+          if field.name() == "issuer_id" {
+            self.issuer_id = Some(value.to_string());
+          }
+        }
+        fn record_debug(
+          &mut self,
+          field: &tracing::field::Field,
+          value: &dyn std::fmt::Debug,
+        ) {
+          if field.name() == "message" {
+            self.message = format!("{value:?}");
+          }
+        }
+      }
+      let mut fields = Fields::default();
+      event.record(&mut fields);
+      let Some(issuer_id) = fields.issuer_id else {
+        return;
+      };
+      self.0.lock().unwrap().push(IssuerEvent {
+        level: *event.metadata().level(),
+        issuer_id,
+        message: fields.message,
+      });
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+  }
+
+  /// A failed sync fails the request, but the update is stored and
+  /// in effect: it is audited, and the old keys are evicted.
+  #[tokio::test]
+  async fn test_failed_sync_fails_the_update() {
+    use crate::provider::workload::load_verification_keys;
+
+    Events::of_issuer("");
+    let mut auth = TestAuth::default();
+    let created = create_issuer(
+      &auth,
+      &ADMIN,
+      TrustedIssuer {
+        keys: TrustedIssuerKeys::Static(jwks_json()),
+        ..issuer(vec![rule("", "Deploy")])
+      },
+    )
+    .await
+    .unwrap()
+    .issuer;
+    let keys = load_verification_keys(&created).await.unwrap();
+    auth.sync_fails = true;
+
+    let err = update_issuer(&auth, &ADMIN, created.clone())
+      .await
+      .unwrap_err();
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = Events::of_issuer(&created.id);
+    assert!(
+      events.iter().any(|event| {
+        event.level == tracing::Level::INFO
+          && event.message == "Trusted issuer updated"
+      }),
+      "{events:?}"
+    );
+    assert!(
+      events.iter().any(|event| {
+        event.level == tracing::Level::WARN
+          && event
+            .message
+            .contains("syncing the users of its rules failed")
+          && event.message.contains("sync failed")
+      }),
+      "{events:?}"
+    );
+    let reloaded = load_verification_keys(&created).await.unwrap();
+    assert!(!Arc::ptr_eq(&keys, &reloaded));
+  }
+
+  /// Exchanges of the issuer's rules wait while the app stores an
+  /// update and syncs the users, or deletes the issuer.
+  #[tokio::test]
+  async fn test_exchanges_wait_for_updates_and_deletion() {
+    let auth = TestAuth::default();
+    let created =
+      create_issuer(&auth, &ADMIN, issuer(vec![rule("", "Deploy")]))
+        .await
+        .unwrap()
+        .issuer;
+    update_issuer(&auth, &ADMIN, created.clone()).await.unwrap();
+    delete_issuer(&auth, &ADMIN, &created.id).await.unwrap();
+    // Store, sync, delete
+    assert_eq!(*auth.exchange_waited.lock().unwrap(), [true; 3]);
+    // And not after.
+    assert!(!exchange_waits(&created.id).await);
+  }
+
+  #[test]
+  fn test_workload_access_of_static_rules_without_usable_ids() {
+    let mut static_issuer = issuer(vec![
+      rule("deploy", "Deploy"),
+      rule("", "No id"),
+      rule("invalid id", "Invalid id"),
+      WorkloadRule {
+        admin: true,
+        ..rule("shared", "Shared")
+      },
+      WorkloadRule {
+        admin: true,
+        ..rule("shared", "Shared again")
+      },
+    ]);
+    static_issuer.id = "static".to_string();
+    let access = WorkloadAccess::of_issuer(&static_issuer);
+    assert_eq!(access.len(), 2);
+    assert_eq!(access[0].rule_id, "deploy");
+    assert!(access[0].enabled);
+    // Their exchanges are refused, and so is their user.
+    assert_eq!(access[1].rule_id, "shared");
+    assert!(!access[1].enabled && !access[1].admin);
+    assert!(access[1].groups.is_empty());
   }
 
   #[tokio::test]

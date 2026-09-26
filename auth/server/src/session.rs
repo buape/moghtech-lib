@@ -36,7 +36,30 @@ impl Session {
   // = LOGIN =
   // =========
 
-  const AUTHENTICATED_USER_ID: &str = "authenticated-user-id";
+  // Stored with when the login completed. The key is not the one of
+  // the earlier format (the user id alone), which then reads as not
+  // initiated.
+  const AUTHENTICATED_USER: &str = "authenticated-user-at";
+
+  /// How long an external login which completed at the provider's
+  /// callback (without a second factor) can be exchanged for a JWT
+  /// (`ExchangeForJwt`) for. The app redeems it as soon as the
+  /// callback's redirect lands, an older one is refused and the
+  /// user logs in again.
+  ///
+  /// Whoever holds the cookie can keep the session alive (starting
+  /// another login saves it), so the completed login is not tied to
+  /// the session's expiry: this bounds how long it outlives an
+  /// unlink of the external login, or the provider being disabled.
+  /// The JWT it is exchanged for counts as a login from the
+  /// callback, not the exchange (see
+  /// [CompletedLogin::authenticated_at]). An external login which
+  /// continues with a second factor is not stored here: the second
+  /// factor completes it, within
+  /// [Self::MAX_SECOND_FACTOR_LOGIN_AGE], and its JWT counts from
+  /// then.
+  pub const MAX_COMPLETED_LOGIN_AGE: Duration =
+    Duration::from_secs(2 * 60);
 
   pub fn id(&self) -> Option<tower_sessions::session::Id> {
     self.0.id()
@@ -82,27 +105,57 @@ impl Session {
       .context("Internal session type error")
   }
 
+  /// Stores the external login of the user, completed now at the
+  /// provider's callback, to be exchanged for a JWT
+  /// ([Self::retrieve_authenticated_user_id]). Cycles the session id
+  /// first, like the first factor of a login which continues with a
+  /// second factor.
   pub async fn insert_authenticated_user_id(
     &self,
     user_id: &str,
   ) -> mogh_error::Result<()> {
+    self
+      .insert_authenticated_user(user_id, unix_timestamp_secs())
+      .await
+  }
+
+  /// [Self::insert_authenticated_user_id] completed at
+  /// `authenticated_at` (unix seconds).
+  pub(crate) async fn insert_authenticated_user(
+    &self,
+    user_id: &str,
+    authenticated_at: u64,
+  ) -> mogh_error::Result<()> {
     self.cycle_id().await?;
     self
       .0
-      .insert(Self::AUTHENTICATED_USER_ID, user_id)
+      .insert(Self::AUTHENTICATED_USER, (user_id, authenticated_at))
       .await
       .context("Failed to serialize session data")
       .map_err(Into::into)
   }
 
+  /// Takes the login completed on the session, it can only be
+  /// exchanged for a JWT once. One older than
+  /// [Self::MAX_COMPLETED_LOGIN_AGE] is refused (and taken all the
+  /// same). Without one, the session is left unmodified (see
+  /// [Self::take]).
   pub async fn retrieve_authenticated_user_id(
     &self,
-  ) -> mogh_error::Result<String> {
-    self
-      .take(Self::AUTHENTICATED_USER_ID)
+  ) -> mogh_error::Result<CompletedLogin> {
+    let (user_id, authenticated_at) = self
+      .take::<(String, u64)>(Self::AUTHENTICATED_USER)
       .await?
       .context("Authentication steps must be completed before JWT can be retrieved")
-      .status_code(StatusCode::UNAUTHORIZED)
+      .status_code(StatusCode::UNAUTHORIZED)?;
+    check_completed_login_age(
+      authenticated_at,
+      unix_timestamp_secs(),
+    )?;
+    Ok(CompletedLogin {
+      user_id,
+      authenticated_at,
+    })
   }
 
   const EXTERNAL_LOGIN: &str = "external-login";
@@ -523,6 +576,19 @@ impl Session {
   }
 }
 
+/// A login completed on the session, see
+/// [Session::retrieve_authenticated_user_id].
+#[derive(Debug, PartialEq)]
+pub struct CompletedLogin {
+  /// The user who logged in.
+  pub user_id: String,
+  /// When the login completed (the provider's callback), unix
+  /// seconds. The JWT it is exchanged for counts as a login from
+  /// then ([JwtClaims::authenticated_at][crate::provider::jwt::JwtClaims::authenticated_at]),
+  /// not from the exchange.
+  pub authenticated_at: u64,
+}
+
 /// A link begun on the session, see [Session::retrieve_external_link].
 pub struct ExternalLink {
   /// The user who began the link.
@@ -563,7 +629,34 @@ fn check_second_factor_login_age(
   begun_at: u64,
   now: u64,
 ) -> mogh_error::Result<()> {
-  if is_within(begun_at, now, Session::MAX_SECOND_FACTOR_LOGIN_AGE) {
+  check_login_age(begun_at, now, Session::MAX_SECOND_FACTOR_LOGIN_AGE)
+}
+
+/// Refuses the exchange of a login which completed
+/// `authenticated_at`, more than [Session::MAX_COMPLETED_LOGIN_AGE]
+/// before `now` (unix seconds). One completed in the future (the
+/// clock of the instance which completed it runs ahead) is as good
+/// as new.
+fn check_completed_login_age(
+  authenticated_at: u64,
+  now: u64,
+) -> mogh_error::Result<()> {
+  check_login_age(
+    authenticated_at,
+    now,
+    Session::MAX_COMPLETED_LOGIN_AGE,
+  )
+}
+
+/// The refusal of a login step more than `max_age` after the
+/// login `begun_at`. The message is the one clients recognize to
+/// start the login over.
+fn check_login_age(
+  begun_at: u64,
+  now: u64,
+  max_age: Duration,
+) -> mogh_error::Result<()> {
+  if is_within(begun_at, now, max_age) {
     return Ok(());
   }
   Err(
@@ -828,6 +921,95 @@ mod tests {
       session.retrieve_passkey_login().await.unwrap();
     assert_eq!(user_id, "user-1");
     assert_eq!(kind, provider);
+  }
+
+  /// A login completed at the provider's callback is exchanged for a
+  /// JWT once, with when it completed. One completed longer than
+  /// [Session::MAX_COMPLETED_LOGIN_AGE] ago is refused, and removed:
+  /// however the session was kept alive, the user logs in again.
+  #[tokio::test]
+  async fn test_completed_login_expires() {
+    let session = session();
+    let before = unix_timestamp_secs();
+    session
+      .insert_authenticated_user_id("user-1")
+      .await
+      .unwrap();
+    let login =
+      session.retrieve_authenticated_user_id().await.unwrap();
+    assert_eq!(login.user_id, "user-1");
+    assert!(
+      (before..=unix_timestamp_secs())
+        .contains(&login.authenticated_at)
+    );
+    // Taken, it can only be exchanged once.
+    let err =
+      session.retrieve_authenticated_user_id().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+    let max_age = Session::MAX_COMPLETED_LOGIN_AGE.as_secs();
+    let expired = unix_timestamp_secs() - max_age - 30;
+    session
+      .insert_authenticated_user("user-1", expired)
+      .await
+      .unwrap();
+    let err =
+      session.retrieve_authenticated_user_id().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("Login has expired"));
+    // Removed all the same.
+    let err =
+      session.retrieve_authenticated_user_id().await.unwrap_err();
+    assert!(format!("{:#}", err.error).contains("must be completed"));
+
+    // A recent one keeps the time it completed.
+    let recent = unix_timestamp_secs() - max_age + 30;
+    session
+      .insert_authenticated_user("user-1", recent)
+      .await
+      .unwrap();
+    assert_eq!(
+      session.retrieve_authenticated_user_id().await.unwrap(),
+      CompletedLogin {
+        user_id: "user-1".into(),
+        authenticated_at: recent,
+      }
+    );
+  }
+
+  #[test]
+  fn test_check_completed_login_age() {
+    let max_age = Session::MAX_COMPLETED_LOGIN_AGE.as_secs();
+    // Short: the app redeems it right after the callback.
+    assert!(
+      max_age <= Session::MAX_SECOND_FACTOR_LOGIN_AGE.as_secs()
+    );
+    let now = 1_000_000;
+    for completed in [now, now - max_age, now + 30, u64::MAX] {
+      check_completed_login_age(completed, now).unwrap();
+    }
+    for completed in [now - max_age - 1, 0] {
+      let err =
+        check_completed_login_age(completed, now).unwrap_err();
+      assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+  }
+
+  /// A completed login stored by an earlier version (the user id
+  /// alone, without when it completed) reads as not initiated,
+  /// rather than being exchanged as a fresh login.
+  #[tokio::test]
+  async fn test_completed_login_of_earlier_format_is_not_initiated() {
+    let session = session();
+    session
+      .0
+      .insert("authenticated-user-id", "user-1")
+      .await
+      .unwrap();
+    let err =
+      session.retrieve_authenticated_user_id().await.unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(format!("{:#}", err.error).contains("must be completed"));
   }
 
   #[test]

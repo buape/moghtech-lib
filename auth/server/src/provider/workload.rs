@@ -4,7 +4,7 @@
 
 use std::{
   collections::HashMap,
-  hash::{DefaultHasher, Hash as _, Hasher as _},
+  hash::{DefaultHasher, Hash, Hasher as _},
   sync::{Arc, Mutex, OnceLock},
   time::Duration,
 };
@@ -305,30 +305,39 @@ pub fn evict_verification_keys(issuer_id: &str) {
   keys_cache().evict(issuer_id);
 }
 
-// ==============
-// = USER LOCKS =
-// ==============
+// =========
+// = LOCKS =
+// =========
 
-type UserLocks =
-  Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+type Locks<K, L> = Mutex<HashMap<K, Arc<L>>>;
+type RuleLock = tokio::sync::Mutex<()>;
+type IssuerLock = tokio::sync::RwLock<()>;
 
 /// One lock per (issuer id, rule id) with a caller.
-fn user_locks() -> &'static UserLocks {
-  static LOCKS: OnceLock<UserLocks> = OnceLock::new();
+fn rule_locks() -> &'static Locks<(String, String), RuleLock> {
+  static LOCKS: OnceLock<Locks<(String, String), RuleLock>> =
+    OnceLock::new();
   LOCKS.get_or_init(Default::default)
 }
 
-/// Held while the app gets or creates the user of a rule, see
-/// [lock_workload_user]. Releases the lock when dropped.
-pub struct WorkloadUserLock {
-  key: (String, String),
-  guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+/// One lock per issuer id with a caller.
+fn issuer_locks() -> &'static Locks<String, IssuerLock> {
+  static LOCKS: OnceLock<Locks<String, IssuerLock>> = OnceLock::new();
+  LOCKS.get_or_init(Default::default)
 }
 
-impl Drop for WorkloadUserLock {
+/// The lock of `key` in `locks`, held until dropped. The last one
+/// released takes the lock out of the map.
+struct Held<K: Eq + Hash + 'static, L: 'static, G> {
+  locks: &'static Locks<K, L>,
+  key: K,
+  guard: Option<G>,
+}
+
+impl<K: Eq + Hash + 'static, L: 'static, G> Drop for Held<K, L, G> {
   fn drop(&mut self) {
     let mut locks =
-      user_locks().lock().unwrap_or_else(|e| e.into_inner());
+      self.locks.lock().unwrap_or_else(|e| e.into_inner());
     drop(self.guard.take());
     // Waiting callers hold a clone, which is only taken with the
     // map locked: nobody but the map holding it means nobody waits.
@@ -341,11 +350,53 @@ impl Drop for WorkloadUserLock {
   }
 }
 
+async fn hold<K, L, G, F>(
+  locks: &'static Locks<K, L>,
+  key: K,
+  lock: impl FnOnce(Arc<L>) -> F,
+) -> Held<K, L, G>
+where
+  K: Eq + Hash + Clone + 'static,
+  L: Default + 'static,
+  F: Future<Output = G>,
+{
+  let shared = locks
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .entry(key.clone())
+    .or_default()
+    .clone();
+  let guard = lock(shared).await;
+  Held {
+    locks,
+    key,
+    guard: Some(guard),
+  }
+}
+
+/// Held while the app gets or creates the user of a rule, see
+/// [lock_workload_user]. Releases the locks when dropped.
+pub struct WorkloadUserLock {
+  // Released in this order: the rule, then the issuer.
+  _rule: Held<
+    (String, String),
+    RuleLock,
+    tokio::sync::OwnedMutexGuard<()>,
+  >,
+  _issuer:
+    Held<String, IssuerLock, tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
 /// Serializes the exchanges of one rule (`issuer_id`, `rule_id`)
 /// around [AuthImpl::get_or_create_workload_user]. A CI matrix starts
 /// many jobs at once, and without this all their first exchanges ask
 /// the app for a user which doesn't exist yet at the same moment,
 /// racing to create it. Exchanges of other rules don't wait.
+///
+/// It also waits for, and holds off, changes to the issuer
+/// ([lock_trusted_issuer]): an exchange which reads the rule again
+/// once it holds this never gives the user the access the rule had
+/// before an update the app finished storing and syncing.
 ///
 /// This only covers one instance of the app: apps running several
 /// still need a get or create which is safe under concurrency.
@@ -353,18 +404,146 @@ pub async fn lock_workload_user(
   issuer_id: &str,
   rule_id: &str,
 ) -> WorkloadUserLock {
-  let key = (issuer_id.to_string(), rule_id.to_string());
-  let lock = user_locks()
-    .lock()
-    .unwrap_or_else(|e| e.into_inner())
-    .entry(key.clone())
-    .or_default()
-    .clone();
-  let guard = lock.lock_owned().await;
+  let issuer = hold(issuer_locks(), issuer_id.to_string(), |lock| {
+    lock.read_owned()
+  })
+  .await;
+  let rule = hold(
+    rule_locks(),
+    (issuer_id.to_string(), rule_id.to_string()),
+    |lock| lock.lock_owned(),
+  )
+  .await;
   WorkloadUserLock {
-    key,
-    guard: Some(guard),
+    _rule: rule,
+    _issuer: issuer,
   }
+}
+
+/// Held while a trusted issuer is changed, see [lock_trusted_issuer].
+/// Releases the lock when dropped.
+pub struct TrustedIssuerLock {
+  _issuer:
+    Held<String, IssuerLock, tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+/// Waits until no exchange of the issuer is getting the user of one
+/// of its rules ([lock_workload_user]), and holds them off until
+/// dropped. The management API holds it while the app stores an
+/// update of the issuer and syncs the users of its rules
+/// ([AuthImpl::sync_workload_users]), or deletes it.
+///
+/// This only covers one instance of the app.
+pub async fn lock_trusted_issuer(
+  issuer_id: &str,
+) -> TrustedIssuerLock {
+  TrustedIssuerLock {
+    _issuer: hold(issuer_locks(), issuer_id.to_string(), |lock| {
+      lock.write_owned()
+    })
+    .await,
+  }
+}
+
+// ==========
+// = ACCESS =
+// ==========
+
+/// What the user of a [WorkloadRule] can do, as the rule and its
+/// [TrustedIssuer] say now. [AuthImpl::sync_workload_users] applies
+/// it to the user of the rule (`issuer_id`, `rule_id`), if it has
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WorkloadAccess {
+  /// The id of the rule.
+  pub rule_id: String,
+  /// The app groups of the user. This is the full
+  /// list: groups not on it should be removed from the user.
+  pub groups: Vec<String>,
+  /// Whether the user is an admin.
+  pub admin: bool,
+  /// Whether the user is enabled
+  /// ([AuthUserImpl::is_enabled][crate::user::AuthUserImpl::is_enabled]):
+  /// the rule and its issuer both are. The tokens a disabled user got
+  /// before are refused by the app's disabled user check
+  /// (`require_user_enabled`), and it can't exchange tokens.
+  ///
+  /// ⚠️ It is the state of the rule, and `true` re-enables a user
+  /// which was disabled any other way, see
+  /// [AuthImpl::sync_workload_users].
+  pub enabled: bool,
+}
+
+impl WorkloadAccess {
+  /// The access of every rule of `issuer`, the rules
+  /// [AuthImpl::sync_workload_users] is called with.
+  ///
+  /// Rules the exchange refuses for their id (static issuers only:
+  /// ids of stored issuers are generated) have no usable user: one
+  /// without a valid id is left out, so the sync removes any user
+  /// with it, and rules sharing an id get one disabled entry, without
+  /// groups or admin.
+  pub fn of_issuer(issuer: &TrustedIssuer) -> Vec<WorkloadAccess> {
+    let mut access = Vec::<WorkloadAccess>::new();
+    for rule in &issuer.rules {
+      if validate_provider_id(&rule.id).is_err() {
+        continue;
+      }
+      if let Some(shared) =
+        access.iter_mut().find(|access| access.rule_id == rule.id)
+      {
+        shared.groups.clear();
+        shared.admin = false;
+        shared.enabled = false;
+        continue;
+      }
+      access.push(WorkloadAccess {
+        rule_id: rule.id.clone(),
+        groups: rule.groups.clone(),
+        admin: rule.admin,
+        enabled: issuer.enabled && rule.enabled,
+      });
+    }
+    access
+  }
+}
+
+/// Applies the rules of every trusted issuer, static and stored, to
+/// their users with [AuthImpl::sync_workload_users].
+///
+/// Call it when the app starts. Static issuers
+/// ([AuthImpl::static_trusted_issuers]) are never updated over the
+/// API, so this is how a change to their configuration reaches the
+/// users of their rules: a rule disabled or removed there, or given
+/// other groups or admin status (which the rule's next exchange
+/// would apply as well). Stored issuers are synced on every update
+/// already: including them brings users in line which were stored
+/// before, eg. by an earlier version.
+///
+/// The users of an issuer removed from the configuration aren't
+/// seen here: the app has to remove them (users of issuer ids it
+/// doesn't know anymore).
+///
+/// ⚠️ It enables the users of every enabled rule of an enabled
+/// issuer, also those an admin disabled directly: when upgrading an
+/// app which let admins disable workload users, disable their rules
+/// before the first start.
+pub async fn sync_all_workload_users<I: AuthImpl + ?Sized>(
+  auth: &I,
+) -> mogh_error::Result<()> {
+  for ResolvedIssuer { issuer, .. } in
+    list_trusted_issuers(auth).await?
+  {
+    let _lock = lock_trusted_issuer(&issuer.id).await;
+    auth
+      .sync_workload_users(
+        issuer.id.clone(),
+        WorkloadAccess::of_issuer(&issuer),
+      )
+      .await?;
+  }
+  Ok(())
 }
 
 // ==============
@@ -872,7 +1051,7 @@ mod tests {
     assert_eq!(max_holders.load(Ordering::SeqCst), 1);
 
     let held = |rule: &str| {
-      user_locks()
+      rule_locks()
         .lock()
         .unwrap()
         .contains_key(&("lock-test".to_string(), rule.to_string()))
@@ -899,6 +1078,195 @@ mod tests {
     assert!(next.is_ok());
     drop(next);
     assert!(!held("cancelled"));
+    assert!(
+      !issuer_locks().lock().unwrap().contains_key("lock-test")
+    );
+  }
+
+  /// A change of the issuer waits for the exchanges getting a user of
+  /// one of its rules, and they wait for it. Other issuers don't.
+  #[tokio::test]
+  async fn test_trusted_issuer_lock() {
+    let waits = |issuer: &'static str, rule: &'static str| async move {
+      tokio::time::timeout(
+        Duration::from_millis(20),
+        lock_workload_user(issuer, rule),
+      )
+      .await
+      .is_err()
+    };
+
+    let exchange = lock_workload_user("issuer-lock-test", "a").await;
+    let update =
+      tokio::spawn(lock_trusted_issuer("issuer-lock-test"));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!update.is_finished());
+    drop(exchange);
+    let update = tokio::time::timeout(Duration::from_secs(5), update)
+      .await
+      .expect("the update gets the issuer")
+      .unwrap();
+    // Every rule of the issuer waits, another issuer doesn't.
+    assert!(waits("issuer-lock-test", "a").await);
+    assert!(waits("issuer-lock-test", "b").await);
+    assert!(!waits("issuer-lock-test-other", "a").await);
+    drop(update);
+    assert!(!waits("issuer-lock-test", "a").await);
+    assert!(
+      !issuer_locks()
+        .lock()
+        .unwrap()
+        .contains_key("issuer-lock-test")
+    );
+  }
+
+  fn issuer_with(
+    id: &str,
+    enabled: bool,
+    rules: Vec<WorkloadRule>,
+  ) -> TrustedIssuer {
+    TrustedIssuer {
+      id: id.to_string(),
+      name: id.to_string(),
+      enabled,
+      issuer: "https://issuer.example.com".to_string(),
+      keys: TrustedIssuerKeys::Discovery {},
+      audiences: vec!["app".to_string()],
+      max_token_age_secs: 0,
+      rules,
+    }
+  }
+
+  #[test]
+  fn test_workload_access_of_issuer() {
+    let mut issuer = issuer_with(
+      "access-test",
+      true,
+      vec![
+        WorkloadRule {
+          groups: vec!["deployers".to_string()],
+          admin: true,
+          ..rule("a", &[("sub", "a")])
+        },
+        WorkloadRule {
+          enabled: false,
+          ..rule("b", &[("sub", "b")])
+        },
+      ],
+    );
+    let access = WorkloadAccess::of_issuer(&issuer);
+    assert_eq!(
+      access,
+      [
+        WorkloadAccess {
+          rule_id: "a".to_string(),
+          groups: vec!["deployers".to_string()],
+          admin: true,
+          enabled: true,
+        },
+        WorkloadAccess {
+          rule_id: "b".to_string(),
+          groups: Vec::new(),
+          admin: false,
+          enabled: false,
+        },
+      ]
+    );
+    issuer.enabled = false;
+    assert!(
+      WorkloadAccess::of_issuer(&issuer)
+        .iter()
+        .all(|access| !access.enabled)
+    );
+  }
+
+  /// Static issuers are only synced when the app asks for it.
+  #[tokio::test]
+  async fn test_sync_all_workload_users() {
+    #[derive(Default)]
+    struct TestAuth {
+      synced: Mutex<Vec<(String, Vec<WorkloadAccess>)>>,
+    }
+    impl AuthImpl for TestAuth {
+      fn new() -> Self {
+        Self::default()
+      }
+      fn static_trusted_issuers(&self) -> Vec<TrustedIssuer> {
+        vec![issuer_with(
+          "static",
+          true,
+          vec![WorkloadRule {
+            enabled: false,
+            ..rule("disabled", &[("sub", "a")])
+          }],
+        )]
+      }
+      fn list_trusted_issuers(
+        &self,
+      ) -> crate::DynFuture<mogh_error::Result<Vec<TrustedIssuer>>>
+      {
+        let stored = vec![
+          issuer_with(
+            "stored",
+            true,
+            vec![rule("deploy", &[("sub", "b")])],
+          ),
+          // The static one wins.
+          issuer_with("static", true, Vec::new()),
+        ];
+        Box::pin(async move { Ok(stored) })
+      }
+      fn sync_workload_users(
+        &self,
+        issuer_id: String,
+        rules: Vec<WorkloadAccess>,
+      ) -> crate::DynFuture<mogh_error::Result<()>> {
+        self.synced.lock().unwrap().push((issuer_id, rules));
+        Box::pin(async { Ok(()) })
+      }
+      fn get_user(
+        &self,
+        _user_id: String,
+      ) -> crate::DynFuture<
+        mogh_error::Result<crate::user::BoxAuthUser>,
+      > {
+        unreachable!()
+      }
+      fn handle_request_authentication(
+        &self,
+        _auth: crate::RequestAuthentication,
+        _ip: std::net::IpAddr,
+        _require_user_enabled: bool,
+        _req: axum::extract::Request,
+      ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+      {
+        unreachable!()
+      }
+      fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+        unreachable!()
+      }
+    }
+
+    let auth = TestAuth::default();
+    sync_all_workload_users(&auth).await.unwrap();
+    let synced = auth.synced.into_inner().unwrap();
+    let synced = synced
+      .iter()
+      .map(|(issuer, rules)| {
+        let rules = rules
+          .iter()
+          .map(|access| (access.rule_id.as_str(), access.enabled))
+          .collect::<Vec<_>>();
+        (issuer.as_str(), rules)
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(
+      synced,
+      [
+        ("static", vec![("disabled", false)]),
+        ("stored", vec![("deploy", true)]),
+      ]
+    );
   }
 
   #[test]

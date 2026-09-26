@@ -1168,7 +1168,11 @@ mod tests {
       );
     }
     assert_eq!(
-      session.retrieve_authenticated_user_id().await.unwrap(),
+      session
+        .retrieve_authenticated_user_id()
+        .await
+        .unwrap()
+        .user_id,
       "existing-user"
     );
   }
@@ -1187,7 +1191,11 @@ mod tests {
 
     assert_eq!(auth.calls.lock().unwrap().signed_up, ["octocat"]);
     assert_eq!(
-      session.retrieve_authenticated_user_id().await.unwrap(),
+      session
+        .retrieve_authenticated_user_id()
+        .await
+        .unwrap()
+        .user_id,
       "new-user"
     );
   }

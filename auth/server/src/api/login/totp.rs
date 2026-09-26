@@ -307,8 +307,13 @@ impl Resolve<LoginArgs> for CompleteTotpLogin {
     self,
     args: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
+    // Before the rate limit: a session without a TOTP login (or
+    // with one which can't be tried anymore) holds nothing to guess,
+    // and is refused without counting against the ip. A client over
+    // the limit uses up an attempt of the login all the same (like
+    // one over the user's cap).
+    let user_id = args.session.begin_totp_login_attempt().await?;
     async {
-      let user_id = args.session.begin_totp_login_attempt().await?;
       let attempt = SecondFactorAttempt::begin(&user_id)?;
       let res = finish_totp_login(args, &user_id, &self.code).await;
       attempt.end(&res);
@@ -390,8 +395,9 @@ impl Resolve<LoginArgs> for CompleteTotpRecoveryLogin {
     self,
     args: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
+    // Before the rate limit, see CompleteTotpLogin.
+    let user_id = args.session.begin_totp_login_attempt().await?;
     async {
-      let user_id = args.session.begin_totp_login_attempt().await?;
       let attempt = SecondFactorAttempt::begin(&user_id)?;
       let res = finish_totp_recovery_login(
         args, &attempt, &user_id, &self.code,

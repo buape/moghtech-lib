@@ -160,13 +160,22 @@ impl Resolve<LoginArgs> for ExchangeForJwt {
     self,
     LoginArgs { auth, session, ip }: &LoginArgs,
   ) -> Result<Self::Response, Self::Error> {
+    // Taken before the rate limit: a session without a completed
+    // login (or with an expired one) holds nothing to guess, and is
+    // refused without counting against the ip. Anyone can get a
+    // browser to send it with a `redeem_ready=true` link: mogh_ui's
+    // useAuthState redeems one on every page load, since the login
+    // waits in the visitor's own session and completes in whichever
+    // tab it returns to. A client over the limit loses the login all
+    // the same, and logs in again.
+    let login = session.retrieve_authenticated_user_id().await?;
     async {
-      let user_id = session.retrieve_authenticated_user_id().await?;
-      let user = auth.get_user(user_id).await?;
+      let user = auth.get_user(login.user_id).await?;
       check_user_cidr_whitelist(user.as_ref(), *ip)?;
+      // A login when the provider's callback completed it, not now.
       auth
         .jwt_provider()
-        .encode_sub(user.id())
+        .encode_sub_with_auth_time(user.id(), login.authenticated_at)
         .map_err(Into::into)
     }
     .with_failure_rate_limit_using_ip(auth.general_rate_limiter(), ip)
@@ -421,6 +430,215 @@ mod tests {
     };
     let opts = get_login_options(&auth).await;
     assert_eq!(opts.auto_redirect.as_deref(), Some("first"));
+  }
+
+  /// One user, `user-1`, and a rate limiter allowing one failure
+  /// per ip.
+  struct RedeemAuth {
+    limiter: std::sync::Arc<mogh_rate_limit::RateLimiter>,
+  }
+
+  impl RedeemAuth {
+    fn args(session: Session) -> LoginArgs {
+      LoginArgs {
+        auth: Box::new(RedeemAuth {
+          limiter: mogh_rate_limit::RateLimiter::new(
+            false,
+            1,
+            std::time::Duration::from_secs(60),
+          ),
+        }),
+        session,
+        ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+      }
+    }
+  }
+
+  struct RedeemUser;
+
+  impl crate::user::AuthUserImpl for RedeemUser {
+    fn id(&self) -> &str {
+      "user-1"
+    }
+    fn username(&self) -> &str {
+      "user"
+    }
+  }
+
+  impl AuthImpl for RedeemAuth {
+    fn new() -> Self {
+      unimplemented!("built by RedeemAuth::args")
+    }
+
+    fn get_user(
+      &self,
+      user_id: String,
+    ) -> crate::DynFuture<mogh_error::Result<crate::user::BoxAuthUser>>
+    {
+      Box::pin(async move {
+        if user_id == "user-1" {
+          Ok(Box::new(RedeemUser) as crate::user::BoxAuthUser)
+        } else {
+          Err(anyhow::anyhow!("User not found").into())
+        }
+      })
+    }
+
+    fn handle_request_authentication(
+      &self,
+      _auth: crate::RequestAuthentication,
+      _ip: std::net::IpAddr,
+      _require_user_enabled: bool,
+      _req: axum::extract::Request,
+    ) -> crate::DynFuture<mogh_error::Result<axum::extract::Request>>
+    {
+      Box::pin(async {
+        Err(anyhow::anyhow!("not implemented").into())
+      })
+    }
+
+    fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
+      static PROVIDER: std::sync::LazyLock<
+        crate::provider::jwt::JwtProvider,
+      > = std::sync::LazyLock::new(|| {
+        crate::provider::jwt::JwtProvider::new(b"secret", 60_000)
+      });
+      &PROVIDER
+    }
+
+    fn general_rate_limiter(&self) -> &mogh_rate_limit::RateLimiter {
+      &self.limiter
+    }
+  }
+
+  fn session() -> Session {
+    Session(tower_sessions::Session::new(
+      None,
+      std::sync::Arc::new(tower_sessions::MemoryStore::default()),
+      None,
+    ))
+  }
+
+  fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs()
+  }
+
+  /// The JWT of an external login counts as a login from when the
+  /// provider's callback completed it, not from its exchange: a
+  /// login redeemed late isn't a fresh one for the reauthentication
+  /// window.
+  #[tokio::test]
+  async fn test_exchange_for_jwt_counts_from_the_callback() {
+    let completed = unix_timestamp_secs() - 90;
+    let session = session();
+    session
+      .insert_authenticated_user("user-1", completed)
+      .await
+      .unwrap();
+    let args = RedeemAuth::args(session);
+    let jwt = ExchangeForJwt {}.resolve(&args).await.unwrap().jwt;
+    let claims =
+      args.auth.jwt_provider().decode_claims(&jwt).unwrap();
+    assert_eq!(claims.sub, "user-1");
+    assert_eq!(claims.auth_time, Some(completed));
+    assert_eq!(claims.authenticated_at(), completed);
+    assert!(claims.iat >= completed + 90);
+    // Only once.
+    let err = ExchangeForJwt {}.resolve(&args).await.unwrap_err();
+    assert_eq!(err.status, reqwest::StatusCode::UNAUTHORIZED);
+  }
+
+  /// The login steps which find nothing to complete on the session
+  /// (nothing pending, or expired) are refused without counting
+  /// against the ip: there is nothing to guess, and anyone can get a
+  /// browser to send `ExchangeForJwt` (eg. with a link to an app
+  /// which redeems any `redeem_ready=true` in its url). The
+  /// credential checks still count.
+  #[tokio::test]
+  async fn test_nothing_to_complete_is_not_counted() {
+    let args = RedeemAuth::args(session());
+    let credential: mogh_auth_client::passkey::PublicKeyCredential =
+      serde_json::from_value(serde_json::json!({
+        "id": "AQID",
+        "rawId": "AQID",
+        "response": {
+          "authenticatorData": "AQID",
+          "clientDataJSON": "AQID",
+          "signature": "AQID",
+          "userHandle": null,
+        },
+        "extensions": {},
+        "type": "public-key",
+      }))
+      .unwrap();
+    let expired = unix_timestamp_secs()
+      - Session::MAX_SECOND_FACTOR_LOGIN_AGE.as_secs()
+      - 60;
+    for _ in 0..3 {
+      // Expired logins, then nothing pending.
+      args
+        .session
+        .insert_authenticated_user("user-1", expired)
+        .await
+        .unwrap();
+      args
+        .session
+        .insert_totp_login("user-1", expired)
+        .await
+        .unwrap();
+      for request in [
+        LoginRequest::ExchangeForJwt(ExchangeForJwt {}),
+        LoginRequest::ExchangeForJwt(ExchangeForJwt {}),
+        LoginRequest::CompleteTotpLogin(CompleteTotpLogin {
+          code: "123456".into(),
+        }),
+        LoginRequest::CompleteTotpLogin(CompleteTotpLogin {
+          code: "123456".into(),
+        }),
+        LoginRequest::CompleteTotpRecoveryLogin(
+          CompleteTotpRecoveryLogin {
+            code: "recovery".into(),
+          },
+        ),
+        LoginRequest::CompletePasskeyLogin(CompletePasskeyLogin {
+          credential: credential.clone(),
+        }),
+      ] {
+        let method = LoginRequestMethod::from(&request);
+        let err = request.resolve(&args).await.err().unwrap();
+        assert_eq!(
+          err.status,
+          reqwest::StatusCode::UNAUTHORIZED,
+          "{method}"
+        );
+        let message = format!("{:#}", err.error);
+        assert!(!message.contains("attempts remaining"), "{message}");
+      }
+    }
+
+    // A completed login of a user who can't be found counts...
+    args
+      .session
+      .insert_authenticated_user_id("unknown")
+      .await
+      .unwrap();
+    let err = ExchangeForJwt {}.resolve(&args).await.unwrap_err();
+    assert!(
+      format!("{:#}", err.error).contains("0 attempts remaining"),
+      "{:#}",
+      err.error
+    );
+    // ...and the ip is out of attempts.
+    args
+      .session
+      .insert_authenticated_user_id("user-1")
+      .await
+      .unwrap();
+    let err = ExchangeForJwt {}.resolve(&args).await.unwrap_err();
+    assert_eq!(err.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
   }
 
   #[tokio::test]
