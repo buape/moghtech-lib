@@ -172,8 +172,12 @@ export interface WorkloadClaim {
  * `claims`, and defines the user those workloads act as.
  * 
  * Each rule has its own user, created on first use by
- * `AuthImpl::get_or_create_workload_user`, with
- * `groups` and `admin` applied on every exchange.
+ * `AuthImpl::get_or_create_workload_user`, with `groups` and
+ * `admin` applied on every exchange and whenever the issuer is
+ * saved (`AuthImpl::sync_workload_users`). Disabling the rule or
+ * its issuer disables the user, which refuses the app tokens it
+ * was already issued; enabling it again brings the same user back.
+ * Narrowing `claims` only affects new exchanges.
  */
 export interface WorkloadRule {
 	/**

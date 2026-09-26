@@ -188,6 +188,49 @@ describe("login tokens shared by tabs", () => {
     assert.equal(calls, 3);
   });
 
+  // The browser updates a tab's `localStorage` as soon as another tab
+  // changes it, and fires `storage` in a later task: a read in between
+  // (a render, a polling request) already sees the change.
+  it("notifies of another tab's change read before its storage event", () => {
+    const a = createLoginTokens();
+    a.add_and_change(jwtFor("x"));
+    const b = createLoginTokens();
+    let calls = 0;
+    const unsubscribe = a.subscribe(() => calls++);
+
+    // `x` signs out in the other tab.
+    b.remove("x");
+    assert.equal(a.jwt(), "");
+    window.dispatchEvent(storageEvent(KEY));
+    assert.equal(calls, 1);
+    // Once.
+    window.dispatchEvent(storageEvent(KEY));
+    assert.equal(calls, 1);
+
+    b.add_and_change(jwtFor("y"));
+    assert.equal(a.accounts().length, 1);
+    window.dispatchEvent(storageEvent(KEY));
+    assert.equal(calls, 2);
+
+    // `localStorage.clear()` in another tab.
+    storage.clear();
+    assert.deepEqual(a.accounts(), []);
+    window.dispatchEvent(storageEvent(null));
+    assert.equal(calls, 3);
+
+    // A change undone before the event: nothing to tell.
+    b.add_and_change(jwtFor("z"));
+    assert.equal(a.accounts().length, 1);
+    b.remove_all();
+    storage.removeItem(KEY);
+    assert.deepEqual(a.accounts(), []);
+    window.dispatchEvent(storageEvent(KEY));
+    window.dispatchEvent(storageEvent(KEY));
+    assert.equal(calls, 3);
+
+    unsubscribe();
+  });
+
   it("stores under another key are separate", () => {
     const a = createLoginTokens();
     const other = createLoginTokens({ key: "other-app-tokens" });

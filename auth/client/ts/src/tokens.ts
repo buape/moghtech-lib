@@ -42,6 +42,8 @@ export type LoginTokensStore = {
    * another one (the browser's `storage` event). When this tab's user
    * signs out in another tab, `jwt()` gives `""` from then on: use it
    * to show the login page and drop the data cached for the user.
+   * Another tab's change is notified when its `storage` event arrives,
+   * even when this tab already read it (eg. `jwt()` in a render).
    * Returns the function to unsubscribe.
    *
    * Fits React's `useSyncExternalStore(store.subscribe, store.jwt)`.
@@ -124,7 +126,15 @@ export function createLoginTokens(options?: {
 
   const listeners = new Set<() => void>();
 
+  // The stored value listeners were last notified of. Kept apart from
+  // `raw`, which every read updates: the browser updates this tab's
+  // `localStorage` as soon as another tab changes it, and fires the
+  // `storage` event in a later task, so a read in between (a render, a
+  // polling request) already sees the change.
+  let notified_raw = raw;
+
   const notify = () => {
+    notified_raw = raw;
     for (const listener of [...listeners]) {
       try {
         listener();
@@ -153,8 +163,8 @@ export function createLoginTokens(options?: {
   // Changes made by other tabs. `key` is null after `localStorage.clear()`.
   const onStorage = (event: StorageEvent) => {
     if (event.key !== null && event.key !== key) return;
-    const before = state;
-    if (load() !== before) notify();
+    load();
+    if (raw !== notified_raw) notify();
   };
 
   const subscribe = (listener: () => void) => {

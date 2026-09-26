@@ -421,3 +421,74 @@ describe("safeBackto", () => {
     });
   }
 });
+
+describe("externalLogin", () => {
+  const origin = "https://app.example";
+  const hadLocation = Object.hasOwn(globalThis, "location");
+  const realLocation = globalThis.location;
+
+  afterEach(() => {
+    if (hadLocation) {
+      Object.defineProperty(globalThis, "location", {
+        configurable: true,
+        writable: true,
+        value: realLocation,
+      });
+    } else {
+      delete globalThis.location;
+    }
+  });
+
+  /** Runs `externalLogin` at `path`, returns where it redirected to. */
+  function externalLoginAt(path, providerSlug = "oidc") {
+    const current = new URL(path, origin);
+    const replaced = [];
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      writable: true,
+      value: {
+        origin: current.origin,
+        href: current.href,
+        pathname: current.pathname,
+        search: current.search,
+        hash: current.hash,
+        replace: (url) => replaced.push(url),
+      },
+    });
+    client.externalLogin(providerSlug);
+    assert.equal(replaced.length, 1);
+    return new URL(replaced[0]);
+  }
+
+  for (const [path, expected] of [
+    // The login page: back to its (checked) `backto`.
+    ["/login?backto=%2Fstacks%2F1%3Ftab%3Dlogs", "/stacks/1?tab=logs"],
+    ["/login/?backto=%2Fstacks%2F1", "/stacks/1"],
+    ["/login", "/"],
+    ["/login?backto=%2F%2Fevil.example", "/"],
+    ["/login?backto=https%3A%2F%2Fevil.example", "/"],
+    // Anywhere else: back to the current page, `backto` or not.
+    ["/login-providers/abc", "/login-providers/abc"],
+    [
+      "/login-providers/abc?backto=%2Fstacks%2F1",
+      "/login-providers/abc?backto=%2Fstacks%2F1",
+    ],
+    ["/loginx?backto=%2Fstacks%2F1", "/loginx?backto=%2Fstacks%2F1"],
+    ["/login/extra?backto=%2Fstacks%2F1", "/login/extra?backto=%2Fstacks%2F1"],
+    ["/stacks/1?tab=logs#top", "/stacks/1?tab=logs#top"],
+    ["/", "/"],
+  ]) {
+    it(`${path} -> ${expected}`, () => {
+      const target = externalLoginAt(path);
+      assert.equal(target.origin, "https://auth.example");
+      assert.equal(target.pathname, "/external/oidc/login");
+      assert.equal(target.searchParams.get("redirect"), origin + expected);
+    });
+  }
+
+  it("encodes the provider slug", () => {
+    const target = externalLoginAt("/login", "a b/c?d");
+    assert.equal(target.pathname, "/external/a%20b%2Fc%3Fd/login");
+    assert.equal(target.searchParams.get("redirect"), origin + "/");
+  });
+});

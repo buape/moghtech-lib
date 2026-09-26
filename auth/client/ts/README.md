@@ -88,10 +88,14 @@ where the browser (or a password manager extension) has no
 
 `safeBackto()` gives the `backto` query of the login page when it is a
 path on the current origin, otherwise `/`. Check `backto` with it before
-navigating there after a login. `externalLogin` uses it too. The result
-is a normalized path which never starts with `//`, even for input like
-`/.//evil.example`, so it can be passed to `location.replace` or a
-router as is.
+navigating there after a login. The result is a normalized path which
+never starts with `//`, even for input like `/.//evil.example`, so it
+can be passed to `location.replace` or a router as is.
+
+`externalLogin` uses it too: started on the login page itself (`/login`
+or `/login/`, not other paths starting with it like
+`/login-providers/:id`), the provider sends the user back to the checked
+`backto`, from anywhere else back to the current page.
 
 ## Development
 

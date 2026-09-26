@@ -89,6 +89,15 @@ export function safeBackto(
   }
 }
 
+/**
+ * Whether `pathname` is the login page's own route, `/login` (or
+ * `/login/`). Not any path starting with it, like an app's
+ * `/login-providers/:id`: a login started there returns there.
+ */
+function isLoginPath(pathname: string): boolean {
+  return pathname === "/login" || pathname === "/login/";
+}
+
 /** A failed request, as the promises of `MoghAuthClient` reject. */
 export type RequestError = {
   /**
@@ -312,11 +321,14 @@ export function MoghAuthClient(url: string, jwt?: string) {
     );
 
   /**
-   * Redirect to log in with an external login provider.
+   * Redirect to log in with an external login provider. From the login
+   * page (`/login`) the provider sends the user back to its `backto`
+   * (checked with `safeBackto`), from anywhere else back to the
+   * current page.
    * @param providerSlug The provider `slug` from `GetLoginOptions`.
    */
   const externalLogin = (providerSlug: string) => {
-    const _redirect = location.pathname.startsWith("/login")
+    const _redirect = isLoginPath(location.pathname)
       ? location.origin + safeBackto()
       : location.href;
     const redirect = encodeURIComponent(_redirect);
