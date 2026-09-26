@@ -180,6 +180,65 @@ async fn invalid_request_signatures_are_rate_limited() {
   app.log_in("admin").await;
 }
 
+/// The login steps which complete a login pending on the session
+/// don't count a session without one: there is nothing to guess, and
+/// anyone can get a browser to send `ExchangeForJwt` (eg. with a link
+/// to an app which redeems any `?redeem_ready=true` in its url). They
+/// must not lock the ip out of the api, nor out of logging in.
+#[tokio::test]
+async fn login_steps_without_a_pending_login_are_not_counted() {
+  let app = TestApp::spawn_with(TestAppOptions {
+    rate_limit: Some((2, 60)),
+    ..Default::default()
+  })
+  .await;
+  let admin = app.sign_up("admin").await;
+  // Well formed, never checked.
+  let credential = json!({
+    "id": "AQID",
+    "rawId": "AQID",
+    "response": {
+      "authenticatorData": "AQID",
+      "clientDataJSON": "AQID",
+      "signature": "AQID",
+      "userHandle": null,
+    },
+    "extensions": {},
+    "type": "public-key",
+  });
+  let client = app.client();
+  for _ in 0..3 {
+    for (method, params) in [
+      ("ExchangeForJwt", json!({})),
+      ("CompleteTotpLogin", json!({ "code": "123456" })),
+      ("CompleteTotpRecoveryLogin", json!({ "code": "recovery" })),
+      ("CompletePasskeyLogin", json!({ "credential": credential })),
+    ] {
+      let res = client
+        .reqwest
+        .post(format!("{}/auth/login/{method}", app.address))
+        .json(&params)
+        .send()
+        .await
+        .unwrap();
+      let status = res.status();
+      let body = res.text().await.unwrap();
+      assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{method}: {body}"
+      );
+      assert!(
+        !body.contains("attempts remaining"),
+        "{method}: {body}"
+      );
+    }
+  }
+  // Credentials from the same ip are still accepted.
+  admin.read(GetRequestInfo {}).await.unwrap();
+  app.log_in("admin").await;
+}
+
 #[tokio::test]
 async fn forwarded_ip_cannot_be_spoofed_without_a_trusted_proxy() {
   let app = TestApp::spawn_with(TestAppOptions {

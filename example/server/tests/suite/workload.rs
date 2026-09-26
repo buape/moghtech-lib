@@ -457,18 +457,232 @@ async fn admin_rules_and_the_first_matching_rule() {
   let res = deploy.read(ListUsers {}).await;
   assert_eq!(status_of(res), StatusCode::FORBIDDEN);
 
-  // The access of a workload can't be changed in the app, only by its rule.
+  // The access of a workload can't be changed in the app, only by its
+  // rule, which sets it again whenever it is saved.
   let deploy_id =
     deploy.read(GetRequestInfo {}).await.unwrap().user_id;
-  let res = admin
+  for (enabled, admin_access) in
+    [(None, Some(true)), (Some(false), None)]
+  {
+    let res =
+      admin_client_update(&admin, &deploy_id, enabled, admin_access)
+        .await;
+    assert_eq!(status_of(res), StatusCode::BAD_REQUEST);
+  }
+}
+
+async fn admin_client_update(
+  admin: &ExampleClient,
+  user_id: &str,
+  enabled: Option<bool>,
+  admin_access: Option<bool>,
+) -> anyhow::Result<example_client::entities::User> {
+  admin
     .write(UpdateUserAccess {
-      user_id: deploy_id,
-      enabled: None,
-      admin: Some(true),
+      user_id: user_id.to_string(),
+      enabled,
+      admin: admin_access,
       groups: None,
     })
-    .await;
-  assert_eq!(status_of(res), StatusCode::BAD_REQUEST);
+    .await
+}
+
+fn find_user(
+  users: &[example_client::entities::User],
+  id: &str,
+) -> example_client::entities::User {
+  users.iter().find(|user| user.id == id).unwrap().clone()
+}
+
+/// Tokens carry the user id only, and the rule's user keeps its id
+/// through changes of the rule: what the rule says now reaches the
+/// tokens it issued before, on their next request.
+#[tokio::test]
+async fn changing_a_rule_reaches_the_tokens_it_issued() {
+  let app = TestApp::spawn().await;
+  let admin = app.sign_up("admin").await;
+  let created = admin
+    .manage(CreateTrustedIssuer {
+      issuer: issuer(
+        &app,
+        vec![
+          WorkloadRule {
+            name: "Infra".into(),
+            claims: vec![claim("repository_id", "777")],
+            groups: Vec::new(),
+            admin: true,
+            ..deploy_rule()
+          },
+          deploy_rule(),
+        ],
+      ),
+    })
+    .await
+    .unwrap()
+    .issuer;
+  let infra_token = || ci_token(json!({ "repository_id": "777" }));
+  let infra = workload_client(&app, infra_token()).await;
+  let deploy =
+    workload_client(&app, ci_token(release_claims())).await;
+  let infra_id = infra.read(GetRequestInfo {}).await.unwrap().user_id;
+  let deploy_id =
+    deploy.read(GetRequestInfo {}).await.unwrap().user_id;
+  infra.read(ListUsers {}).await.unwrap();
+
+  let update = |change: fn(&mut TrustedIssuer)| {
+    let mut issuer = created.clone();
+    change(&mut issuer);
+    admin.manage(UpdateTrustedIssuer { issuer })
+  };
+
+  // Demoted: the token issued before is no admin anymore.
+  update(|issuer| {
+    issuer.rules[0].admin = false;
+    issuer.rules[0].groups = vec!["readers".into()];
+  })
+  .await
+  .unwrap();
+  let res = infra.read(ListUsers {}).await;
+  assert_eq!(status_of(res), StatusCode::FORBIDDEN);
+  infra.read(GetRequestInfo {}).await.unwrap();
+  let user =
+    find_user(&admin.read(ListUsers {}).await.unwrap(), &infra_id);
+  assert!(!user.admin && user.enabled);
+  assert_eq!(user.groups, ["readers"]);
+
+  // Disabled: the token issued before is refused, and gets no new one.
+  update(|issuer| issuer.rules[1].enabled = false)
+    .await
+    .unwrap();
+  let res = deploy.read(GetRequestInfo {}).await;
+  assert_eq!(status_of(res), StatusCode::FORBIDDEN);
+  let (status, error) = app
+    .token_exchange(
+      &app.idp.mint(ci_token(release_claims())),
+      TOKEN_TYPE_JWT,
+    )
+    .await
+    .unwrap_err();
+  assert_eq!(status, StatusCode::BAD_REQUEST);
+  assert_eq!(error.error, "invalid_grant");
+  let users = admin.read(ListUsers {}).await.unwrap();
+  assert!(!find_user(&users, &deploy_id).enabled);
+  // Only the disabled rule's user.
+  assert!(find_user(&users, &infra_id).enabled);
+  infra.read(GetRequestInfo {}).await.unwrap();
+
+  // Enabled again, the same user works again.
+  update(|_| {}).await.unwrap();
+  deploy.read(GetRequestInfo {}).await.unwrap();
+  let again = workload_client(&app, ci_token(release_claims())).await;
+  assert_eq!(
+    again.read(GetRequestInfo {}).await.unwrap().user_id,
+    deploy_id
+  );
+
+  // A disabled issuer disables all of its rules' users.
+  update(|issuer| issuer.enabled = false).await.unwrap();
+  for workload in [&infra, &deploy, &again] {
+    let res = workload.read(GetRequestInfo {}).await;
+    assert_eq!(status_of(res), StatusCode::FORBIDDEN);
+  }
+  let (status, _) = app
+    .token_exchange(&app.idp.mint(infra_token()), TOKEN_TYPE_JWT)
+    .await
+    .unwrap_err();
+  assert_eq!(status, StatusCode::BAD_REQUEST);
+
+  // Enabled again, back to the rules as they are.
+  update(|_| {}).await.unwrap();
+  let infra_again = workload_client(&app, infra_token()).await;
+  assert_eq!(
+    infra_again.read(GetRequestInfo {}).await.unwrap().user_id,
+    infra_id
+  );
+  // The rule is admin again (`created`), and so are its tokens.
+  infra.read(ListUsers {}).await.unwrap();
+  // Nothing was created along the way.
+  assert_eq!(admin.read(ListUsers {}).await.unwrap().len(), 3);
+}
+
+/// Static issuers change with the config file: the app applies them
+/// to the users of their rules when it starts.
+#[tokio::test]
+async fn static_issuer_changes_apply_on_restart() {
+  let idp = example_mock_idp::MockIdp::spawn(0).await.unwrap();
+  let idp_issuer = idp.issuer.clone();
+  let static_issuer = |deploy_admin: bool, docs_enabled: bool| {
+    json!({
+      "id": "mock-ci",
+      "name": "Mock CI",
+      "enabled": true,
+      "issuer": idp_issuer,
+      "keys": { "source": "Discovery", "params": {} },
+      "audiences": [AUDIENCE],
+      "rules": [
+        {
+          "id": "deploy",
+          "name": "Deploy",
+          "enabled": true,
+          "claims": [{ "claim": "repository_id", "pattern": "12345" }],
+          "admin": deploy_admin,
+        },
+        {
+          "id": "docs",
+          "name": "Docs",
+          "enabled": docs_enabled,
+          "claims": [{ "claim": "repository_id", "pattern": "555" }],
+        },
+      ],
+    })
+  };
+  let issuers = static_issuer(true, true);
+  let mut app = TestApp::spawn_with_idp(
+    TestAppOptions {
+      config: json!({ "trusted_issuers": [issuers] }),
+      ..Default::default()
+    },
+    idp,
+  )
+  .await;
+  let admin = app.sign_up("admin").await;
+  let deploy =
+    workload_client(&app, ci_token(release_claims())).await;
+  let docs = workload_client(
+    &app,
+    ci_token(json!({ "repository_id": "555" })),
+  )
+  .await;
+  deploy.read(ListUsers {}).await.unwrap();
+  docs.read(GetRequestInfo {}).await.unwrap();
+
+  let set_issuers = |app: &TestApp, issuers: serde_json::Value| {
+    let path = app.dir.path().join("config/core.config.json");
+    let mut config: serde_json::Value =
+      serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["trusted_issuers"] = issuers;
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap())
+      .unwrap();
+  };
+
+  // Deploy demoted, Docs disabled in the config.
+  set_issuers(&app, json!([static_issuer(false, false)]));
+  app.restart().await;
+  let res = deploy.read(ListUsers {}).await;
+  assert_eq!(status_of(res), StatusCode::FORBIDDEN);
+  deploy.read(GetRequestInfo {}).await.unwrap();
+  let res = docs.read(GetRequestInfo {}).await;
+  assert_eq!(status_of(res), StatusCode::FORBIDDEN);
+
+  // The issuer removed from the config: its users are removed.
+  set_issuers(&app, json!([]));
+  app.restart().await;
+  for workload in [&deploy, &docs] {
+    let res = workload.read(GetRequestInfo {}).await;
+    assert_eq!(status_of(res), StatusCode::UNAUTHORIZED);
+  }
+  let users = admin.read(ListUsers {}).await.unwrap();
+  assert!(users.iter().all(|user| user.workload.is_none()));
 }
 
 #[tokio::test]

@@ -74,7 +74,8 @@ function UsersTable({ ownId }: { ownId: string }) {
                 <Switch
                   aria-label={`${user.username} enabled`}
                   checked={user.enabled}
-                  disabled={user.id === ownId}
+                  // A workload is disabled with its rule.
+                  disabled={user.id === ownId || !!user.workload}
                   onChange={(e) =>
                     updateAccess({
                       user_id: user.id,

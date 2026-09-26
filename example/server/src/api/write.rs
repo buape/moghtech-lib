@@ -189,9 +189,13 @@ impl Resolve<WriteArgs> for UpdateUserAccess {
       .await?
       .context("No user found with given id")
       .status_code(StatusCode::NOT_FOUND)?;
-    // What a workload can do is defined by its rule alone.
+    // What a workload can do is defined by its rule alone, which
+    // sets it again whenever the rule is saved. Its rule (one user
+    // per rule) is what to disable.
     if target.workload.is_some()
-      && (self.admin.is_some() || self.groups.is_some())
+      && (self.enabled.is_some()
+        || self.admin.is_some()
+        || self.groups.is_some())
     {
       return Err(
         anyhow!("The access of workload users is set by their rule")

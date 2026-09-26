@@ -36,6 +36,10 @@ async fn app() -> anyhow::Result<()> {
   db::init().await?;
   // Fails here if the encryption key is invalid.
   crypto::encryption_key();
+  // Static trusted issuers may have changed in the config.
+  auth::sync_workload_users_on_startup()
+    .await
+    .context("Failed to sync the users of trusted issuers")?;
 
   mogh_server::serve_app(api::app(), config, None).await
 }

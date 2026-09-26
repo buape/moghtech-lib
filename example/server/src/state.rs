@@ -1,5 +1,5 @@
 use std::{
-  sync::{Arc, LazyLock, OnceLock},
+  sync::{Arc, LazyLock, Mutex, OnceLock},
   time::Duration,
 };
 
@@ -11,7 +11,7 @@ use mogh_auth_server::{
   provider::{jwt::JwtProvider, passkey::PasskeyProvider},
   rand::random_string,
 };
-use mogh_cache::{CloneCache, TimeoutCache};
+use mogh_cache::TimeoutCache;
 use mogh_rate_limit::RateLimiter;
 use tracing::warn;
 
@@ -75,24 +75,74 @@ pub fn local_login_rate_limiter() -> &'static RateLimiter {
   LIMITER.get_or_init(rate_limiter)
 }
 
+/// A value loaded from the database, kept in memory until it changes.
+///
 /// The stored login providers / trusted issuers are read by
 /// unauthenticated requests (the login options, every token exchange),
 /// so they are served from memory and only reloaded after a change.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum AuthCacheKey {
-  LoginProviders,
-  TrustedIssuers,
+pub struct ReloadCache<T> {
+  /// The changes made so far, and the value loaded since the last.
+  state: Mutex<(u64, Option<Arc<T>>)>,
 }
 
-#[derive(Clone, Debug)]
-pub enum AuthCacheEntry {
-  LoginProviders(Arc<Vec<ExternalLoginProvider>>),
-  TrustedIssuers(Arc<Vec<TrustedIssuer>>),
+impl<T> Default for ReloadCache<T> {
+  fn default() -> Self {
+    Self {
+      state: Mutex::new((0, None)),
+    }
+  }
 }
 
-pub fn auth_cache()
--> &'static CloneCache<AuthCacheKey, AuthCacheEntry> {
-  static CACHE: OnceLock<CloneCache<AuthCacheKey, AuthCacheEntry>> =
+impl<T> ReloadCache<T> {
+  /// The value in memory, else loads it.
+  ///
+  /// A load which a change ran during is used, but not kept: it may
+  /// have read what was there before, and would otherwise be served
+  /// until the next change. A disabled workload rule would then keep
+  /// accepting tokens.
+  pub async fn get_or_load<F>(
+    &self,
+    load: impl FnOnce() -> F,
+  ) -> anyhow::Result<Arc<T>>
+  where
+    F: Future<Output = anyhow::Result<T>>,
+  {
+    let changes = {
+      let state =
+        self.state.lock().unwrap_or_else(|e| e.into_inner());
+      if let Some(value) = &state.1 {
+        return Ok(value.clone());
+      }
+      state.0
+    };
+    let value = Arc::new(load().await?);
+    let mut state =
+      self.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.0 == changes {
+      state.1 = Some(value.clone());
+    }
+    Ok(value)
+  }
+
+  /// Call once a change is stored, the next read loads it.
+  pub fn changed(&self) {
+    let mut state =
+      self.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.0 += 1;
+    state.1 = None;
+  }
+}
+
+pub fn login_providers_cache()
+-> &'static ReloadCache<Vec<ExternalLoginProvider>> {
+  static CACHE: OnceLock<ReloadCache<Vec<ExternalLoginProvider>>> =
+    OnceLock::new();
+  CACHE.get_or_init(Default::default)
+}
+
+pub fn trusted_issuers_cache()
+-> &'static ReloadCache<Vec<TrustedIssuer>> {
+  static CACHE: OnceLock<ReloadCache<Vec<TrustedIssuer>>> =
     OnceLock::new();
   CACHE.get_or_init(Default::default)
 }

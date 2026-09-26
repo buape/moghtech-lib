@@ -15,6 +15,7 @@ use mogh_auth_client::{
   config::{ExternalLoginProvider, TrustedIssuer},
   passkey::Passkey,
 };
+use mogh_auth_server::provider::workload::WorkloadAccess;
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{
   SqlitePool,
@@ -542,27 +543,78 @@ pub async fn delete_user(id: &str) -> anyhow::Result<()> {
   Ok(())
 }
 
-/// Removes the users of the workload rules of an issuer, except `keep_rule_ids`.
-pub async fn delete_workload_users(
+/// Brings the users of the workload rules of an issuer in line with
+/// `rules`, in one transaction: the users of rules which aren't among
+/// them are removed, the others get their rule's groups, admin status
+/// and enabled. Rules without a user don't get one.
+pub async fn sync_workload_users(
   issuer_id: &str,
-  keep_rule_ids: &[String],
+  rules: &[WorkloadAccess],
 ) -> anyhow::Result<()> {
+  // Takes the write lock up front: a transaction which only reads
+  // at first can't write anymore once another one wrote meanwhile.
+  let mut tx = db()
+    .begin_with("BEGIN IMMEDIATE")
+    .await
+    .context("Failed to begin transaction")?;
   let users = sqlx::query_as::<_, (String, Option<String>)>(
     "SELECT id, workload_rule_id FROM users
      WHERE workload_issuer_id = ?",
   )
   .bind(issuer_id)
+  .fetch_all(&mut *tx)
+  .await
+  .context("Failed to query workload users")?;
+  let now = unix_timestamp_ms();
+  for (id, rule_id) in users {
+    let rule = rules
+      .iter()
+      .find(|rule| rule_id.as_ref() == Some(&rule.rule_id));
+    let Some(rule) = rule else {
+      sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to delete workload user")?;
+      continue;
+    };
+    sqlx::query(
+      "UPDATE users
+       SET groups = ?, admin = ?, enabled = ?, updated_at = ?
+       WHERE id = ?",
+    )
+    .bind(to_json(&rule.groups)?)
+    .bind(rule.admin)
+    .bind(rule.enabled)
+    .bind(now)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .context("Failed to update workload user")?;
+  }
+  tx.commit().await.context("Failed to commit transaction")
+}
+
+/// Removes the workload users of issuers which aren't among
+/// `issuer_ids`, eg. of an issuer removed from the config file.
+pub async fn delete_workload_users_of_other_issuers(
+  issuer_ids: &[String],
+) -> anyhow::Result<u64> {
+  let mut deleted = 0;
+  let users = sqlx::query_as::<_, (String, String)>(
+    "SELECT id, workload_issuer_id FROM users
+     WHERE workload_issuer_id IS NOT NULL",
+  )
   .fetch_all(db())
   .await
   .context("Failed to query workload users")?;
-  for (id, rule_id) in users {
-    if rule_id.is_some_and(|rule_id| keep_rule_ids.contains(&rule_id))
-    {
-      continue;
+  for (id, issuer_id) in users {
+    if !issuer_ids.contains(&issuer_id) {
+      delete_user(&id).await?;
+      deleted += 1;
     }
-    delete_user(&id).await?;
   }
-  Ok(())
+  Ok(deleted)
 }
 
 // ===================
@@ -854,13 +906,21 @@ pub async fn update_trusted_issuer(
   Ok(())
 }
 
+/// Also removes the users of its rules.
 pub async fn delete_trusted_issuer(id: &str) -> anyhow::Result<()> {
+  let mut tx =
+    db().begin().await.context("Failed to begin transaction")?;
   sqlx::query("DELETE FROM trusted_issuers WHERE id = ?")
     .bind(id)
-    .execute(db())
+    .execute(&mut *tx)
     .await
     .context("Failed to delete trusted issuer")?;
-  Ok(())
+  sqlx::query("DELETE FROM users WHERE workload_issuer_id = ?")
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .context("Failed to delete the users of the trusted issuer")?;
+  tx.commit().await.context("Failed to commit transaction")
 }
 
 // ========

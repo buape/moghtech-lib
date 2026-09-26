@@ -20,8 +20,13 @@ use mogh_auth_server::{
     get_user_from_request_authentication, verify_api_key_secret_async,
   },
   provider::{
-    external::ExternalLoginInfo, jwt::JwtProvider,
-    passkey::PasskeyProvider, workload::WorkloadIdentity,
+    external::ExternalLoginInfo,
+    jwt::JwtProvider,
+    passkey::PasskeyProvider,
+    workload::{
+      WorkloadAccess, WorkloadIdentity, list_trusted_issuers,
+      sync_all_workload_users,
+    },
   },
   user::{AuthUserImpl, BoxAuthUser},
 };
@@ -33,7 +38,7 @@ use tracing::{info, warn};
 use crate::{
   config::{core_config, core_keys},
   db::{self, DbUser, NewUser, UserUpdate},
-  state::{self, AuthCacheEntry, AuthCacheKey, auth_cache},
+  state::{self, login_providers_cache, trusted_issuers_cache},
 };
 
 /// The authenticated user of a request, attached
@@ -329,7 +334,7 @@ impl AuthImpl for ExampleAuthImpl {
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
       db::create_login_provider(&provider).await?;
-      auth_cache().remove(&AuthCacheKey::LoginProviders).await;
+      login_providers_cache().changed();
       Ok(())
     })
   }
@@ -340,7 +345,7 @@ impl AuthImpl for ExampleAuthImpl {
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
       db::update_login_provider(&provider).await?;
-      auth_cache().remove(&AuthCacheKey::LoginProviders).await;
+      login_providers_cache().changed();
       Ok(())
     })
   }
@@ -352,7 +357,7 @@ impl AuthImpl for ExampleAuthImpl {
     Box::pin(async move {
       // Also removes the links to the provider from all users.
       db::delete_login_provider(&id).await?;
-      auth_cache().remove(&AuthCacheKey::LoginProviders).await;
+      login_providers_cache().changed();
       Ok(())
     })
   }
@@ -477,26 +482,35 @@ impl AuthImpl for ExampleAuthImpl {
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
       db::create_trusted_issuer(&issuer).await?;
-      auth_cache().remove(&AuthCacheKey::TrustedIssuers).await;
+      trusted_issuers_cache().changed();
       Ok(())
     })
   }
 
+  /// The server syncs the users of its rules next.
   fn update_trusted_issuer(
     &self,
     issuer: TrustedIssuer,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
       db::update_trusted_issuer(&issuer).await?;
-      auth_cache().remove(&AuthCacheKey::TrustedIssuers).await;
-      // The users of rules which were removed can't be used anymore.
-      let rule_ids = issuer
-        .rules
-        .iter()
-        .map(|rule| rule.id.clone())
-        .collect::<Vec<_>>();
-      db::delete_workload_users(&issuer.id, &rule_ids).await?;
+      trusted_issuers_cache().changed();
       Ok(())
+    })
+  }
+
+  /// Removes the users of rules which were removed, and gives the
+  /// others what their rule says now: a demoted rule's tokens lose
+  /// admin on their next request, a disabled one's are refused.
+  fn sync_workload_users(
+    &self,
+    issuer_id: String,
+    rules: Vec<WorkloadAccess>,
+  ) -> DynFuture<mogh_error::Result<()>> {
+    Box::pin(async move {
+      db::sync_workload_users(&issuer_id, &rules)
+        .await
+        .map_err(Into::into)
     })
   }
 
@@ -505,9 +519,9 @@ impl AuthImpl for ExampleAuthImpl {
     id: String,
   ) -> DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      // Along with the users of its rules.
       db::delete_trusted_issuer(&id).await?;
-      auth_cache().remove(&AuthCacheKey::TrustedIssuers).await;
-      db::delete_workload_users(&id, &[]).await?;
+      trusted_issuers_cache().changed();
       Ok(())
     })
   }
@@ -527,6 +541,7 @@ impl AuthImpl for ExampleAuthImpl {
         None => create_workload_user(&identity).await?,
       };
       // The rule is the full definition of what the user can do.
+      // Created enabled, `enabled` is left to sync_workload_users.
       db::update_user(&user.id, UserUpdate::Admin(identity.admin))
         .await?;
       db::update_user(
@@ -908,40 +923,45 @@ fn workload_usernames(identity: &WorkloadIdentity) -> [String; 4] {
 
 async fn cached_login_providers()
 -> anyhow::Result<Arc<Vec<ExternalLoginProvider>>> {
-  if let Some(AuthCacheEntry::LoginProviders(providers)) =
-    auth_cache().get(&AuthCacheKey::LoginProviders).await
-  {
-    return Ok(providers);
-  }
-  let providers =
-    Arc::new(db::list_login_providers().await.inspect_err(|e| {
-      warn!("Failed to load login providers | {e:#}")
-    })?);
-  auth_cache()
-    .insert(
-      AuthCacheKey::LoginProviders,
-      AuthCacheEntry::LoginProviders(providers.clone()),
-    )
-    .await;
-  Ok(providers)
+  login_providers_cache()
+    .get_or_load(|| async {
+      db::list_login_providers().await.inspect_err(|e| {
+        warn!("Failed to load login providers | {e:#}")
+      })
+    })
+    .await
 }
 
 async fn cached_trusted_issuers()
 -> anyhow::Result<Arc<Vec<TrustedIssuer>>> {
-  if let Some(AuthCacheEntry::TrustedIssuers(issuers)) =
-    auth_cache().get(&AuthCacheKey::TrustedIssuers).await
-  {
-    return Ok(issuers);
+  trusted_issuers_cache()
+    .get_or_load(|| async {
+      db::list_trusted_issuers().await.inspect_err(|e| {
+        warn!("Failed to load trusted issuers | {e:#}")
+      })
+    })
+    .await
+}
+
+/// Applies the trusted issuers to the users of their rules when the
+/// app starts: static issuers change with the config file, not over
+/// the API. The users of issuers which are gone are removed.
+pub async fn sync_workload_users_on_startup() -> anyhow::Result<()> {
+  sync_all_workload_users(&ExampleAuthImpl)
+    .await
+    .map_err(|e| e.error)?;
+  let issuer_ids = list_trusted_issuers(&ExampleAuthImpl)
+    .await
+    .map_err(|e| e.error)?
+    .into_iter()
+    .map(|resolved| resolved.issuer.id)
+    .collect::<Vec<_>>();
+  let removed =
+    db::delete_workload_users_of_other_issuers(&issuer_ids).await?;
+  if removed > 0 {
+    info!(
+      "Removed {removed} users of trusted issuers which are gone"
+    );
   }
-  let issuers =
-    Arc::new(db::list_trusted_issuers().await.inspect_err(|e| {
-      warn!("Failed to load trusted issuers | {e:#}")
-    })?);
-  auth_cache()
-    .insert(
-      AuthCacheKey::TrustedIssuers,
-      AuthCacheEntry::TrustedIssuers(issuers.clone()),
-    )
-    .await;
-  Ok(issuers)
+  Ok(())
 }

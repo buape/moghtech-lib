@@ -55,6 +55,32 @@ test("sign up and log in through the provider", async ({ page }) => {
   await expectLoggedInAs(page, username);
 });
 
+test("a login the provider finishes in another tab is redeemed there", async ({
+  page,
+  context,
+}) => {
+  const username = uniqueName("othertab");
+  await addIdpUser(page, username);
+  await page.goto("/login");
+  await page.getByRole("button", { name: /OIDC/ }).click();
+  await expect(page.getByText("Mock Identity Provider")).toBeVisible();
+
+  // Eg. a link in an email: the same browser (session cookie), but not
+  // the tab which left for the provider.
+  const other = await context.newPage();
+  const redeems: string[] = [];
+  other.on("request", (request) => {
+    if (request.url().includes("/ExchangeForJwt")) redeems.push(request.url());
+  });
+  await other.goto(page.url());
+  await pickIdpUser(other, username);
+  // The login waits in the browser's session, not in the tab.
+  await expectLoggedInAs(other, username);
+  await expect(other).not.toHaveURL(/redeem_ready/);
+  await expect(other.locator(".mantine-Notification-root")).toHaveCount(0);
+  expect(redeems).toHaveLength(1);
+});
+
 test("denying the login at the provider", async ({ page }) => {
   await page.goto("/login");
   await page.getByRole("button", { name: /OIDC/ }).click();

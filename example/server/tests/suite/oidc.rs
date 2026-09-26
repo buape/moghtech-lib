@@ -17,7 +17,7 @@ use example_mock_idp::IdpUser;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::common::*;
+use crate::{common::*, reauth::assert_reauthentication_required};
 
 fn oidc_app_options(oidc: serde_json::Value) -> TestAppOptions {
   TestAppOptions {
@@ -91,6 +91,43 @@ async fn sign_up_and_log_in_with_oidc() {
   // And never without one.
   let res = app.client().login(ExchangeForJwt {}).await;
   assert_eq!(status_of(res), StatusCode::UNAUTHORIZED);
+}
+
+/// The token redeemed for an external login counts as a login from
+/// the provider's callback, not from the redeem: a login left on the
+/// session (eg. by whoever got into the user's identity provider
+/// account) is not a fresh one when it is redeemed later. It can't
+/// be kept for long either: past `Session::MAX_COMPLETED_LOGIN_AGE`
+/// (2 minutes, the session unit tests cover it) it is refused.
+#[tokio::test]
+async fn a_late_redeem_is_not_a_recent_login() {
+  const WINDOW_SECS: u64 = 2;
+  let app = TestApp::spawn_with(TestAppOptions {
+    env: vec![(
+      "EXAMPLE_REAUTHENTICATION_WINDOW_SECONDS".into(),
+      WINDOW_SECS.to_string(),
+    )],
+    ..oidc_app_options(json!({}))
+  })
+  .await;
+  app.add_idp_user("alice", &[]);
+
+  // Redeemed right away, as the app does: a recent login.
+  let alice = oidc_login(&app, "alice").await;
+  alice.manage(BeginTotpEnrollment {}).await.unwrap();
+
+  let (client, landed) = browser_login(&app, "alice").await;
+  assert_eq!(landed.query(), Some("redeem_ready=true"), "{landed}");
+  tokio::time::sleep(std::time::Duration::from_secs(WINDOW_SECS + 2))
+    .await;
+  let jwt = client.login(ExchangeForJwt {}).await.unwrap().jwt;
+  let late = client.with_auth(ClientAuth::Jwt(jwt));
+  assert_reauthentication_required(
+    late.manage(BeginTotpEnrollment {}).await,
+    "BeginTotpEnrollment",
+  );
+  // The token is good for everything else.
+  assert_eq!(get_user(&late).await.username, "alice");
 }
 
 #[tokio::test]
