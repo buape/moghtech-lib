@@ -18,7 +18,7 @@ import { useEffect, useState } from "react";
 import { useInRouterContext } from "react-router-dom";
 import LoginHeader from "./header";
 import { LoginProviderButton, MAX_HEADER_LOGIN_PROVIDERS } from "./providers";
-import { externalLoginState } from "../external-flow";
+import { externalLoginState, isLoginPath } from "../external-flow";
 
 export * from "./providers";
 import {
@@ -85,8 +85,12 @@ export function LoginPage({
     }
   }, [options?.auto_redirect, secondFactorPending]);
 
-  // If signing in another user, need to redirect away from /login manually
-  const maybeNavigate = location.pathname.startsWith("/login")
+  // On the login route, go on to `backto` after logging in: the app's
+  // router doesn't leave it by itself (eg. when signing in another
+  // user). Elsewhere (eg. the second factor of an external login which
+  // returned to a page of the app) stay on the page, also when its path
+  // only starts with `/login` (eg. `/login-providers/:id`).
+  const maybeNavigate = isLoginPath(location.pathname)
     ? () => location.replace(backtoPath())
     : undefined;
 

@@ -1,30 +1,40 @@
-// State of the external login / link flows, shared by the auth
-// hooks and the login page. Not exported from the package. No imports:
-// the unit tests load it in Node.
+// State of the external login / link flows, and the url handling they
+// need, shared by the auth hooks and the login page. Not exported from
+// the package. No imports: the unit tests load it in Node.
 
 /**
  * Whether an external login failed on this page load: the server
  * sent the browser back with `login_error`, or redeeming the login
- * for a token failed. The login page then doesn't auto redirect to
- * the provider again, which would only fail again, in a loop.
+ * for a token (`redeem_ready`) failed. The login page then doesn't
+ * auto redirect to the provider again, which would only fail again,
+ * in a loop.
  */
 export const externalLoginState = { failed: false };
 
 const EXTERNAL_FLOW_KEY = "mogh-ui-external-flow-v1";
 
-/** Longer than any login at a provider is expected to take. */
+/**
+ * Longer than any login at a provider is expected to take. A return
+ * after it isn't vouched for (a failure isn't shown as the server's).
+ */
 const EXTERNAL_FLOW_MAX_AGE_MS = 30 * 60_000;
 
 /**
  * Notes that this tab is leaving for an external login or link. The
- * reason the server sends back when it fails (`login_error` /
- * `link_error`) is only shown after a flow the tab started.
+ * mark is per tab (`sessionStorage`) and vouches for the page load the
+ * provider sends the tab back to ([takeExternalFlowReturn]), within
+ * [EXTERNAL_FLOW_MAX_AGE_MS]. Only then does `useAuthState` show:
+ * - the reason the server sends back when the flow fails
+ *   (`login_error` / `link_error`);
+ * - the server's error when redeeming a `redeem_ready` fails (it is
+ *   redeemed either way, without the mark a failure is only logged).
  */
 export function markExternalFlow() {
   try {
     sessionStorage.setItem(EXTERNAL_FLOW_KEY, String(Date.now()));
   } catch {
-    // Storage blocked: failed flows show a generic reason.
+    // Storage blocked: failed flows show a generic reason, and a
+    // failed redeem is only logged.
   }
 }
 
@@ -176,4 +186,42 @@ export function flowReturnError(
     source = "unverified";
   }
   return { link, text, source };
+}
+
+/**
+ * Whether `pathname` is the login page's own route, `/login` (or
+ * `/login/`). Not any path starting with it, like an app's
+ * `/login-providers/:id`, where the login page is also shown (for the
+ * second factor of an external login which returned there).
+ */
+export function isLoginPath(pathname: string): boolean {
+  return pathname === "/login" || pathname === "/login/";
+}
+
+/**
+ * Replaces the page's url without a reload (which would drop the
+ * notifications). `url` must be absolute and on this origin: a relative
+ * path starting with `//` (the app opened at `https://app//x`) would
+ * be read as another host, which `replaceState` refuses by throwing.
+ *
+ * Never throws: it runs while rendering, where a throw would take the
+ * app down, and the url is only being tidied up.
+ */
+export function replaceUrl(url: string) {
+  try {
+    history.replaceState(history.state, "", url);
+  } catch (error) {
+    console.warn("Couldn't update the url:", error);
+  }
+}
+
+/**
+ * Removes query params from the page's url, keeping the rest of it
+ * (fragment included), without a reload ([replaceUrl]).
+ */
+export function removeQueryParams(...params: string[]) {
+  const url = new URL(location.href);
+  if (!params.some((param) => url.searchParams.has(param))) return;
+  for (const param of params) url.searchParams.delete(param);
+  replaceUrl(url.href);
 }

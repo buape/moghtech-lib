@@ -1,8 +1,8 @@
 // Tokens the server refused, shared by the auth queries.
 // Not exported from the package.
 
-// Every request which fails auth counts against the server's per IP
-// auth rate limit, which logging in shares. A token the server
+// Every request with a token the server refuses counts against its
+// per IP auth rate limit, which logging in shares. A token the server
 // rejected isn't sent again.
 let rejectedJwt: string | undefined;
 

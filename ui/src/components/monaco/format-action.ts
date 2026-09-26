@@ -29,15 +29,22 @@ export type Format = (
  */
 const WRITABLE_EDITOR = "!editorReadonly";
 
+const FORMAT_ACTION_ID = "mogh.format-document";
+
 /**
  * The "Format Document (Prettier)" action of an editor showing
  * `language`, for `editor.addAction`.
  *
- * Only for a writable editor: `setValue` doesn't check `readOnly`, and
- * would rewrite what a read only editor shows (and call its
- * `onChange`). The action is off (its keybinding too) while the editor
- * is read only, also when `readOnly` changes later, and a format which
- * finishes after the editor turned read only is dropped.
+ * The formatted text replaces the model's content as one edit
+ * (`executeEdits`), which undo reverts, leaving the earlier undo history
+ * as it was (`setValue` would clear it). Formatting can take a while (the
+ * first time Prettier and its plugins are loaded), and the editor stays
+ * editable meanwhile: a result for text which has changed since is
+ * dropped, rather than overwriting what was typed.
+ *
+ * Only for a writable editor. The action is off (its keybinding too)
+ * while the editor is read only, also when `readOnly` changes later, and
+ * a format which finishes after the editor turned read only is dropped.
  */
 export function formatDocumentAction({
   language,
@@ -52,7 +59,7 @@ export function formatDocumentAction({
   format: Format;
 }): editor.IActionDescriptor {
   return {
-    id: "mogh.format-document",
+    id: FORMAT_ACTION_ID,
     label: "Format Document (Prettier)",
     keybindings,
     precondition: WRITABLE_EDITOR,
@@ -61,19 +68,37 @@ export function formatDocumentAction({
       if (readOnly()) return;
       const model = codeEditor.getModel();
       if (!model) return;
+      // Any edit (typing, undo) changes the version.
+      const version = model.getVersionId();
+      const source = codeEditor.getValue();
       const position = codeEditor.getPosition();
       const beforeOffset = (position && model.getOffsetAt(position)) ?? 0;
       const { formatted, cursorOffset } = await format(
         language,
-        codeEditor.getValue(),
+        source,
         beforeOffset,
       );
-      // Disposed / switched model, or turned read only, while formatting.
-      if (model.isDisposed() || codeEditor.getModel() !== model || readOnly()) {
+      // Disposed / switched model, edited or turned read only while
+      // formatting.
+      if (
+        model.isDisposed() ||
+        codeEditor.getModel() !== model ||
+        model.getVersionId() !== version ||
+        readOnly()
+      ) {
         return;
       }
-      codeEditor.setValue(formatted);
-      codeEditor.setPosition(model.getPositionAt(cursorOffset));
+      // Already formatted: no edit to undo.
+      if (formatted === source) return;
+      // Undo stops keep the format one undo step of its own.
+      codeEditor.pushUndoStop();
+      const applied = codeEditor.executeEdits(FORMAT_ACTION_ID, [
+        { range: model.getFullModelRange(), text: formatted },
+      ]);
+      codeEditor.pushUndoStop();
+      if (applied) {
+        codeEditor.setPosition(model.getPositionAt(cursorOffset));
+      }
     },
   };
 }

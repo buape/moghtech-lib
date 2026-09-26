@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor";
+import { ENV_KEY_VALUE_REGEX, WHITESPACE_REGEX } from "./env_key";
 import { TOML_KEY_VALUE_REGEX } from "./toml_key";
 
 /// V2: Toml + Yaml + Env Vars
@@ -193,14 +194,11 @@ const fancy_toml_language: monaco.languages.IMonarchLanguage = {
 
     // Environment Variable Tokenizer
     envVariableTokenizer: [
-      [
-        /(\s*-*\s*)([A-Za-z0-9_]+)(\s*)(=|:)(\s*)/,
-        ["", "key", "", "operator.assignment", ""],
-      ],
+      [ENV_KEY_VALUE_REGEX, ["", "key", "", "operator.assignment", ""]],
       { include: "@yamlTokenizer" }, // Use YAML tokenizer for EnvVar values
     ],
 
-    yaml_whitespace: [[/[ \t\r\n]+/, ""]],
+    yaml_whitespace: [[WHITESPACE_REGEX, ""]],
     yaml_comments: [[/#.*$/, "comment"]],
     yaml_keys: [[/([^\s\[\]{},"']+)(\s*)(:)/, ["key", "", "delimiter"]]],
     yaml_numbers: [

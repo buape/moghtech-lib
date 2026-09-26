@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor";
+import { ENV_KEY_VALUE_REGEX, WHITESPACE_REGEX } from "./env_key";
 
 // Language Configuration
 const key_value_conf: monaco.languages.LanguageConfiguration = {
@@ -17,7 +18,7 @@ const key_value_conf: monaco.languages.LanguageConfiguration = {
 };
 
 // Language Definition (Monarch Tokenizer)
-const key_value_language = <monaco.languages.IMonarchLanguage>{
+const key_value_language: monaco.languages.IMonarchLanguage = {
   defaultToken: "",
   tokenPostfix: ".env",
 
@@ -28,9 +29,9 @@ const key_value_language = <monaco.languages.IMonarchLanguage>{
     root: [
       // Handle environment variables (KEY = VALUE or KEY: VALUE)
       [
-        /(\s*-*\s*)([A-Za-z0-9_]+)(\s*)(=|:)(\s*)/,
+        ENV_KEY_VALUE_REGEX,
         [
-          "", // Optional leading hyphen
+          "", // Indentation, a list item's leading hyphen
           "key", // Key (environment variable)
           "", // Whitespace
           "operator.assignment", // Equals sign (=) or colon (:)
@@ -48,7 +49,7 @@ const key_value_language = <monaco.languages.IMonarchLanguage>{
       { include: "@yaml_constants" },
     ],
 
-    yaml_whitespace: [[/[ \t\r\n]+/, ""]],
+    yaml_whitespace: [[WHITESPACE_REGEX, ""]],
 
     yaml_comments: [[/#.*$/, "comment"]],
 

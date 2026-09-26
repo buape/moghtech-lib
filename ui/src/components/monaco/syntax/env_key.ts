@@ -1,0 +1,24 @@
+/**
+ * The key of an environment variable entry (`KEY=value`, `KEY: value`,
+ * also as a list item `- KEY=value`) and its `=` / `:`, as the groups
+ * (indentation and dashes, key, whitespace, "=" or ":", whitespace).
+ * Shared by the `key_value` and `fancy_toml` (inside `"""` / `'''`
+ * strings) tokenizers.
+ *
+ * The part before the key can only be read one way: whitespace, then
+ * optionally dashes and more whitespace. The previous `\s*-*\s*` could
+ * split a run of whitespace between its two `\s*` every possible way,
+ * which it tried wherever no key followed. Monarch retries the rules one
+ * character further along when none matches, so on a run of whitespace
+ * the other rules don't consume (U+00A0, U+3000, ...) that was cubic:
+ * seconds for a few thousand characters, freezing the tab.
+ */
+export const ENV_KEY_VALUE_REGEX =
+  /(\s*(?:-+\s*)?)([A-Za-z0-9_]+)(\s*)(=|:)(\s*)/;
+
+/**
+ * Whitespace between the values, any Unicode whitespace like `\s` (not
+ * only ASCII). A run is consumed at once, so the rules before it are
+ * tried once for it rather than at each of its characters.
+ */
+export const WHITESPACE_REGEX = /\s+/;

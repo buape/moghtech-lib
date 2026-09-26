@@ -19,6 +19,8 @@ no CommonJS build):
 Install the peer dependencies next to it (npm does this by default),
 `prettier` included: the editor formats yaml / typescript with it
 (Alt + Shift + F, not in a read only editor), loaded only when used.
+A format is one edit, which undo reverts, and is dropped when the text
+changed while it ran.
 
 ```ts
 import "mogh_ui/index.scss";
@@ -38,6 +40,27 @@ import { ThemeProvider } from "mogh_ui";
   `link_error`): the server adds its own to the url the provider sends
   the user back to, and `useAuthState` would take one already there for
   the server's. `externalLogin` drops them from the current url too.
+- `useAuthState` redeems a `redeem_ready` in the url once per page load.
+  The login it redeems waits in the visitor's own session, so it
+  completes in whichever tab the login returns to (eg. one opened by a
+  link in an email which the provider sent to finish it), also after a
+  reload while redeeming. Anyone can put it in a link, which can only
+  complete the visitor's own login, and otherwise fails.
+- Start external logins through mogh_ui (`externalLogin`, `LoginPage`),
+  not the client's `externalLogin`: it notes (in `sessionStorage`, for
+  30 minutes) that the tab left for the provider. Only on the page load
+  which returns from a login the tab started does `useAuthState` show
+  the server's error when redeeming fails, or the reason in a
+  `login_error` / `link_error`. Otherwise (eg. a link carrying them) the
+  redeem's error is only logged to the console, and a login error only
+  says the login didn't complete. Either way a failed login removes its
+  param from the url, and a user who isn't logged in lands on the login
+  page without its auto redirect.
+- After logging in, `LoginPage` goes on to `backto` only on the login
+  route itself (`/login`, `/login/`). Shown anywhere else (eg. for the
+  second factor of an external login which returned to
+  `/login-providers/:id`) it stays on the page. The url an external
+  login or second factor returns to keeps its fragment.
 - `Config` shows one confirm dialog behind all of its Save buttons.
   Ctrl / Cmd + Enter (outside of text inputs) opens it while there are
   changes, and Enter in the open dialog saves (it opens with its Save

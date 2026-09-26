@@ -1,17 +1,32 @@
 import { withoutFlowReturnParams } from "./external-flow";
 
+/**
+ * Loads the page again without the query params a login returns with
+ * (`redeem_ready`, `totp`, `passkey`, see `useAuthState`), once it is
+ * done with them. The rest of the url is kept, fragment included.
+ */
 export function sanitizeQuery() {
   sanitizeQueryInner(new URLSearchParams(location.search));
 }
 
+/** [sanitizeQuery] of the page's url with the query `search`. */
 export function sanitizeQueryInner(search: URLSearchParams) {
   search.delete("redeem_ready");
   search.delete("totp");
   search.delete("passkey");
   const query = search.toString();
-  location.replace(
-    `${location.origin}${location.pathname}${query.length ? "?" + query : ""}`,
-  );
+  const url =
+    location.origin +
+    location.pathname +
+    (query.length ? "?" + query : "") +
+    location.hash;
+  if (location.hash && url === location.href) {
+    // Nothing to remove: to the same url with a fragment, `replace`
+    // would only scroll to it instead of loading the page again.
+    location.reload();
+  } else {
+    location.replace(url);
+  }
 }
 
 /**

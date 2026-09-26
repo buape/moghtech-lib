@@ -11,6 +11,8 @@ import {
   flowReturnError,
   flowReturnParam,
   markExternalFlow,
+  removeQueryParams,
+  replaceUrl,
   takeExternalFlowReturn,
   withoutFlowReturnParams,
 } from "./external-flow";
@@ -46,8 +48,11 @@ export function authClient() {
  * query params the login returns with (see [useAuthState]), which only
  * the server adds.
  *
- * Also notes that this tab started the login, so the reason a failed
- * login comes back with is shown (see [useAuthState]).
+ * Also notes that this tab started the login: [useAuthState] only
+ * shows the server's reason a failed login comes back with (or its
+ * error redeeming one) after a login this tab started. Start external
+ * logins through this (or `LoginPage`), not the client's
+ * `externalLogin`, which would have such failures only logged.
  *
  * @param providerSlug The provider `slug` from `GetLoginOptions`.
  */
@@ -63,7 +68,8 @@ export function externalLogin(providerSlug: string) {
   }
   url = withoutFlowReturnParams(url);
   if (url !== current) {
-    history.replaceState(history.state, "", url);
+    // Absolute: a path starting with `//` would be read as another host.
+    replaceUrl(location.origin + url);
   }
   markExternalFlow();
   authClient().externalLogin(providerSlug);
@@ -75,7 +81,9 @@ export function externalLogin(providerSlug: string) {
  * `/login`, and comes back to the current page after logging in.
  */
 let onReauthenticationRequired = () => {
-  const backto = encodeURIComponent(location.pathname + location.search);
+  const backto = encodeURIComponent(
+    location.pathname + location.search + location.hash,
+  );
   // Leaves time to read the notification.
   setTimeout(() => location.assign(`/login?backto=${backto}`), 2_000);
 };
@@ -95,8 +103,8 @@ export function useLoginOptions() {
 /**
  * Runs a manage query. A token the server refuses with one of
  * `rejectedOn` isn't sent again by the queries here (`sendableJwt`):
- * every request which fails auth counts against the server's per IP
- * auth rate limit, which logging in shares.
+ * every request with a token the server refuses counts against its
+ * per IP auth rate limit, which logging in shares.
  */
 function manageQuery<T>(
   rejectedOn: number[],
@@ -157,29 +165,37 @@ export function useLogin<
     ...config,
     mutationKey: [type],
     mutationFn: (params: P) => authClient().login<T, R>(type, params),
-    onError: (
-      e: { result?: { error?: string; trace?: string[] } },
-      ...args
-    ) => {
-      console.log("Login error:", e);
-      const msg = e.result?.error ?? "Unknown error. See console.";
-      // Skip the causes the message already shows, eg. a failed
-      // attempt's error under the rate limit's attempts remaining note.
-      const detail = e.result?.trace
-        ?.filter((cause) => !msg.includes(cause))
-        .map((msg) => msg[0].toUpperCase() + msg.slice(1))
-        .join(" | ");
-      let msg_log = msg ? msg[0].toUpperCase() + msg.slice(1) + " | " : "";
-      if (detail) {
-        msg_log += detail + " | ";
-      }
-      notifications.show({
-        title: `Login request ${type} failed`,
-        message: `${msg_log}See console for details`,
-        color: "red",
-      });
+    onError: (e: LoginError, ...args) => {
+      showLoginError(type, e);
       config?.onError && config.onError(e, ...args);
     },
+  });
+}
+
+/** What a failed login request rejects with. */
+type LoginError = { result?: { error?: string; trace?: string[] } };
+
+/** Logs a failed login request, and shows the server's error. */
+function showLoginError(
+  type: MoghAuth.Types.LoginRequest["type"],
+  e: LoginError,
+) {
+  console.log("Login error:", e);
+  const msg = e.result?.error ?? "Unknown error. See console.";
+  // Skip the causes the message already shows, eg. a failed
+  // attempt's error under the rate limit's attempts remaining note.
+  const detail = e.result?.trace
+    ?.filter((cause) => !msg.includes(cause))
+    .map((msg) => msg[0].toUpperCase() + msg.slice(1))
+    .join(" | ");
+  let msg_log = msg ? msg[0].toUpperCase() + msg.slice(1) + " | " : "";
+  if (detail) {
+    msg_log += detail + " | ";
+  }
+  notifications.show({
+    title: `Login request ${type} failed`,
+    message: `${msg_log}See console for details`,
+    color: "red",
   });
 }
 
@@ -187,9 +203,9 @@ export function useLogin<
  * Look up the signed in user's id.
  *
  * Pass `enabled: false` where the host app already knows the answer
- * from its own session query. Every request which fails auth counts
- * against the server's per IP auth rate limit, so a token the server
- * rejects is only ever sent once: it isn't retried or refetched
+ * from its own session query. Every request with a token the server
+ * refuses counts against its per IP auth rate limit, so a token the
+ * server rejects is only ever sent once: it isn't retried or refetched
  * (whatever the host's query client defaults), and the query stays
  * disabled until there is another token.
  */
@@ -259,7 +275,17 @@ export function useManageAuth<
   });
 }
 
-let jwt_redeem_sent = false;
+/**
+ * The redeem of this page load's `redeem_ready`: `sent` once, and
+ * `failed` when it didn't log in.
+ */
+let jwt_redeem: "sent" | "failed" | undefined;
+/**
+ * Whether the page load which redeemed is the return from an external
+ * login this tab started ([takeExternalFlowReturn]): only then is the
+ * server's error shown when the redeem fails.
+ */
+let jwt_redeem_vouched = false;
 let passkey_sent = false;
 let external_error_shown = false;
 
@@ -267,24 +293,20 @@ let external_error_shown = false;
 const MAX_EXTERNAL_ERROR_LENGTH = 300;
 
 /**
- * Removes params from the url without a reload,
- * which would drop the notifications.
- */
-function removeQueryParams(...params: string[]) {
-  const search = new URLSearchParams(location.search);
-  for (const param of params) search.delete(param);
-  const query = search.toString();
-  history.replaceState(
-    history.state,
-    "",
-    `${location.pathname}${query.length ? "?" + query : ""}${location.hash}`,
-  );
-}
-
-/**
  * Handles what an external login redirects back to the app with.
  * Call it at the top of the app, before (outside) its router:
- * - `redeem_ready`: redeems the login for a token.
+ * - `redeem_ready`: redeems the login for a token, once per page load.
+ *   The login it redeems waits in the visitor's own session, so it
+ *   works wherever the login returns: also to another tab (eg. from a
+ *   link in an email the provider sent), a reload while redeeming, or
+ *   a login started with the client's `externalLogin`. Anyone can put
+ *   it in a link, which can only complete a login of the visitor's
+ *   own, and otherwise fails. The server's error is only shown on the
+ *   page load which returns from an external login this tab started
+ *   through mogh_ui ([externalLogin], `LoginPage`) within 30 minutes.
+ *   Otherwise the failure is only logged to the console. Either way
+ *   the param is removed from the url, and the login page doesn't
+ *   auto redirect, which could loop.
  * - `passkey`: asks for the passkey, the login's second factor.
  * - `login_error` / `link_error`: shows why an external login / link
  *   failed (`AuthImpl::external_login_error_redirect` on the server).
@@ -315,13 +337,28 @@ export function useAuthState() {
     MoghAuth.LOGIN_TOKENS!.add_and_change(jwt);
     sanitizeQueryInner(search);
   };
-  const { mutate: redeemJwt } = useLogin("ExchangeForJwt", {
+  const { mutate: redeemJwt } = useMutation({
+    mutationKey: ["ExchangeForJwt"],
+    mutationFn: () => authClient().login("ExchangeForJwt", {}),
     onSuccess,
-    onError: () => {
-      // Retrying can't help, the server has ended the login.
+    onError: (e: LoginError) => {
+      if (jwt_redeem_vouched) {
+        showLoginError("ExchangeForJwt", e);
+      } else {
+        // Eg. a link carrying it, with no login to redeem: nothing
+        // alarming to show, the user can just log in.
+        console.warn(
+          "Couldn't redeem the redeem_ready in the url, which isn't the return from an external login this tab started:",
+          e,
+        );
+      }
+      // Retrying can't help, the server has ended the login (or there
+      // was none). Nor can the provider: the login page doesn't auto
+      // redirect to it, which could loop.
+      jwt_redeem = "failed";
       externalLoginState.failed = true;
-      removeQueryParams("redeem_ready");
       setRedeemFailed(true);
+      removeQueryParams("redeem_ready");
     },
   });
   const { mutate: completePasskeyLogin } = useLogin("CompletePasskeyLogin", {
@@ -347,7 +384,6 @@ export function useAuthState() {
     } catch (e) {
       console.error("Invalid passkey challenge:", e);
       search.delete("passkey");
-      removeQueryParams("passkey");
       if (!passkey_sent) {
         passkey_sent = true;
         notifications.show({
@@ -356,6 +392,7 @@ export function useAuthState() {
           color: "red",
         });
       }
+      removeQueryParams("passkey");
     }
   }
 
@@ -415,17 +452,19 @@ export function useAuthState() {
     removeQueryParams("login_error", "link_error");
   }
 
-  const jwt_redeem_ready = flowReturnParam(search, "redeem_ready") === "true";
+  const redeem_ready = flowReturnParam(search, "redeem_ready") === "true";
 
-  // guard against multiple reqs sent
-  // maybe isPending would do this but not sure about with render loop, this for sure will.
-  if (jwt_redeem_ready && !jwt_redeem_sent) {
-    redeemJwt({});
-    jwt_redeem_sent = true;
+  // Once per page load: guards against multiple requests sent. Whether
+  // the page load returns from the tab's flow is only known on the
+  // first render.
+  if (redeem_ready && jwt_redeem === undefined) {
+    jwt_redeem = "sent";
+    jwt_redeem_vouched = external_flow_return;
+    redeemJwt();
   }
 
   return {
-    jwt_redeem_ready: jwt_redeem_ready && !redeemFailed,
+    jwt_redeem_ready: redeem_ready && jwt_redeem === "sent" && !redeemFailed,
     passkey_pending: !!passkeyRequest,
     totp: flowReturnParam(search, "totp") === "true",
   };

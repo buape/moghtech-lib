@@ -656,7 +656,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "http",
- "mogh_auth_client",
+ "mogh_auth_client 5.0.1",
  "mogh_error",
  "mogh_pki",
  "mogh_resolver",
@@ -1291,7 +1291,7 @@ name = "example_client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "mogh_auth_client",
+ "mogh_auth_client 6.0.0",
  "mogh_error",
  "mogh_resolver",
  "reqwest 0.13.5",
@@ -1326,7 +1326,7 @@ dependencies = [
  "envy",
  "example_client",
  "example_mock_idp",
- "mogh_auth_client",
+ "mogh_auth_client 6.0.0",
  "mogh_auth_server",
  "mogh_cache",
  "mogh_config",
@@ -2409,7 +2409,26 @@ dependencies = [
 
 [[package]]
 name = "mogh_auth_client"
-version = "5.0.2"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "445ddca57e50e0ce6413f2b3e0af9bc24347f9a617970ef1425f43a3b3d402e7"
+dependencies = [
+ "anyhow",
+ "mogh_error",
+ "mogh_resolver",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "strum",
+ "typeshare",
+ "webauthn-rs",
+ "zeroize",
+]
+
+[[package]]
+name = "mogh_auth_client"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "mogh_error",
@@ -2437,7 +2456,7 @@ dependencies = [
  "data-encoding",
  "http-body-util",
  "jsonwebtoken",
- "mogh_auth_client",
+ "mogh_auth_client 6.0.0",
  "mogh_error",
  "mogh_pki",
  "mogh_rate_limit",
