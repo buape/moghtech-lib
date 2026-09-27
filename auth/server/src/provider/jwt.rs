@@ -140,11 +140,11 @@ impl JwtProvider {
   pub fn new(secret: &[u8], ttl_ms: u128) -> Self {
     if secret.is_empty() {
       error!(
-        "The jwt secret is empty: no app token is issued or accepted. Configure a random secret of at least {MIN_SECRET_BYTES} bytes."
+        "The jwt secret is empty. No app token can be issued or accepted. Please configure a random secret of at least {MIN_SECRET_BYTES} bytes."
       );
     } else if secret.len() < MIN_SECRET_BYTES {
       warn!(
-        "The jwt secret is only {} bytes: anyone with a token can try to guess it offline, and then issue tokens for any user. Configure a random secret of at least {MIN_SECRET_BYTES} bytes.",
+        "The jwt secret is only {} bytes. Anyone with a token can try to guess it offline, and then issue tokens for any user. It is recommended to configure a random secret of at least {MIN_SECRET_BYTES} bytes.",
         secret.len()
       );
     }
