@@ -651,6 +651,8 @@ dependencies = [
 [[package]]
 name = "cicada_client"
 version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73f2b79a2c416ac041f7d32b9f0b2f833ef79463bbf1f80f03607e8d5549c60b"
 dependencies = [
  "async_timing_util",
  "chrono",
@@ -675,6 +677,8 @@ dependencies = [
 [[package]]
 name = "cicada_loader"
 version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a405150868452dd5522253a224c3ae4d3f67ecda63649c504d2af5806727f8"
 dependencies = [
  "anyhow",
  "cicada_client",

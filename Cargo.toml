@@ -126,10 +126,8 @@ colored = "3.1.1"
 utoipa = "6.0.0"
 regex = "1.13.1"
 
+
 [patch.crates-io]
-# CICADA (unpublished 0.19.0, until released)
-cicada_loader = { path = "../cicada/lib/loader" }
-cicada_client = { path = "../cicada/client/rs" }
 
 # MOGH API
 mogh_auth_client = { path = "auth/client/rs" }
