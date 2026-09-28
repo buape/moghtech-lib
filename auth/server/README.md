@@ -649,9 +649,14 @@ recording can fail should log and continue instead.
 ```rust
 fn record_login(&self, login: Login) -> DynFuture<mogh_error::Result<()>> {
   // login.user_id, login.username, login.ip,
-  // login.second_factor: Option<Passkey | Totp | TotpRecovery>, and
+  // login.second_factor: Option<Passkey | Totp | TotpRecovery>,
   // login.kind: Local | Provider { provider_id, provider_name }
-  //   | Workload { issuer_id, issuer_name, rule_id, rule_name }
+  //   | Workload { issuer_id, issuer_name, rule_id, rule_name }, and
+  // login.token_expires: when the issued session jwt or exchanged
+  //   token expires (unix seconds) — a workload rule's
+  //   `token_ttl_secs` capped at the app ttl, everything else the
+  //   app ttl. Stamp it on the record to show how long each
+  //   granted credential lives.
   Box::pin(async move { audit(login).await })
 }
 ```

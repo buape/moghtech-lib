@@ -943,20 +943,21 @@ async fn complete_workload<I: AuthImpl + ?Sized>(
     rule_id: rule.id.clone(),
     rule_name: rule.name.clone(),
   };
+  let default_ttl_ms = auth.jwt_provider().ttl_ms();
+  let ttl_ms = match u128::from(rule.token_ttl_secs) * 1000 {
+    0 => default_ttl_ms,
+    ttl_ms => ttl_ms.min(default_ttl_ms),
+  };
   auth
     .record_login(Login::of(
       user.as_ref(),
       ip,
       LoginKind::from(login.clone()),
       None,
+      auth.jwt_provider().expires_at(ttl_ms)?,
     ))
     .await?;
 
-  let default_ttl_ms = auth.jwt_provider().ttl_ms();
-  let ttl_ms = match u128::from(rule.token_ttl_secs) * 1000 {
-    0 => default_ttl_ms,
-    ttl_ms => ttl_ms.min(default_ttl_ms),
-  };
   let jwt =
     auth.jwt_provider().encode_sub_with_ttl(user.id(), ttl_ms)?;
 
@@ -1021,6 +1022,9 @@ async fn complete_exchange<I: AuthImpl + ?Sized>(
       ip,
       LoginKind::from(login.clone()),
       None,
+      // encode_sub_with_auth_time's expiry counts from the issue
+      // time (auth_time only sets the authenticated_at claim).
+      auth.jwt_provider().default_expires_at()?,
     ))
     .await?;
 
@@ -1495,21 +1499,42 @@ mod tests {
         rule_name: "Deploy".into(),
       }
     );
+    // Stamped with the token's expiry: the rule's 900s ttl.
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+    let expires = logins[0].token_expires;
+    assert!(
+      (now + 895..=now + 905).contains(&expires),
+      "expires {expires} should be about {now} + 900"
+    );
   }
 
   #[tokio::test]
   async fn test_workload_token_ttl_is_capped_at_app_default() {
+    let now = || {
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+    };
     let mut rule = deploy_rule();
     rule.token_ttl_secs = 365 * 24 * 60 * 60;
     let auth = workload_auth(vec![rule]);
     let token = workload_token(12345, "refs/heads/release/1").mint();
     assert_eq!(run(&auth, token).await.unwrap().expires_in, 3600);
+    // The login record's stamp is capped the same way.
+    let expires = auth.logins.lock().unwrap()[0].token_expires;
+    assert!((now() + 3595..=now() + 3605).contains(&expires));
 
     let mut rule = deploy_rule();
     rule.token_ttl_secs = 0;
     let auth = workload_auth(vec![rule]);
     let token = workload_token(12345, "refs/heads/release/1").mint();
     assert_eq!(run(&auth, token).await.unwrap().expires_in, 3600);
+    let expires = auth.logins.lock().unwrap()[0].token_expires;
+    assert!((now() + 3595..=now() + 3605).contains(&expires));
   }
 
   #[tokio::test]

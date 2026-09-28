@@ -369,6 +369,7 @@ async fn finish_totp_login(
       *ip,
       kind,
       Some(SecondFactor::Totp),
+      auth.jwt_provider().default_expires_at()?,
     ))
     .await?;
 
@@ -455,6 +456,7 @@ async fn finish_totp_recovery_login(
       *ip,
       kind,
       Some(SecondFactor::TotpRecovery),
+      auth.jwt_provider().default_expires_at()?,
     ))
     .await?;
 

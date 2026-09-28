@@ -226,6 +226,28 @@ impl JwtProvider {
     self.ttl_ms
   }
 
+  /// When a token encoded now with the default ttl expires, in unix
+  /// seconds: the `exp` an [encode_sub](Self::encode_sub) (or
+  /// [encode_sub_with_auth_time](Self::encode_sub_with_auth_time),
+  /// whose expiry also counts from the issue time) token carries.
+  /// For [Login::of](crate::Login::of), which runs just before the
+  /// token is encoded.
+  pub fn default_expires_at(&self) -> anyhow::Result<u64> {
+    self.expires_at(self.ttl_ms)
+  }
+
+  /// [default_expires_at](Self::default_expires_at) for a token
+  /// encoded with its own ttl
+  /// ([encode_sub_with_ttl](Self::encode_sub_with_ttl)): `ttl_ms`
+  /// capped at [ttl_ms](Self::ttl_ms), with the encode's own
+  /// arithmetic.
+  pub fn expires_at(&self, ttl_ms: u128) -> anyhow::Result<u64> {
+    Ok(
+      unix_timestamp_secs()?
+        .saturating_add(ttl_secs(ttl_ms.min(self.ttl_ms))),
+    )
+  }
+
   pub fn header(&self) -> &Header {
     self.header.as_ref().unwrap_or(&DEFAULT_HEADER)
   }

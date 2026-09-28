@@ -620,6 +620,7 @@ async fn login_callback<I: AuthImpl>(
           ip,
           kind: provider_login(provider),
           second_factor: None,
+          token_expires: auth.jwt_provider().default_expires_at()?,
         })
         .await?;
       session.insert_authenticated_user_id(&user_id).await?;
@@ -1014,7 +1015,14 @@ mod tests {
     }
 
     fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
-      panic!("not needed for these tests")
+      // The sign-up / login paths stamp the session expiry on the
+      // login record through it.
+      static PROVIDER: std::sync::LazyLock<
+        crate::provider::jwt::JwtProvider,
+      > = std::sync::LazyLock::new(|| {
+        crate::provider::jwt::JwtProvider::new(b"secret", 60_000)
+      });
+      &PROVIDER
     }
   }
 
@@ -1628,7 +1636,14 @@ mod tests {
       Box::pin(async { Err(anyhow!("not implemented").into()) })
     }
     fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
-      panic!("not needed for these tests")
+      // The sign-up / login paths stamp the session expiry on the
+      // login record through it.
+      static PROVIDER: std::sync::LazyLock<
+        crate::provider::jwt::JwtProvider,
+      > = std::sync::LazyLock::new(|| {
+        crate::provider::jwt::JwtProvider::new(b"secret", 60_000)
+      });
+      &PROVIDER
     }
   }
 
@@ -1665,7 +1680,14 @@ mod tests {
       Box::pin(async { Err(anyhow!("not implemented").into()) })
     }
     fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
-      panic!("not needed for these tests")
+      // The sign-up / login paths stamp the session expiry on the
+      // login record through it.
+      static PROVIDER: std::sync::LazyLock<
+        crate::provider::jwt::JwtProvider,
+      > = std::sync::LazyLock::new(|| {
+        crate::provider::jwt::JwtProvider::new(b"secret", 60_000)
+      });
+      &PROVIDER
     }
   }
 
@@ -1843,7 +1865,14 @@ mod tests {
       Box::pin(async { Err(anyhow!("not implemented").into()) })
     }
     fn jwt_provider(&self) -> &crate::provider::jwt::JwtProvider {
-      panic!("not needed for these tests")
+      // The sign-up / login paths stamp the session expiry on the
+      // login record through it.
+      static PROVIDER: std::sync::LazyLock<
+        crate::provider::jwt::JwtProvider,
+      > = std::sync::LazyLock::new(|| {
+        crate::provider::jwt::JwtProvider::new(b"secret", 60_000)
+      });
+      &PROVIDER
     }
   }
 

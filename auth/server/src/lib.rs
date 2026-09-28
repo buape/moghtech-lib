@@ -91,15 +91,26 @@ pub struct Login {
   /// exchange (which refuses such users); an `ExchangeExternalForJwt`
   /// can be completed with one.
   pub second_factor: Option<SecondFactor>,
+  /// When the token the login issued expires, in unix seconds:
+  /// the `exp` of the session jwt or exchanged token, computed
+  /// with the encode's own arithmetic
+  /// ([JwtProvider::expires_at](provider::jwt::JwtProvider::expires_at))
+  /// just before the token is encoded. An app surfacing logins can
+  /// show how long each granted credential lives without knowing
+  /// the flows' ttl rules (a workload rule's `token_ttl_secs`
+  /// capped at the app ttl, everything else the app ttl).
+  pub token_expires: u64,
 }
 
 impl Login {
-  /// The login of `user`.
+  /// The login of `user`, issuing a token that expires at
+  /// `token_expires` (unix seconds, see the field).
   pub fn of(
     user: &dyn crate::user::AuthUserImpl,
     ip: IpAddr,
     kind: LoginKind,
     second_factor: Option<SecondFactor>,
+    token_expires: u64,
   ) -> Login {
     Login {
       user_id: user.id().to_string(),
@@ -107,6 +118,7 @@ impl Login {
       ip,
       kind,
       second_factor,
+      token_expires,
     }
   }
 }

@@ -66,6 +66,7 @@ pub async fn sign_up_local_user<I: AuthImpl + ?Sized>(
       ip,
       kind: LoginKind::Local,
       second_factor: None,
+      token_expires: auth.jwt_provider().default_expires_at()?,
     })
     .await?;
 
@@ -227,6 +228,7 @@ pub async fn login_local_user<I: AuthImpl + ?Sized>(
           ip,
           LoginKind::Local,
           None,
+          auth.jwt_provider().default_expires_at()?,
         ))
         .await?;
 
@@ -415,6 +417,17 @@ mod tests {
       assert_eq!(logins[0].ip, IP);
       assert_eq!(logins[0].kind, LoginKind::Local);
       assert!(logins[0].second_factor.is_none());
+      // Stamped with the session token's expiry: the test
+      // provider's 60s ttl from about now.
+      let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+      let expires = logins[0].token_expires;
+      assert!(
+        (now + 55..=now + 65).contains(&expires),
+        "expires {expires} should be about {now} + 60"
+      );
     }
     let ip = IpAddr::from([127, 0, 0, 1]);
     let res = login_local_user(

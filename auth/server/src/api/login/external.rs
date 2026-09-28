@@ -76,6 +76,7 @@ where
           ip,
           provider_login(&provider),
           None,
+          auth.jwt_provider().default_expires_at()?,
         ))
         .await?;
 

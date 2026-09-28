@@ -302,6 +302,7 @@ async fn get_user_id_or_two_factor<I: AuthImpl>(
           ip,
           provider_login(provider),
           None,
+          auth.jwt_provider().default_expires_at()?,
         ))
         .await?;
       session.insert_authenticated_user_id(user.id()).await?;

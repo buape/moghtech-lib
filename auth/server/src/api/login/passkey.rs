@@ -70,6 +70,7 @@ impl Resolve<LoginArgs> for CompletePasskeyLogin {
           *ip,
           kind,
           Some(SecondFactor::Passkey),
+          auth.jwt_provider().default_expires_at()?,
         ))
         .await?;
 
