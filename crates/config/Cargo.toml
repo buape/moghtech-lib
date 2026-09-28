@@ -8,8 +8,6 @@ repository.workspace = true
 
 [features]
 default = []
-# Load config from Cicada with `cicada:` paths. Opt in: it brings the
-# cicada client (and with it an http / auth client stack) into the build.
 cicada = ["dep:cicada_loader"]
 
 [dependencies]
