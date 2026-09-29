@@ -127,13 +127,18 @@ fn hash_encode_contents(path: &Path) -> anyhow::Result<HeaderValue> {
   let contents = std::fs::read(path).context(
     "Failed to read static UI index.html for content hash",
   )?;
-  let mut hasher = sha2::Sha256::new();
-  hasher.update(&contents);
-  let digest = hasher.finalize();
-  let value = data_encoding::BASE64URL.encode(&digest);
+  let value = content_hash(&contents);
   // ETag values must be wrapped in double quotes (RFC 9110).
   HeaderValue::from_bytes(format!("\"{value}\"").as_bytes())
     .context("Invalid index hash for ETag header value")
+}
+
+/// The BASE64URL encoded SHA-256 of `contents`, the ETag scheme of
+/// the static UI index and the OpenAPI spec (`openapi` feature).
+pub(crate) fn content_hash(contents: &[u8]) -> String {
+  let mut hasher = sha2::Sha256::new();
+  hasher.update(contents);
+  data_encoding::BASE64URL.encode(&hasher.finalize())
 }
 
 fn add_no_cache_layer(router: Router) -> Router {

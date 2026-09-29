@@ -32,6 +32,8 @@ use reqwest as _;
 use tower as _;
 
 pub mod cors;
+#[cfg(feature = "openapi")]
+pub mod openapi;
 pub mod session;
 mod timeout;
 pub mod ui;

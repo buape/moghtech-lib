@@ -1,10 +1,15 @@
 [package]
 name = "mogh_server"
 description = "Configurable axum server including TLS, Session, CORS, common security headers, and static file hosting."
-version = "2.1.0"
+version = "2.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+default = []
+# `openapi::serve_docs`: the Scalar API reference over a cached spec.
+openapi = ["dep:serde", "dep:serde_json", "dep:flate2"]
 
 [dependencies]
 mogh_request_ip.workspace = true
@@ -18,21 +23,23 @@ axum.workspace = true
 sha2.workspace = true
 url.workspace = true
 tokio.workspace = true
+# The `openapi` feature.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 # Implements tower-sessions' SessionStore trait.
-async-trait = "0.1.89"
-# Same version / features as axum-server 'tls-rustls', used to pick
-# the crypto provider (see 'serve_app').
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+async-trait.workspace = true
+# Used to pick the crypto provider (see 'serve_app').
+rustls.workspace = true
 # The timer hyper needs to apply the header read timeout (see
-# 'serve_app'), same version as axum-server's.
-hyper-util = { version = "0.1.18", features = ["tokio"] }
+# 'serve_app').
+hyper-util.workspace = true
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
-# An http/2 client for the header read timeout tests, same version
-# as hyper's.
-h2 = "0.4.13"
+tower.workspace = true
+# An http/2 client for the header read timeout tests.
+h2.workspace = true
 reqwest.workspace = true
 # 'ring' next to aws-lc-rs, as in apps also using mogh_auth_server,
 # so rustls can't pick a crypto provider by itself.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "ring", "std"] }
+rustls = { workspace = true, features = ["ring"] }

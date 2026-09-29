@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+
+<head>
+  <title>$title</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+
+<body>
+
+  <!--
+    The spec is fetched from its own (cached, gzipped) route rather
+    than inlined here, see mod.rs.
+
+    `hideModels` keeps the component schemas (hundreds, for a large
+    API) out of the sidebar and page, they are still shown inline on
+    each operation.
+
+    An empty `proxyUrl` disables Scalar's default request proxy
+    (proxy.scalar.com), so "Send request" goes straight to this
+    server.
+  -->
+  <script id="api-reference" data-url="/docs/openapi.json"
+    data-configuration='{"hideModels":true,"proxyUrl":""}'></script>
+
+  <!-- Pinned with an integrity hash, see README.md to bump it. -->
+  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.72.1/dist/browser/standalone.js"
+    integrity="sha384-U11tb2XnKvmwt8RlTvnwUnYgrN+ur4Xyh9htLhjajWNR/Oyl5AX5DEz00qRmlrmK"
+    crossorigin="anonymous"></script>
+</body>
+
+</html>

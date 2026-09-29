@@ -97,6 +97,18 @@ login flows, backed by `session::MemorySessionStore`:
 requests carrying the user's cookies and read the responses. List the exact
 origins instead, or disable credentials.
 
+### OpenAPI docs
+
+With the `openapi` feature, `openapi::serve_docs(title, &spec)` serves the
+[Scalar](https://github.com/scalar/scalar) API reference at `/docs`, and the
+spec it renders (anything serializing to an OpenAPI document, eg utoipa's
+`OpenApi`) at `/docs/openapi.json`. The spec is serialized, gzipped and hashed
+once, and served with `Cache-Control: no-cache` and the content hash as `ETag`,
+so a large spec is revalidated (an empty 304) rather than downloaded on every
+load of the docs. The page hides Scalar's models section for the same reason,
+and sends "Send request" straight to the server rather than through Scalar's
+proxy. See `src/openapi/README.md` to bump the pinned Scalar version.
+
 ### Static UI
 
 `ui::serve_static_ui` serves a static UI directory, answering paths without a
