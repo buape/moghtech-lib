@@ -36,9 +36,6 @@ mogh_server = "2.1.0"
 mogh_validations = "1.0.3"
 
 # CICADA
-# mogh_config re-exports it as `mogh_config::cicada`: a minor (0.x)
-# bump here ships as a mogh_config major release, a patch bump as a
-# patch release.
 cicada_loader = "0.19.0"
 
 # ASYNC
