@@ -508,7 +508,7 @@ pub struct ExternalLoginProviderListItem {
   description = "List all configured external login providers. Admin only.",
   request_body(content = ListExternalLoginProviders),
   responses(
-    (status = 200, description = "The external login providers", body = ListExternalLoginProvidersResponse),
+    (status = 200, description = "The external login providers", body = [ExternalLoginProviderListItem]),
     (status = 401, description = "Unauthorized", body = mogh_error::Serror),
     (status = 403, description = "Forbidden", body = mogh_error::Serror),
     (status = 500, description = "Request failed", body = mogh_error::Serror)
@@ -710,7 +710,7 @@ pub struct TrustedIssuerListItem {
   description = "List the token issuers trusted for workload identity. Admin only.",
   request_body(content = ListTrustedIssuers),
   responses(
-    (status = 200, description = "The trusted issuers", body = ListTrustedIssuersResponse),
+    (status = 200, description = "The trusted issuers", body = [TrustedIssuerListItem]),
     (status = 401, description = "Unauthorized", body = mogh_error::Serror),
     (status = 403, description = "Forbidden", body = mogh_error::Serror),
     (status = 500, description = "Request failed", body = mogh_error::Serror)
